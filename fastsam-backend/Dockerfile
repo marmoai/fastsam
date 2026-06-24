@@ -24,7 +24,7 @@ RUN python - <<'PY'
 from ultralytics.utils.downloads import attempt_download_asset
 
 for name in ("FastSAM-x.pt", "FastSAM-s.pt", "mobile_sam.pt", "sam_b.pt"):
-    path = attempt_download_asset(name, release="latest")
+    path = attempt_download_asset(name)
     print(f"downloaded {name} -> {path}")
 PY
 
