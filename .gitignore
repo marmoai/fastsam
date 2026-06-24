@@ -1,0 +1,11 @@
+venv/
+fastsam-backend/venv/
+node_modules/
+dist/
+.DS_Store
+*.log
+**/__pycache__/
+**/*.pyc
+fastsam-backend/runs/
+fastsam-backend/*.tar
+fastsam-backend/*.pt

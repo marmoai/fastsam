@@ -1,0 +1,8 @@
+{
+  "name": "marmoai quickrouter",
+  "description": "智能图像处理与助手工具，集成 Gemini AI 能力，支持实时灵感绘图与语义图层管理。",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

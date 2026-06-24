@@ -1,0 +1,40 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile and credit information",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Firebase Auth UID" },
+        "email": { "type": "string", "description": "User email" },
+        "displayName": { "type": "string", "description": "User display name" },
+        "photoURL": { "type": "string", "description": "User profile picture URL" },
+        "credits": { "type": "integer", "description": "Available credits" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Account creation time" }
+      },
+      "required": ["uid", "email", "credits"]
+    },
+    "ImageHistory": {
+      "title": "ImageHistory",
+      "description": "History of generated or processed images",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "Owner UID" },
+        "prompt": { "type": "string", "description": "Prompt used" },
+        "imageUrl": { "type": "string", "description": "URL of the image" },
+        "timestamp": { "type": "string", "format": "date-time", "description": "Creation time" }
+      },
+      "required": ["userId", "imageUrl", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User profiles"
+    },
+    "/users/{userId}/history/{historyId}": {
+      "schema": "ImageHistory",
+      "description": "User's image history"
+    }
+  }
+}

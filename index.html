@@ -1,0 +1,766 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css">
+    <title>MarmoAid 图像助手</title>
+    <script type="importmap">
+{
+  "imports": {
+    "@google/genai": "https://esm.sh/@google/genai",
+    "marked": "https://esm.sh/marked@12.0.2",
+    "jszip": "https://esm.sh/jszip@3.10.1",
+    "localforage": "https://esm.sh/localforage@1.10.0",
+    "react": "https://esm.sh/react@^19.2.3",
+    "react-dom/": "https://esm.sh/react-dom@^19.2.3/",
+    "react/": "https://esm.sh/react@^19.2.3/"
+  }
+}
+
+</script>
+    <link rel="stylesheet" href="/src/styles/main.css">
+</head>
+<body>
+    <!-- Shaders for 2.5D Relighting -->
+    <script id="relight-vs" type="x-shader/x-vertex">
+        attribute vec2 a_position;
+        attribute vec2 a_texCoord;
+        varying vec2 v_texCoord;
+        void main() {
+            gl_Position = vec4(a_position, 0.0, 1.0);
+            v_texCoord = a_texCoord;
+        }
+    </script>
+    <script id="relight-fs" type="x-shader/x-fragment">
+        precision mediump float;
+        uniform sampler2D u_image;
+        uniform vec2 u_resolution;
+        uniform vec3 u_lightPos; // x, y, z (height) relative to canvas center
+        uniform vec3 u_lightColor;
+        uniform float u_intensity;
+        varying vec2 v_texCoord;
+
+        float getLuminance(vec4 color) {
+            return dot(color.rgb, vec3(0.299, 0.587, 0.114));
+        }
+
+        void main() {
+            vec4 color = texture2D(u_image, v_texCoord);
+            
+            // 1. Generate Pseudo-Normal on the fly using Sobel-like filter
+            float stepX = 1.0 / u_resolution.x;
+            float stepY = 1.0 / u_resolution.y;
+            
+            float tl = getLuminance(texture2D(u_image, v_texCoord + vec2(-stepX, -stepY)));
+            float t  = getLuminance(texture2D(u_image, v_texCoord + vec2(0.0,   -stepY)));
+            float tr = getLuminance(texture2D(u_image, v_texCoord + vec2(stepX,  -stepY)));
+            float l  = getLuminance(texture2D(u_image, v_texCoord + vec2(-stepX, 0.0)));
+            float r  = getLuminance(texture2D(u_image, v_texCoord + vec2(stepX,  0.0)));
+            float bl = getLuminance(texture2D(u_image, v_texCoord + vec2(-stepX, stepY)));
+            float b  = getLuminance(texture2D(u_image, v_texCoord + vec2(0.0,    stepY)));
+            float br = getLuminance(texture2D(u_image, v_texCoord + vec2(stepX,  stepY)));
+            
+            float dX = (tr + 2.0*r + br) - (tl + 2.0*l + bl);
+            float dY = (bl + 2.0*b + br) - (tl + 2.0*t + tr);
+            
+            // Construct normal. Z controls "depth" or flatness.
+            vec3 normal = normalize(vec3(-dX * 2.0, -dY * 2.0, 0.5));
+
+            // 2. Lighting Calculation
+            vec2 pixelPos = v_texCoord * u_resolution;
+            // Light position passed in pixels relative to image
+            vec3 lightDir = normalize(u_lightPos - vec3(pixelPos, 0.0));
+            
+            // Diffuse
+            float diff = max(dot(normal, lightDir), 0.0);
+            
+            // Specular
+            vec3 viewDir = vec3(0.0, 0.0, 1.0);
+            vec3 reflectDir = reflect(-lightDir, normal);
+            float spec = pow(max(dot(viewDir, reflectDir), 0.0), 32.0); // Shininess
+
+            // Combine
+            // Ambient (0.5) + Diffuse + Specular
+            vec3 lighting = u_lightColor * (diff * 1.5 + spec * 1.0) * u_intensity;
+            
+            // Blend Mode: Overlay-ish logic
+            // Boost original color by calculated light
+            vec3 finalColor = color.rgb * (0.4 + lighting); 
+            
+            gl_FragColor = vec4(finalColor, color.a);
+        }
+    </script>
+    <div class="mobile-overlay" id="mobileOverlay"></div>
+    <div class="container chat-collapsed">
+        <div class="assets-sidebar collapsed">
+            <div class="sidebar-header">
+                <h3 class="sidebar-header-title">
+                    <a href="/art">
+                        <img src="https://www.marmoai.cn/WechatIMG152.png" alt="我的识别记录">
+                    </a>
+                </h3>
+            </div>
+            <div class="toggle-sidebar-wrapper" id="toggleSidebarWrapper">
+                <div class="sidebar-hover-trigger">
+                    <i class="fas fa-chevron-right"></i>
+                </div>
+                <div class="sidebar-vertical-group">
+                    <div class="avatar-toggle" id="avatarToggle" title="展开侧边栏">
+                        <img src="https://www.marmoai.cn/images/avatars/WeChat84b8e05cc8464bb089de1c46bed38809.jpg" alt="Robot Avatar">
+                    </div>
+                    <button class="toggle-sidebar" id="toggleSidebarBtn" title="切换历史栏">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="sidebar-icon-svg">
+                            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                            <line x1="9" y1="3" x2="9" y2="21"></line>
+                        </svg>
+                    </button>
+                    <button class="new-project-mini-btn" id="newProjectMiniBtn" title="新建项目">
+                        <i class="fas fa-comment-medical"></i>
+                    </button>
+                    <!-- Latent Canvas Entry Button -->
+                    <button id="openLatentCanvasBtn" class="new-project-mini-btn" title="实时灵感绘图">
+                        <i class="fas fa-magic" style="color: #818cf8;"></i>
+                    </button>
+                </div>
+            </div>
+            <button id="newSessionBtn" class="new-session-btn">开启新对话</button>
+            
+            <div class="assets-container">
+                <!-- NEW: Asset Library -->
+                <div id="assetLibraryContainer">
+                    <h4><i class="fas fa-star"></i> 我的素材库</h4>
+                    <div id="assetLibraryGrid">
+                        <!-- Asset items will be injected here by JS -->
+                    </div>
+                    <div class="empty-library-state" id="emptyLibraryState">
+                        <p>点击图片预览上的 <i class="fas fa-star"></i> 收藏常用素材</p>
+                    </div>
+                </div>
+
+                <!-- History -->
+                <div id="historyContainer">
+                     <h4><i class="fas fa-history"></i> 对话历史</h4>
+                     <ul id="historyList"></ul>
+                     <div class="empty-state" id="emptyState">
+                         <i class="fas fa-box-open"></i>
+                         <p>暂无对话记录</p>
+                     </div>
+                </div>
+            </div>
+            
+            <div class="sidebar-footer">
+                <div class="download-prompt">
+                    <i class="fas fa-mobile-alt"></i>
+                    <span>下载APP</span>
+                </div>
+                <div id="authContainer" class="user-status">
+                </div>
+            </div>
+        </div>
+        <div class="mini-control-bar">
+            <div class="mini-download" title="下载APP">
+                <i class="fas fa-mobile-alt"></i>
+            </div>
+            <a href="/user-profile" class="mini-user" title="用户信息">
+                <i class="fas fa-user-circle"></i>
+            </a>
+        </div>
+
+        <div id="workbench" class="workbench-panel">
+            <div class="workbench-header">
+                <h3 id="workbenchHeaderTitle" style="display: flex; align-items: center;">
+                    <img id="workbenchHeaderLogo" src="https://www.marmoai.cn/images/avatars/WeChat84b8e05cc8464bb089de1c46bed38809.jpg" alt="logo" style="width:24px;height:24px;border-radius:50%;object-fit:cover;margin-right:8px;vertical-align:middle;box-shadow:0 2px 5px rgba(0,0,0,0.1);">
+                    <span id="workbenchTitle">創作工作台</span>
+                    <span id="workbenchSubtitle" style="font-size: 13px; font-weight: normal; margin-left: 8px; color: #666;"></span>
+                </h3>
+                <div style="display: flex; align-items: center; gap: 16px;">
+                    <!-- History Controls (Redo/Undo) -->
+                    <div class="history-controls" style="display: flex; gap: 4px; background: rgba(0,0,0,0.03); padding: 4px; border-radius: 6px; border: 1px solid rgba(0,0,0,0.05);">
+                        <button id="undoBtn" class="zoom-btn" title="撤销" style="border:none; background:transparent;"><i class="fas fa-undo"></i></button>
+                        <button id="redoBtn" class="zoom-btn" title="重做" style="border:none; background:transparent;"><i class="fas fa-redo"></i></button>
+                    </div>
+                    <div class="zoom-controls">
+                        <button class="zoom-btn" onclick="zoomOut()">-</button>
+                        <span class="zoom-display" id="zoomLevel">100%</span>
+                        <button class="zoom-btn" onclick="zoomIn()">+</button>
+                        <button class="zoom-btn" onclick="resetZoom()">重置</button>
+                    </div>
+                    <!-- Atmosphere Toggle Button -->
+                    <button id="toggleAtmospherePanel" class="zoom-btn" title="环境/灯光卡片"><i class="fas fa-lightbulb"></i></button>
+                    <button id="toggleCanvasStyle" class="zoom-btn" title="切换画布样式"><i class="fas fa-border-all"></i></button>
+                    <button id="clearWorkbench" class="zoom-btn" title="清空工作台">清空</button>
+                </div>
+            </div>
+            <!-- Atmosphere Palette -->
+            <div id="atmospherePalette" class="atmosphere-palette">
+                <!-- Content injected by JS -->
+            </div>
+            
+            <!-- NEW: Layer Manager Panel -->
+            <div id="layerManagerPanel" class="layer-manager-panel">
+                <div class="layer-panel-header" id="layerPanelHeader">
+                    <h4><i class="fas fa-layer-group"></i> 语义图层</h4>
+                    <button class="layer-panel-close" id="closeLayerPanel">&times;</button>
+                </div>
+                <div class="layer-list" id="layerList">
+                    <!-- Layer items injected by JS -->
+                </div>
+            </div>
+
+            <!-- Subtle Smart Toast Container -->
+            <div id="smartToastContainer" style="position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 1000; display: flex; flex-direction: column; gap: 8px; align-items: center; pointer-events: none;"></div>
+
+            <!-- 新增的背景层 -->
+            <div class="workbench-background" id="workbenchBackground"></div>
+
+            <!-- 画布层 (负责缩放和平移) -->
+            <div class="workbench-zoom-container" id="workbenchZoomContainer">
+                <div id="workbenchGrid" class="workbench-grid">
+                    <div id="lightConnector" class="light-connector"></div>
+                    <div id="vLine" class="guide-line v"></div>
+                    <div id="hLine" class="guide-line h"></div>
+                    <!-- 引导线 - 动态 JS 控制 -->
+                    <div id="guide-v" class="guide-line guide-line-v"></div>
+                    <div id="guide-h" class="guide-line guide-line-h"></div>
+                   
+                    <!-- Genealogy SVG Layer -->
+                    <svg id="genealogyLayer" class="genealogy-layer">
+                        <defs>
+                            <marker id="arrowhead" markerWidth="10" markerHeight="7" 
+                            refX="9" refY="3.5" orient="auto">
+                                <polygon points="0 0, 10 3.5, 0 7" fill="#cbd5e0"/>
+                            </marker>
+                            <marker id="arrowhead-active" markerWidth="10" markerHeight="7" 
+                            refX="9" refY="3.5" orient="auto">
+                                <polygon points="0 0, 10 3.5, 0 7" fill="#2A5C82"/>
+                            </marker>
+                        </defs>
+                    </svg>
+
+                    <!-- 注意：empty-workbench-state 已经从这里移除了 -->
+                </div>
+            </div>
+
+            <!-- 空状态 UI 层 (移到了这里，与 zoom-container 平级，不会随画布移动) -->
+            <div class="empty-workbench-state">
+                <i class="fas fa-image"></i>
+                <p>上传或生成的图片将出现在这里</p>
+                <p style="font-size: 12px; margin-top: 10px;">拖拽图片重叠可触发融合反应</p>
+            </div>
+        </div>
+
+<!-- 工作台工具箱浮窗 -->
+<div id="workbenchToolbox" class="workbench-toolbox">
+    <button class="toolbox-btn select" title="选用此图"><i class="fas fa-check"></i></button>
+    <button class="toolbox-btn ai-spark" title="AI 创意灵感与图层编辑" style="color: #6366f1; font-weight: bold; position: relative; display: none;"><i class="fas fa-bolt"></i></button>
+    <button class="toolbox-btn box-extract" title="框选图层"><i class="fas fa-vector-square"></i></button>
+    <button class="toolbox-btn critique" title="智能体辩论/评审"><i class="fas fa-comments"></i></button>
+    <button class="toolbox-btn layers" title="语义图层分析"><i class="fas fa-sitemap"></i></button>
+    <button class="toolbox-btn magic-layers" title="Magic Layers"><i class="fas fa-layer-group"></i></button>
+    <button class="toolbox-btn precise-edit" title="精准编辑/局部重绘"><i class="fas fa-eraser"></i></button>
+    <button class="toolbox-btn camera-angle" title="相机角度变换"><i class="fas fa-camera"></i></button>
+    <button class="toolbox-btn veo-video" title="Veo 视频生成"><i class="fas fa-video"></i></button>
+    <button class="toolbox-btn upscale" title="智能高清"><i class="fas fa-wand-magic-sparkles"></i></button>
+    <button class="toolbox-btn multiview" title="多维视图 (建筑/空间三视图)"><i class="fas fa-cubes"></i></button>
+    <button class="toolbox-btn download" title="下载图片"><i class="fas fa-download"></i></button>
+    <button class="toolbox-btn delete" title="删除图片"><i class="fas fa-trash-alt"></i></button>
+</div>
+
+<!-- 工作台右键菜单 -->
+<div id="workbenchContextMenu" class="workbench-context-menu">
+    <div class="context-menu-item" id="ctxMenuGroup">
+        <i class="fas fa-object-group"></i> 编组
+    </div>
+    <div class="context-menu-item" id="ctxMenuAutoGrid">
+        <i class="fas fa-th"></i> 智能网格整理
+    </div>
+    <div class="context-menu-item" id="ctxMenuAddText">
+        <i class="fas fa-font"></i> 文本
+    </div>
+    <div class="context-menu-item has-submenu" id="ctxMenuShape">
+        <i class="fas fa-shapes"></i> 绘制形状 <i class="fas fa-chevron-right" style="margin-left: auto; font-size: 10px;"></i>
+        <div class="context-submenu">
+            <div class="context-menu-item" id="ctxMenuShapeRect"><i class="far fa-square"></i> 矩形</div>
+            <div class="context-menu-item" id="ctxMenuShapeEllipse"><i class="far fa-circle"></i> 椭圆</div>
+            <div class="context-menu-item" id="ctxMenuShapeLine"><i class="fas fa-minus"></i> 直线</div>
+            <div class="context-menu-item" id="ctxMenuShapeArrow"><i class="fas fa-long-arrow-alt-right"></i> 箭头</div>
+        </div>
+    </div>
+    <div class="context-menu-item" id="ctxMenuUpload">
+        <i class="fas fa-upload"></i> 上传新图片
+    </div>
+    <div class="context-menu-item" id="ctxMenuViewAll">
+        <i class="fas fa-expand-arrows-alt"></i> 查看全部
+    </div>
+    <div class="context-menu-item" id="ctxMenuSaveState">
+        <i class="fas fa-save"></i> 保存画板状态
+    </div>
+    <div class="context-menu-item" id="ctxMenuSaveAsset" style="display: none; color: #f59e0b;">
+        <i class="fas fa-star"></i> 存为独立资产
+    </div>
+    <div class="context-menu-item" id="ctxMenuCopyStyle" style="display: none;">
+        <i class="fas fa-copy"></i> 复制设计决策
+    </div>
+    <div class="context-menu-item" id="ctxMenuPasteStyle" style="display: none;">
+        <i class="fas fa-paste"></i> 粘贴设计决策
+    </div>
+</div>
+
+<!-- 形状调节器 -->
+<div id="shapeAdjuster" class="shape-adjuster">
+    <div class="adjuster-group">
+        <label>颜色</label>
+        <input type="color" id="shapeAdjusterColor" value="#2A5C82">
+    </div>
+    <div class="adjuster-group">
+        <label>线宽</label>
+        <input type="range" id="shapeAdjusterWidth" min="1" max="20" value="2">
+        <span id="shapeAdjusterWidthVal">2px</span>
+    </div>
+</div>
+
+<!-- 文本调节器 -->
+<div id="textAdjuster" class="shape-adjuster">
+    <div class="adjuster-group">
+        <label>颜色</label>
+        <input type="color" id="textAdjusterColor" value="#000000">
+    </div>
+    <div class="adjuster-group">
+        <label>字体</label>
+        <select id="textAdjusterFont" style="width: 100px; padding: 2px; border-radius: 4px; border: 1px solid #ccc;">
+            <option value="sans-serif">无衬线</option>
+            <option value="serif">衬线</option>
+            <option value="monospace">等宽</option>
+            <option value="cursive">手写</option>
+            <option value="Arial, sans-serif">Arial</option>
+            <option value="'Helvetica Neue', Helvetica, sans-serif">Helvetica</option>
+            <option value="'Times New Roman', Times, serif">Times New Roman</option>
+            <option value="Georgia, serif">Georgia</option>
+            <option value="'Courier New', Courier, monospace">Courier New</option>
+            <option value="Verdana, sans-serif">Verdana</option>
+            <option value="Impact, fantasy">Impact</option>
+            <option value="'Comic Sans MS', cursive">Comic Sans MS</option>
+            <option value="'Trebuchet MS', sans-serif">Trebuchet MS</option>
+            <option value="'Arial Black', sans-serif">Arial Black</option>
+            <option value="'Microsoft YaHei', sans-serif">微软雅黑</option>
+            <option value="SimSun, serif">宋体</option>
+            <option value="SimHei, sans-serif">黑体</option>
+            <option value="KaiTi, serif">楷体</option>
+            <option value="FangSong, serif">仿宋</option>
+        </select>
+    </div>
+    <div class="adjuster-group">
+        <label>粗细</label>
+        <select id="textAdjusterWeight" style="width: 70px; padding: 2px; border-radius: 4px; border: 1px solid #ccc;">
+            <option value="normal">常规</option>
+            <option value="bold">加粗</option>
+            <option value="300">细体</option>
+            <option value="900">黑体</option>
+        </select>
+    </div>
+    <div class="adjuster-group" style="gap: 4px;">
+        <label>大小</label>
+        <div style="display: flex; align-items: center; gap: 4px;">
+            <button id="textAdjusterSizeMinus" style="padding: 0 4px; border: 1px solid #ccc; background: white; cursor: pointer; border-radius: 4px;" title="减小字体"><i class="fas fa-minus" style="font-size: 10px;"></i></button>
+            <input type="range" id="textAdjusterSize" min="1" max="150" value="24" style="width: 60px;">
+            <button id="textAdjusterSizePlus" style="padding: 0 4px; border: 1px solid #ccc; background: white; cursor: pointer; border-radius: 4px;" title="增大字体"><i class="fas fa-plus" style="font-size: 10px;"></i></button>
+        </div>
+        <span id="textAdjusterSizeVal" style="width: 36px; text-align: right;">24px</span>
+    </div>
+    <div class="adjuster-group">
+        <label>对齐</label>
+        <div style="display: flex; gap: 4px;">
+            <button id="textAlignLeft" style="padding: 2px 6px; border: 1px solid #ccc; background: #eee; cursor: pointer; border-radius: 4px;"><i class="fas fa-align-left"></i></button>
+            <button id="textAlignCenter" style="padding: 2px 6px; border: 1px solid #ccc; background: white; cursor: pointer; border-radius: 4px;"><i class="fas fa-align-center"></i></button>
+            <button id="textAlignRight" style="padding: 2px 6px; border: 1px solid #ccc; background: white; cursor: pointer; border-radius: 4px;"><i class="fas fa-align-right"></i></button>
+        </div>
+    </div>
+</div>
+
+<!-- 环形注入菜单 (Pie Menu) -->
+<div id="injectionMenu" class="injection-menu">
+    <div class="injection-option" data-action="style">
+        <i class="fas fa-palette"></i>
+        <span class="injection-label">风格注入</span>
+    </div>
+    <div class="injection-option" data-action="composition">
+        <i class="fas fa-crop-alt"></i>
+        <span class="injection-label">构图注入</span>
+    </div>
+    <div class="injection-option" data-action="composite">
+        <i class="fas fa-object-group"></i>
+        <span class="injection-label">主体融合</span>
+    </div>
+    <div class="injection-option" data-action="cancel">
+        <i class="fas fa-times"></i>
+        <span class="injection-label">取消</span>
+    </div>
+</div>
+        
+        <div class="chat-panel collapsed">
+            <button class="toggle-chat" id="toggleChatBtn" title="切换聊天面板">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="sidebar-icon-svg chat-open-indicator">
+                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+                </svg>
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="sidebar-icon-svg chat-close-indicator">
+                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                    <line x1="15" y1="3" x2="15" y2="21"></line>
+                </svg>
+            </button>
+            <div class="chat-header">
+                <button class="hamburger-menu" id="hamburgerMenu">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="sidebar-icon-svg">
+                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                        <line x1="15" y1="3" x2="15" y2="21"></line>
+                    </svg>
+                </button>
+                <div style="display: flex; align-items: center; gap: 12px;">
+                    <div>
+                        MarmoAid 图像助手
+                        <div style="font-size: 13px; font-weight: normal;"> </div>
+                    </div>
+                </div>
+                <div class="header-right">
+                    
+                    <div class="credit-counter" id="creditCounter">
+                        <i class="fas fa-bolt"></i>
+                        <span id="remainingCredits">--</span>
+                    </div>
+                </div>
+            </div>
+            <div class="chat-messages" id="chatMessages">
+                <!-- Messages will be dynamically inserted here -->
+            </div>
+            <div class="input-area">
+                <div class="input-container-wrapper">
+                    <span id="mainImagePreview"></span>
+                    <textarea id="userInput" placeholder="输入您的指令...（例：生成一张风景画，或上传图片进行编辑）"></textarea>
+                    <div class="input-footer">
+                        <div class="input-footer-right" style="margin-left: auto;">
+                            <div class="plus-menu-container">
+                                <button id="plusMenuBtn" title="更多选项" class="circle-btn">
+                                    <i class="fas fa-plus"></i>
+                                </button>
+                                <div id="plusMenu" class="plus-menu hidden">
+                                    <button id="menuUploadBtn"><i class="fas fa-image"></i> 上传图片</button>
+                                    
+                                    <div id="workflowMenuContainer" style="position: relative;">
+                                        <button id="menuWorkflowBtn" style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
+                                            <span><i class="fas fa-layer-group"></i> 场景全案工作流</span>
+                                            <i class="fas fa-chevron-right" style="font-size: 10px; opacity: 0.7;"></i>
+                                        </button>
+                                        <div id="scenarioSubMenu" class="plus-menu" style="position: absolute; right: 100%; top: 0; bottom: auto; margin-right: 4px; display: none; z-index: 101;">
+                                            <button class="scenario-option-btn" data-scenario="interior"><i class="fas fa-home" style="width: 20px;"></i> 室内设计提案</button>
+                                            <button class="scenario-option-btn" data-scenario="ecommerce"><i class="fas fa-shopping-bag" style="width: 20px;"></i> 电商爆款上新</button>
+                                            <button class="scenario-option-btn" data-scenario="ip_creation"><i class="fas fa-user-astronaut" style="width: 20px;"></i> IP角色孵化</button>
+                                        </div>
+                                    </div>
+                                    <button id="exitWorkflowBtn" class="hidden"><i class="fas fa-comment"></i> 切换普通对话模式</button>
+
+                                    <div class="plus-menu-divider"></div>
+                                    <div class="plus-menu-item-select">
+                                        <i class="fas fa-cube"></i>
+                                        <select id="modelSelect">
+                                            <option value="gpt-image-2" selected>GPT-image-2 (中转高精生成/编辑)</option>
+                                            <option value="qwen-cleanplate">Qwen Clean Plate (仅背景净化)</option>
+                                            <option value="flash">Gemini 3 Flash/Banana 2</option>
+                                            <option value="pro">Gemini 3.1 Pro/Banana pro</option>
+                                            <option value="lite">Gemini 3.1 Flash Lite/Banana </option>
+                                        </select>
+                                    </div>
+                                    <button id="thinkingLevelToggle"><i class="fas fa-brain"></i> 思考: LOW</button>
+                                </div>
+                            </div>
+                            <button id="sendBtn" disabled title="发送" class="circle-btn">
+                                <i class="fas fa-arrow-up"></i>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+                <input type="file" id="mainImageUpload" accept="image/*" style="display:none;" multiple>
+            </div>
+        </div>
+    </div>
+    
+    <div id="maskEditorModal" class="mask-editor-modal">
+        <div class="mask-editor-content">
+            <div class="mask-editor-header">
+                <div style="display: flex; align-items: center; gap: 20px;">
+                    <h3>绘制蒙版区域 (在要替换或重绘的区域上涂抹)</h3>
+                    <div class="mask-tool-selector" style="display: flex; gap: 15px; align-items: center; background: #f0f0f0; padding: 5px 10px; border-radius: 8px;">
+                        <label style="cursor: pointer; display: flex; align-items: center; gap: 5px; font-size: 14px;"><input type="radio" name="maskTool" value="lasso" checked> 套索</label>
+                        <label style="cursor: pointer; display: flex; align-items: center; gap: 5px; font-size: 14px;"><input type="radio" name="maskTool" value="box"> 框选</label>
+                    </div>
+                </div>
+                <button id="closeMaskEditor" class="close-btn">&times;</button>
+            </div>
+            <div class="mask-editor-body">
+                <div id="maskCanvasContainer">
+                    <!-- Canvases will be created here by JS -->
+                </div>
+            </div>
+            <div class="mask-editor-footer">
+                <div class="tool-controls">
+                    <div class="lasso-hint" id="maskToolHint">按住鼠标左键沿物体边缘拖拽完成套索</div>
+                    <div>松开鼠标后自动闭合选区，可重新按下重新勾勒。</div>
+                </div>
+                <div class="action-buttons">
+                    <button id="cancelMask" class="btn-secondary">取消</button>
+                    <button id="applyMask" class="btn-primary">应用蒙版</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- UX Enhancement Elements -->
+    <div id="magicWandModal">
+        <div class="magic-wand-header">您想用这张图做什么？</div>
+        <div class="magic-wand-actions">
+            <button class="magic-wand-btn" data-action="style-transfer">风格转换</button>
+            <button class="magic-wand-btn" data-action="inpaint">局部重绘</button>
+            <button class="magic-wand-btn" data-action="outpaint">智能扩图</button>
+            <button class="magic-wand-btn" data-action="query">咨询图片</button>
+        </div>
+    </div>
+    
+    <!-- NEW: Credit Purchase Modal -->
+    <div id="creditModal" class="credit-modal">
+        <div class="credit-modal-content">
+            <div class="credit-modal-header">
+                <h3>充值点数</h3>
+                <button id="closeCreditModal" class="close-btn">&times;</button>
+            </div>
+            <div class="credit-modal-body">
+                <p>选择一个套餐包以继续您的创作之旅！</p>
+                <div class="credit-options">
+                    <div class="credit-option">
+                        <div class="credits">100 点</div>
+                        <div class="price">¥10</div>
+                    </div>
+                    <div class="credit-option recommended">
+                        <div class="recommended-badge">推荐</div>
+                        <div class="credits">550 点</div>
+                        <div class="price">¥50</div>
+                    </div>
+                    <div class="credit-option">
+                        <div class="credits">1200 点</div>
+                        <div class="price">¥100</div>
+                    </div>
+                </div>
+            </div>
+            <div class="credit-modal-footer">
+                <button class="btn-primary" style="width: 100%;">立即充值</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- NEW: Delete Confirmation Modal -->
+    <div id="deleteConfirmModal" class="modal">
+        <div class="modal-content" style="max-width: 380px;">
+            <div class="modal-header">
+                <h3>确认删除</h3>
+                <button id="closeDeleteModal" class="close-btn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p>您确定要永久删除这个对话吗？此操作无法撤销。</p>
+            </div>
+            <div class="modal-footer">
+                <button id="cancelDeleteBtn" class="btn btn-cancel">取消</button>
+                <button id="confirmDeleteBtn" class="btn btn-confirm">确认删除</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 相机角度变换 Modal -->
+    <div id="cameraAngleModal" class="modal">
+        <div class="modal-content" style="max-width: 360px; background: white; border-radius: 12px; padding: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.2);">
+            <div class="modal-header" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+                <h3 style="margin: 0; font-size: 16px; color: #333;"><i class="fas fa-camera"></i> 相机角度变换</h3>
+                <button id="closeCameraAngleBtn" class="close-btn" style="background: none; border: none; font-size: 20px; cursor: pointer; color: #888;">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="camera-orbit-scene" style="perspective: 800px; width: 100%; height: 180px; position: relative; display: flex; justify-content: center; align-items: center; background: #f8f9fa; border-radius: 8px; border: 1px solid #eee; overflow: hidden; margin-bottom: 20px;">
+                    <div class="orbit-world" style="transform-style: preserve-3d; transform: rotateX(-20deg) rotateY(-30deg); position: relative; width: 0; height: 0;">
+                        <!-- Grid Floor (XZ plane) -->
+                        <div class="orbit-grid" style="position: absolute; width: 200px; height: 200px; top: -100px; left: -100px; transform: rotateX(90deg); background-image: linear-gradient(rgba(0,0,0,0.1) 1px, transparent 1px), linear-gradient(90deg, rgba(0,0,0,0.1) 1px, transparent 1px); background-size: 20px 20px; border: 1px solid rgba(0,0,0,0.1);"></div>
+                        
+                        <!-- Horizontal Orbit Ring (Blue, XZ plane) -->
+                        <div class="orbit-ring-h" style="position: absolute; width: 160px; height: 160px; top: -80px; left: -80px; transform: rotateX(90deg); border: 2px solid #4285f4; border-radius: 50%; box-sizing: border-box; opacity: 0.5;"></div>
+                        
+                        <!-- Vertical Orbit Arc (Purple, YZ plane) -->
+                        <div class="orbit-ring-v" style="position: absolute; width: 160px; height: 160px; top: -80px; left: -80px; transform: rotateY(90deg); border: 2px solid #a142f4; border-radius: 50%; box-sizing: border-box; opacity: 0.5;"></div>
+                        
+                        <!-- Central Image (XY plane) -->
+                        <div class="orbit-center-img" style="position: absolute; width: 60px; height: 60px; top: -30px; left: -30px; transform: translateZ(0); display: flex; justify-content: center; align-items: center; transform-style: preserve-3d;">
+                            <img id="cameraPreviewImg" src="" class="generated-image" style="max-width: 100%; max-height: 100%; object-fit: contain; box-shadow: 0 4px 12px rgba(0,0,0,0.2); border: 2px solid white; background: white;">
+                        </div>
+                        
+                        <!-- Camera Object Wrapper -->
+                        <div id="orbitCameraWrapper" style="position: absolute; top: 0; left: 0; transform-style: preserve-3d; transition: transform 0.1s ease-out;">
+                            <!-- Line to center -->
+                            <div id="orbitCameraLine" style="position: absolute; top: 0; left: -1px; width: 2px; height: 80px; background: #fbbc05; transform-origin: top center; transform: rotateX(-90deg); opacity: 0.8; transition: height 0.1s ease-out;"></div>
+                            <!-- Camera Icon -->
+                            <div id="orbitCamera" style="position: absolute; top: -12px; left: -12px; width: 24px; height: 24px; transform: translateZ(80px) rotateY(180deg); display: flex; justify-content: center; align-items: center; color: #ea4335; font-size: 18px; text-shadow: 0 2px 4px rgba(0,0,0,0.3); transition: transform 0.1s ease-out;">
+                                <i class="fas fa-video"></i>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="camera-controls" style="display: flex; flex-direction: column; gap: 16px;">
+                    <div class="control-group">
+                        <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+                            <label style="font-weight: 500; color: #555; font-size: 13px;">水平旋转 (Rotate)</label>
+                            <span id="cameraRotateVal" style="color: #1a73e8; font-weight: 600; font-size: 13px;">0°</span>
+                        </div>
+                        <input type="range" id="cameraRotate" min="-90" max="90" value="0" style="width: 100%; accent-color: #1a73e8;">
+                        <div style="display: flex; justify-content: space-between; font-size: 11px; color: #999; margin-top: 2px;">
+                            <span>向左转</span><span>向右转</span>
+                        </div>
+                    </div>
+                    <div class="control-group">
+                        <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+                            <label style="font-weight: 500; color: #555; font-size: 13px;">垂直俯仰 (Vertical)</label>
+                            <span id="cameraVerticalVal" style="color: #1a73e8; font-weight: 600; font-size: 13px;">0°</span>
+                        </div>
+                        <input type="range" id="cameraVertical" min="-90" max="90" value="0" style="width: 100%; accent-color: #1a73e8;">
+                        <div style="display: flex; justify-content: space-between; font-size: 11px; color: #999; margin-top: 2px;">
+                            <span>仰视</span><span>俯视</span>
+                        </div>
+                    </div>
+                    <div class="control-group">
+                        <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+                            <label style="font-weight: 500; color: #555; font-size: 13px;">缩放距离 (Zoom)</label>
+                            <span id="cameraZoomVal" style="color: #1a73e8; font-weight: 600; font-size: 13px;">0%</span>
+                        </div>
+                        <input type="range" id="cameraZoom" min="-50" max="50" value="0" style="width: 100%; accent-color: #1a73e8;">
+                        <div style="display: flex; justify-content: space-between; font-size: 11px; color: #999; margin-top: 2px;">
+                            <span>拉远</span><span>拉近</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer" style="margin-top: 20px; display: flex; justify-content: flex-end; gap: 10px;">
+                <button id="resetCameraBtn" class="btn btn-cancel" style="padding: 8px 16px; border: 1px solid #ddd; border-radius: 6px; background: white; cursor: pointer; font-weight: 500; color: #555; font-size: 13px;">重置</button>
+                <button id="applyCameraAngleBtn" class="btn btn-confirm" style="padding: 8px 16px; border: none; border-radius: 6px; background: #1a73e8; color: white; cursor: pointer; font-weight: 500; display: flex; align-items: center; gap: 6px; font-size: 13px;"><i class="fas fa-magic"></i> 生成变换</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- NEW: Real-time Latent Canvas Modal -->
+    <div id="latentCanvasModal" class="latent-canvas-modal">
+        <div class="latent-toolbar-top">
+            <div class="latent-title"><i class="fas fa-magic"></i> 实时灵感绘图 (Real-time Sketch)</div>
+            <div class="latent-actions">
+                <button class="btn-send-workbench" id="latentSendToWorkbench"><i class="fas fa-upload"></i> 发送到工作台</button>
+                <button class="btn-close-latent" id="latentCloseBtn"><i class="fas fa-times"></i></button>
+            </div>
+        </div>
+        <div class="latent-split-container">
+            <!-- Sketch Pane -->
+            <div class="sketch-pane">
+                <div class="brush-tools">
+                    <button class="brush-btn active" id="toolPencil" title="画笔"><i class="fas fa-pencil-alt"></i></button>
+                    <button class="brush-btn" id="toolEraser" title="橡皮擦"><i class="fas fa-eraser"></i></button>
+                    <button class="brush-btn" id="toolClear" title="清空"><i class="fas fa-trash"></i></button>
+                    <div style="width: 36px; height: 1px; background: #475569; margin: 4px 0;"></div>
+                    <button class="brush-btn" id="latentUndo" title="撤销"><i class="fas fa-undo"></i></button>
+                </div>
+                <div class="canvas-wrapper">
+                    <canvas id="latentSketchCanvas" width="512" height="512"></canvas>
+                </div>
+            </div>
+            <!-- Result Pane -->
+            <div class="result-pane">
+                <!-- 1. 空状态提示 (放在底层) -->
+               <div class="empty-workbench-state" style="z-index: 0; position: absolute;">
+                    <i class="fas fa-magic"></i>
+                    <p>灵感绘图结果将出现在这里</p>
+                    <p style="font-size: 12px; margin-top: 10px;">左侧绘制草图，右侧实时生成</p>
+                </div>
+
+                <!-- 2. 结果图片 (必须保留 id="latentResultImg") -->
+                <!-- 技巧：src 设为一个透明像素，这样没图时能透出底下的文字，有图时会盖住文字 -->
+                <img id="latentResultImg" 
+                     src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" 
+                     alt="AI Result" 
+                     class="generated-image"
+                     style="position: relative; z-index: 1; width: 100%; height: 100%; object-fit: contain;">
+
+                <!-- 3. 加载动画 (放在最上层) -->
+                <div class="latent-loader" id="latentLoader" style="z-index: 2;">
+                    <div class="spinner"></div>
+                    <span>渲染中...</span>
+                </div>
+            </div>
+        </div>
+        <div class="latent-controls-bottom">
+            <button class="brush-btn" id="latentRandomizeSeed" title="切换风格 / 随机种子" style="width: 40px; height: 40px; margin-right: 12px; background: #334155; border: 1px solid #475569;">
+                <i class="fas fa-dice" style="color: #cbd5e1;"></i>
+            </button>
+            <input type="text" id="latentPrompt" class="latent-prompt-input" placeholder="描述您的画面 (例如: A futuristic city in neon style, 4k)...">
+            <div class="toggle-realtime">
+                <span>实时生成</span>
+                <label class="switch">
+                    <input type="checkbox" id="realtimeToggle" checked>
+                    <span class="slider"></span>
+                </label>
+            </div>
+            <button class="btn-primary" id="latentGenerateBtn" style="padding: 10px 24px;">生成</button>
+        </div>
+    </div>
+    <div id="productSidebar" class="product-sidebar">
+        <div class="product-header">
+            <h3 style="font-size: 16px;"><i class="fas fa-search-dollar"></i> 相似商品推荐</h3>
+            <button id="closeProductSidebar" style="background:none; border:none; font-size:18px; cursor:pointer;">&times;</button>
+        </div>
+        <div id="productResults" class="product-results">
+            <!-- JS 注入卡片 -->
+        </div>
+        <div id="productLoading" style="display:none; flex-direction:column; align-items:center; justify-content:center; height:200px; color:#666;">
+            <div class="spinner" style="border-top-color: #8b5cf6;"></div>
+            <p style="margin-top:10px; font-size:12px;">正在全网搜索相似好物...</p>
+        </div>
+    </div>
+
+<script type="module" src="/auth.js"></script>
+<script type="module">
+    import { initAuth } from "/auth.js";
+    document.addEventListener("DOMContentLoaded", async () => {
+        console.log('DOM 已加载，尝试初始化 auth.js...');
+        try {
+            await initAuth();
+            console.log('auth.js 初始化完成.');
+            const userStatusElement = document.querySelector('.sidebar-footer .user-status')
+            if (userStatusElement) {
+              userStatusElement.style.cursor = 'pointer';
+              userStatusElement.addEventListener('click', (event) => {
+                if (!event.target.closest('a')) {
+                  console.log('User status area clicked, navigating to user profile.');
+                  window.location.href = '/user-profile';
+                }
+              });
+            } else {
+                console.warn("找不到 .user-status 元素来添加点击事件");
+            }
+            const authState = window.auth?.getState ? window.auth.getState() : null;
+
+            if (authState?.isLoggedIn && window.auth?.updateCreditCounter) {
+                 console.log('用户已登录，尝试更新积分显示...');
+                 window.auth.updateCreditCounter(authState.userInfo?.sub).catch(console.error);
+            } else if (window.auth?.getState) {
+               console.log('auth.js 初始化完成，用户未登录。');
+            } else {
+               console.warn('auth.js 初始化完成，但 getState 方法不可用。');
+            }
+        } catch (error) {
+            console.error('auth.js 初始化失败:', error);
+            alert('认证系统初始化失败，请刷新页面或稍后重试。');
+        }
+    });
+
+  </script>
+<script type="module" src="/src/main.js"></script>
+</body> 
+</html>

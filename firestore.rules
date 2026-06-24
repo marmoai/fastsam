@@ -1,0 +1,77 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: users
+    // Document ID: {userId}
+    // Fields:
+    //   - uid: string (required)
+    //   - email: string (required)
+    //   - displayName: string
+    //   - photoURL: string
+    //   - credits: integer (required)
+    //   - createdAt: timestamp
+    //
+    // Collection: users/{userId}/history
+    // Document ID: {historyId}
+    // Fields:
+    //   - userId: string (required)
+    //   - prompt: string
+    //   - imageUrl: string (required)
+    //   - timestamp: timestamp (required)
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
+          (request.auth.token.email == "allentsai762@gmail.com" && request.auth.token.email_verified == true));
+    }
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'email', 'credits']) &&
+             data.uid is string &&
+             data.email is string &&
+             data.credits is int &&
+             data.credits >= 0;
+    }
+
+    function isValidHistory(data) {
+      return data.keys().hasAll(['userId', 'imageUrl', 'timestamp']) &&
+             data.userId is string &&
+             data.imageUrl is string &&
+             data.timestamp is timestamp;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+      allow create: if isOwner(userId) && isValidUser(request.resource.data) && request.resource.data.credits == 10; // Initial 10 credits
+      allow update: if (isOwner(userId) && isValidUser(request.resource.data) && request.resource.data.credits == resource.data.credits) || isAdmin();
+      
+      match /history/{historyId} {
+        allow read: if isOwner(userId) || isAdmin();
+        allow create: if isOwner(userId) && isValidHistory(request.resource.data);
+        allow delete: if isOwner(userId) || isAdmin();
+      }
+    }
+  }
+}
