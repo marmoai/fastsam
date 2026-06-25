@@ -1,4 +1,4 @@
-name: Build and Push GHCR Image
+name: Build and Push Container Images
 
 on:
   push:
@@ -8,6 +8,8 @@ on:
 
 env:
   IMAGE_NAME: marmo-sam-gpu
+  TCR_REGISTRY: ccr.ccs.tencentyun.com
+  TCR_NAMESPACE: fastsam
 
 jobs:
   build-and-push:
@@ -30,11 +32,27 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
+      - name: Log in to Tencent TCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.TCR_REGISTRY }}
+          username: ${{ secrets.TCR_USERNAME }}
+          password: ${{ secrets.TCR_PASSWORD }}
+
+      - name: Extract metadata for GHCR
+        id: meta_ghcr
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=
+
+      - name: Extract metadata for Tencent TCR
+        id: meta_tcr
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.TCR_REGISTRY }}/${{ env.TCR_NAMESPACE }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest
             type=sha,prefix=
@@ -45,7 +63,9 @@ jobs:
           context: ./fastsam-backend
           file: ./fastsam-backend/Dockerfile
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: |
+            ${{ steps.meta_ghcr.outputs.tags }}
+            ${{ steps.meta_tcr.outputs.tags }}
+          labels: ${{ steps.meta_ghcr.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
