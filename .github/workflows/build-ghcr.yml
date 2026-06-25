@@ -53,14 +53,6 @@ jobs:
       - name: Install skopeo
         run: sudo apt-get update && sudo apt-get install -y skopeo
 
-      - name: Copy latest image to Tencent TCR
-        run: |
-          skopeo copy --retry-times 5 \
-            --src-creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
-            --dest-creds "${{ secrets.TCR_USERNAME }}:${{ secrets.TCR_PASSWORD }}" \
-            docker://ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest \
-            docker://${{ env.TCR_REGISTRY }}/${{ env.TCR_NAMESPACE }}/${{ env.IMAGE_NAME }}:latest
-
       - name: Copy sha tag to Tencent TCR
         run: |
           skopeo copy --retry-times 5 \
