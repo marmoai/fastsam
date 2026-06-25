@@ -47,6 +47,8 @@ jobs:
           context: ./fastsam-backend
           file: ./fastsam-backend/Dockerfile
           push: true
+          provenance: false
+          sbom: false
           tags: ${{ steps.meta_tcr.outputs.tags }}
           labels: ${{ steps.meta_tcr.outputs.labels }}
           cache-from: type=gha
