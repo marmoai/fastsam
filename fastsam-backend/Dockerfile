@@ -20,14 +20,6 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --upgrade pip && \
     pip install -r /app/requirements.txt
 
-RUN python - <<'PY'
-from ultralytics.utils.downloads import attempt_download_asset
-
-for name in ("FastSAM-x.pt", "FastSAM-s.pt", "mobile_sam.pt", "sam_b.pt"):
-    path = attempt_download_asset(name)
-    print(f"downloaded {name} -> {path}")
-PY
-
 COPY main.py /app/main.py
 
 ENV FASTSAM_MODEL_PATH=/app/FastSAM-x.pt
