@@ -9,6 +9,7 @@ import time
 import io
 import os
 from PIL import Image
+from urllib.request import urlopen
 
 app = FastAPI()
 
@@ -20,10 +21,67 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
+
+MODEL_CACHE_DIR = os.getenv("MODEL_CACHE_DIR", "/tmp/models")
+MODEL_BASE_URL = os.getenv("MODEL_BASE_URL", "https://www.marmoai.cn/models/fastsam").rstrip("/")
+MODEL_DOWNLOAD_TIMEOUT = int(os.getenv("MODEL_DOWNLOAD_TIMEOUT", "300"))
+OSS_PUBLIC_BASE_URL = os.getenv("OSS_PUBLIC_BASE_URL", "https://www.marmoai.cn").rstrip("/")
 FASTSAM_MODEL_PATH = os.getenv("FASTSAM_MODEL_PATH", "FastSAM-x.pt")
 SAM_MODEL_PATH = os.getenv("SAM_MODEL_PATH", "sam_b.pt")
+FASTSAM_MODEL_URL = os.getenv("FASTSAM_MODEL_URL", f"{MODEL_BASE_URL}/FastSAM-x.pt")
+SAM_MODEL_URL = os.getenv("SAM_MODEL_URL", f"{MODEL_BASE_URL}/sam_b.pt")
 fastsam_model = None
 sam_model = None
+
+
+def resolve_model_url(model_url):
+    if not model_url:
+        return model_url
+    if not model_url.startswith("oss://"):
+        return model_url
+
+    bucket_and_key = model_url[len("oss://"):]
+    _, _, object_key = bucket_and_key.partition("/")
+    if not object_key:
+        raise ValueError(f"Invalid OSS model URL: {model_url}")
+    return f"{OSS_PUBLIC_BASE_URL}/{object_key.lstrip('/')}"
+
+
+def ensure_model_file(configured_path, fallback_url, filename, label):
+    if configured_path and os.path.isfile(configured_path):
+        return configured_path
+
+    os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
+    cached_path = os.path.join(MODEL_CACHE_DIR, filename)
+    if os.path.isfile(cached_path):
+        print(f"Using cached {label} model: {cached_path}")
+        return cached_path
+
+    model_url = resolve_model_url(fallback_url)
+    if not model_url:
+        raise FileNotFoundError(
+            f"{label} model is missing. Set {label.upper()}_MODEL_PATH or {label.upper()}_MODEL_URL."
+        )
+
+    temp_path = f"{cached_path}.part"
+    print(f"Downloading {label} model from {model_url} to {cached_path}")
+    try:
+        with urlopen(model_url, timeout=MODEL_DOWNLOAD_TIMEOUT) as response, open(temp_path, "wb") as file_obj:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                file_obj.write(chunk)
+        os.replace(temp_path, cached_path)
+    except Exception:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
+
+    size_mb = os.path.getsize(cached_path) / (1024 * 1024)
+    print(f"Cached {label} model at {cached_path} ({size_mb:.2f} MB)")
+    return cached_path
 
 
 def get_fastsam_model():
@@ -31,18 +89,21 @@ def get_fastsam_model():
     if fastsam_model is not None:
         return fastsam_model
 
-    print(f"Loading FastSAM model: {FASTSAM_MODEL_PATH}")
-    fastsam_model = FastSAM(FASTSAM_MODEL_PATH)
+    model_path = ensure_model_file(FASTSAM_MODEL_PATH, FASTSAM_MODEL_URL, "FastSAM-x.pt", "fastsam")
+    print(f"Loading FastSAM model: {model_path}")
+    fastsam_model = FastSAM(model_path)
     print("FastSAM model loaded.")
     return fastsam_model
+
 
 def get_sam_model():
     global sam_model
     if sam_model is not None:
         return sam_model
 
-    print(f"Loading high precision SAM model: {SAM_MODEL_PATH}")
-    sam_model = SAM(SAM_MODEL_PATH)
+    model_path = ensure_model_file(SAM_MODEL_PATH, SAM_MODEL_URL, "sam_b.pt", "sam")
+    print(f"Loading high precision SAM model: {model_path}")
+    sam_model = SAM(model_path)
     print("High precision SAM model loaded.")
     return sam_model
 

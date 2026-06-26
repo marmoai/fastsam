@@ -4,6 +4,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PIP_NO_CACHE_DIR=1
+ENV YOLO_CONFIG_DIR=/tmp/Ultralytics
+ENV MODEL_CACHE_DIR=/tmp/models
+ENV MODEL_BASE_URL=https://www.marmoai.cn/models/fastsam
 
 WORKDIR /app
 
@@ -24,8 +27,6 @@ RUN pip install --upgrade pip && \
 
 COPY main.py /app/main.py
 
-ENV FASTSAM_MODEL_PATH=/app/FastSAM-x.pt
-ENV SAM_MODEL_PATH=/app/sam_b.pt
 ENV PORT=8000
 
 EXPOSE 8000
