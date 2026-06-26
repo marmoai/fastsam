@@ -2,5 +2,5 @@ fastapi
 uvicorn
 ultralytics
 opencv-python-headless
-numpy
+numpy<2
 pillow

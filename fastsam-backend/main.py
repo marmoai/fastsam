@@ -20,13 +20,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load Model
 FASTSAM_MODEL_PATH = os.getenv("FASTSAM_MODEL_PATH", "FastSAM-x.pt")
 SAM_MODEL_PATH = os.getenv("SAM_MODEL_PATH", "sam_b.pt")
-print(f"Loading FastSAM model: {FASTSAM_MODEL_PATH}")
-model = FastSAM(FASTSAM_MODEL_PATH)
-print("Model loaded.")
+fastsam_model = None
 sam_model = None
+
+
+def get_fastsam_model():
+    global fastsam_model
+    if fastsam_model is not None:
+        return fastsam_model
+
+    print(f"Loading FastSAM model: {FASTSAM_MODEL_PATH}")
+    fastsam_model = FastSAM(FASTSAM_MODEL_PATH)
+    print("FastSAM model loaded.")
+    return fastsam_model
 
 def get_sam_model():
     global sam_model
@@ -87,6 +95,11 @@ def run_sam_bbox_inference(
         )
     finally:
         predictor.args.imgsz = previous_imgsz
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
 
 
 def run_sam_mask_refine_inference(
@@ -3506,7 +3519,8 @@ async def segment(request: Request):
                 return JSONResponse(content={"success": True, "engine": "sam", "cutouts": cutouts})
 
             # Default FastSAM path: global candidate masks + existing merge logic.
-            results = model(img, retina_masks=True, imgsz=1024, conf=0.25, iou=0.9)
+            fastsam = get_fastsam_model()
+            results = fastsam(img, retina_masks=True, imgsz=1024, conf=0.25, iou=0.9)
             masks = normalize_result_masks(results, w, h)
 
             def fastsam_mask_provider(target_bbox, layer_meta, index):
@@ -3532,7 +3546,8 @@ async def segment(request: Request):
                 )
 
             print("No bounding boxes provided, fallback to segment everything")
-            results = model(img, retina_masks=True, imgsz=1024, conf=0.4, iou=0.9)
+            fastsam = get_fastsam_model()
+            results = fastsam(img, retina_masks=True, imgsz=1024, conf=0.4, iou=0.9)
             
             layers = []
             if len(results) > 0 and results[0].masks is not None:
