@@ -43,14 +43,7 @@ jobs:
           load: true
           provenance: false
           sbom: false
-          tags: |
-            local/${{ env.IMAGE_NAME }}:latest
-            local/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.short_sha }}
-
-      - name: Push latest to Tencent TCR
-        run: |
-          docker tag local/${{ env.IMAGE_NAME }}:latest ${{ env.TCR_REGISTRY }}/${{ env.TCR_NAMESPACE }}/${{ env.IMAGE_NAME }}:latest
-          docker push ${{ env.TCR_REGISTRY }}/${{ env.TCR_NAMESPACE }}/${{ env.IMAGE_NAME }}:latest
+          tags: local/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.short_sha }}
 
       - name: Push sha tag to Tencent TCR
         run: |
