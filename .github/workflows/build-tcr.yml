@@ -10,6 +10,7 @@ env:
   IMAGE_NAME: marmo-sam-gpu
   TCR_REGISTRY: ccr.ccs.tencentyun.com
   TCR_NAMESPACE: fastsam
+  MODEL_BASE_URL: https://www.marmoai.cn/models/fastsam
 
 jobs:
   build-and-push:
@@ -34,6 +35,15 @@ jobs:
       - name: Compute tag
         id: vars
         run: echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Download model assets
+        run: |
+          curl -fL --retry 3 --retry-delay 5 \
+            -o fastsam-backend/FastSAM-x.pt \
+            "${MODEL_BASE_URL}/FastSAM-x.pt"
+          curl -fL --retry 3 --retry-delay 5 \
+            -o fastsam-backend/sam_b.pt \
+            "${MODEL_BASE_URL}/sam_b.pt"
 
       - name: Build and load image locally
         uses: docker/build-push-action@v6
