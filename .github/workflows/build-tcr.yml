@@ -45,17 +45,12 @@ jobs:
             -o fastsam-backend/sam_b.pt \
             "${MODEL_BASE_URL}/sam_b.pt"
 
-      - name: Build and load image locally
+      - name: Build and push image to Tencent TCR
         uses: docker/build-push-action@v6
         with:
           context: ./fastsam-backend
           file: ./fastsam-backend/Dockerfile
-          load: true
+          push: true
           provenance: false
           sbom: false
-          tags: local/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.short_sha }}
-
-      - name: Push sha tag to Tencent TCR
-        run: |
-          docker tag local/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.short_sha }} ${{ env.TCR_REGISTRY }}/${{ env.TCR_NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.short_sha }}
-          docker push ${{ env.TCR_REGISTRY }}/${{ env.TCR_NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.short_sha }}
+          tags: ${{ env.TCR_REGISTRY }}/${{ env.TCR_NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.short_sha }}
