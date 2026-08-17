@@ -28,6 +28,7 @@ RUN pip install --upgrade pip && \
 COPY main.py /app/main.py
 COPY FastSAM-x.pt /app/FastSAM-x.pt
 COPY sam_b.pt /app/sam_b.pt
+COPY sam_l.pt /app/sam_l.pt
 
 ENV PORT=8000
 
