@@ -1,13 +1,22 @@
+import gc
+import os
+import threading
+
+# Configure PyTorch before Ultralytics imports it. This reduces allocator
+# fragmentation during the mutually-exclusive SAM-B/SAM-L model switch.
+os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+import torch
 from ultralytics import FastSAM, SAM
 import cv2
 import numpy as np
 import base64
 import time
 import io
-import os
 from PIL import Image
 from urllib.request import urlopen
 
@@ -20,8 +29,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
 
 MODEL_CACHE_DIR = os.getenv("MODEL_CACHE_DIR", "/tmp/models")
 MODEL_BASE_URL = os.getenv("MODEL_BASE_URL", "https://www.marmoai.cn/models/fastsam").rstrip("/")
@@ -37,6 +44,7 @@ SAM_B_MODEL_URL = os.getenv("SAM_B_MODEL_URL", SAM_MODEL_URL)
 SAM_L_MODEL_URL = os.getenv("SAM_L_MODEL_URL", f"{MODEL_BASE_URL}/sam_l.pt")
 fastsam_model = None
 sam_models = {}
+sam_runtime_lock = threading.RLock()
 
 
 def resolve_model_url(model_url):
@@ -102,6 +110,13 @@ def get_fastsam_model():
 
 def get_sam_model(model_variant="b"):
     variant = "l" if str(model_variant).lower() == "l" else "b"
+
+    # Keep only one high-precision SAM model resident. B and L cannot safely
+    # coexist on the deployment GPU, especially at 1536px hard-edge inference.
+    for loaded_variant in list(sam_models):
+        if loaded_variant != variant:
+            release_sam_model(loaded_variant, reason=f"switch_to_{variant}")
+
     if variant in sam_models:
         return sam_models[variant]
 
@@ -118,6 +133,48 @@ def get_sam_model(model_variant="b"):
     sam_models[variant] = SAM(model_path)
     print(f"High precision SAM-{variant.upper()} model loaded.")
     return sam_models[variant]
+
+
+def release_sam_model(model_variant, reason="manual_release"):
+    """Release one SAM variant and return its CUDA allocator memory to the pool."""
+    variant = "l" if str(model_variant).lower() == "l" else "b"
+    sam = sam_models.pop(variant, None)
+    if sam is None:
+        return False
+
+    predictor = getattr(sam, "predictor", None)
+    # Move both Ultralytics' model wrapper and predictor model off the GPU
+    # before dropping references. This is more reliable than empty_cache()
+    # alone when a large SAM-L forward pass has just completed or failed.
+    for model_object in (
+        getattr(sam, "model", None),
+        getattr(predictor, "model", None),
+    ):
+        try:
+            if model_object is not None and hasattr(model_object, "to"):
+                model_object.to("cpu")
+        except Exception as error:
+            print(f"SAM-{variant.upper()} CPU release warning: {error}")
+    del predictor
+    del sam
+    gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+        allocated_mb = torch.cuda.memory_allocated() / (1024 * 1024)
+        reserved_mb = torch.cuda.memory_reserved() / (1024 * 1024)
+        print(
+            f"Released high precision SAM-{variant.upper()} model: "
+            f"reason={reason} cudaAllocated={allocated_mb:.0f}MB "
+            f"cudaReserved={reserved_mb:.0f}MB"
+        )
+    else:
+        print(f"Released high precision SAM-{variant.upper()} model: reason={reason}")
+    return True
 
 
 def get_sam_predictor(model_variant="b"):
@@ -156,24 +213,25 @@ def run_sam_bbox_inference(
     masks=None,
     model_variant="b"
 ):
-    predictor = get_sam_predictor(model_variant)
-    previous_imgsz = getattr(predictor.args, "imgsz", 1024)
-    predictor.args.imgsz = imgsz
-    if hasattr(predictor.model, "set_imgsz"):
-        predictor.model.set_imgsz((imgsz, imgsz))
-    try:
-        return predictor(
-            source=img,
-            bboxes=[target_bbox],
-            points=points,
-            labels=labels,
-            masks=masks,
-            multimask_output=multimask_output
-        )
-    finally:
+    with sam_runtime_lock:
+        predictor = get_sam_predictor(model_variant)
+        previous_imgsz = getattr(predictor.args, "imgsz", 1024)
+        predictor.args.imgsz = imgsz
         if hasattr(predictor.model, "set_imgsz"):
-            predictor.model.set_imgsz((previous_imgsz, previous_imgsz))
-        predictor.args.imgsz = previous_imgsz
+            predictor.model.set_imgsz((imgsz, imgsz))
+        try:
+            return predictor(
+                source=img,
+                bboxes=[target_bbox],
+                points=points,
+                labels=labels,
+                masks=masks,
+                multimask_output=multimask_output
+            )
+        finally:
+            if hasattr(predictor.model, "set_imgsz"):
+                predictor.model.set_imgsz((previous_imgsz, previous_imgsz))
+            predictor.args.imgsz = previous_imgsz
 
 
 @app.get("/healthz")
@@ -190,26 +248,27 @@ def run_sam_mask_refine_inference(
     multimask_output=True,
     model_variant="b"
 ):
-    predictor = get_sam_predictor(model_variant)
-    previous_imgsz = getattr(predictor.args, "imgsz", 1024)
-    previous_direct_mask_mode = getattr(predictor.model, "use_mask_input_as_output_without_sam", False)
-    predictor.args.imgsz = imgsz
-    if hasattr(predictor.model, "set_imgsz"):
-        predictor.model.set_imgsz((imgsz, imgsz))
-    predictor.model.use_mask_input_as_output_without_sam = False
-    try:
-        return predictor(
-            source=img,
-            points=points,
-            labels=labels,
-            masks=masks,
-            multimask_output=multimask_output
-        )
-    finally:
-        predictor.model.use_mask_input_as_output_without_sam = previous_direct_mask_mode
+    with sam_runtime_lock:
+        predictor = get_sam_predictor(model_variant)
+        previous_imgsz = getattr(predictor.args, "imgsz", 1024)
+        previous_direct_mask_mode = getattr(predictor.model, "use_mask_input_as_output_without_sam", False)
+        predictor.args.imgsz = imgsz
         if hasattr(predictor.model, "set_imgsz"):
-            predictor.model.set_imgsz((previous_imgsz, previous_imgsz))
-        predictor.args.imgsz = previous_imgsz
+            predictor.model.set_imgsz((imgsz, imgsz))
+        predictor.model.use_mask_input_as_output_without_sam = False
+        try:
+            return predictor(
+                source=img,
+                points=points,
+                labels=labels,
+                masks=masks,
+                multimask_output=multimask_output
+            )
+        finally:
+            predictor.model.use_mask_input_as_output_without_sam = previous_direct_mask_mode
+            if hasattr(predictor.model, "set_imgsz"):
+                predictor.model.set_imgsz((previous_imgsz, previous_imgsz))
+            predictor.args.imgsz = previous_imgsz
 
 
 def run_sam_auto_inference(
@@ -217,19 +276,20 @@ def run_sam_auto_inference(
     imgsz=1024,
     model_variant="b"
 ):
-    predictor = get_sam_predictor(model_variant)
-    previous_imgsz = getattr(predictor.args, "imgsz", 1024)
-    predictor.args.imgsz = imgsz
-    if hasattr(predictor.model, "set_imgsz"):
-        predictor.model.set_imgsz((imgsz, imgsz))
-    try:
-        return predictor(
-            source=img
-        )
-    finally:
+    with sam_runtime_lock:
+        predictor = get_sam_predictor(model_variant)
+        previous_imgsz = getattr(predictor.args, "imgsz", 1024)
+        predictor.args.imgsz = imgsz
         if hasattr(predictor.model, "set_imgsz"):
-            predictor.model.set_imgsz((previous_imgsz, previous_imgsz))
-        predictor.args.imgsz = previous_imgsz
+            predictor.model.set_imgsz((imgsz, imgsz))
+        try:
+            return predictor(
+                source=img
+            )
+        finally:
+            if hasattr(predictor.model, "set_imgsz"):
+                predictor.model.set_imgsz((previous_imgsz, previous_imgsz))
+            predictor.args.imgsz = previous_imgsz
 
 BBOX_EXPAND_RATIO = 0.18
 SOFT_EDGE_SAM_IMGSZ = 1536
@@ -7283,6 +7343,10 @@ async def segment(request: Request):
                             f"strategy={strategy_type}"
                         )
                     )
+                    # The normalized masks are CPU numpy arrays. Drop the
+                    # Ultralytics result before a possible B -> L switch so
+                    # its GPU tensors do not keep B's inference memory alive.
+                    del results
                     if soft_edge_prompts:
                         candidate_masks = filter_soft_edge_masks_by_points(candidate_masks, soft_edge_prompts)
                     if strategy_type not in {"food_product", "soft_edge"}:
@@ -7316,6 +7380,7 @@ async def segment(request: Request):
                                     interpolation=cv2.INTER_LINEAR if use_subpixel_masks else cv2.INTER_NEAREST,
                                     debug_label=f"{layer_label} strategy={strategy_type} model=L"
                                 )
+                                del l_results
                                 candidate_masks, arbitration = arbitrate_sam_b_l_masks(
                                     candidate_masks,
                                     l_masks,
@@ -7328,6 +7393,11 @@ async def segment(request: Request):
                                 )
                             except Exception as error:
                                 print(f"SAM-L escalation failed for {layer_label}: {error}")
+                                # An OOM can leave the L predictor and its
+                                # allocator reservation alive. Release it so
+                                # the request can still finish with B and the
+                                # next invocation starts from a clean state.
+                                release_sam_model("l", reason="escalation_failed")
                         else:
                             print(
                                 f"SAM route for {layer_label}: model=B "
