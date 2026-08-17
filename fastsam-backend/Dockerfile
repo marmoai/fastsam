@@ -26,9 +26,6 @@ RUN pip install --upgrade pip && \
     pip install -r /app/requirements.txt
 
 COPY main.py /app/main.py
-COPY FastSAM-x.pt /app/FastSAM-x.pt
-COPY sam_b.pt /app/sam_b.pt
-COPY sam_l.pt /app/sam_l.pt
 
 ENV PORT=8000
 
