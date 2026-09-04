@@ -110,6 +110,7 @@ def get_fastsam_model():
 
 def get_sam_model(model_variant="b"):
     variant = "l" if str(model_variant).lower() == "l" else "b"
+    log_cuda_memory(f"request_{variant}_model", variant)
 
     # Keep only one high-precision SAM model resident. B and L cannot safely
     # coexist on the deployment GPU, especially at 1536px hard-edge inference.
@@ -130,8 +131,10 @@ def get_sam_model(model_variant="b"):
         filename = "sam_b.pt"
     model_path = ensure_model_file(configured_path, model_url, filename, f"sam_{variant}")
     print(f"Loading high precision SAM-{variant.upper()} model: {model_path}")
+    log_cuda_memory(f"before_{variant}_load", variant)
     sam_models[variant] = SAM(model_path)
     print(f"High precision SAM-{variant.upper()} model loaded.")
+    log_cuda_memory(f"after_{variant}_load", variant)
     return sam_models[variant]
 
 
@@ -142,6 +145,7 @@ def release_sam_model(model_variant, reason="manual_release"):
     if sam is None:
         return False
 
+    log_cuda_memory(f"before_release:{reason}", variant)
     predictor = getattr(sam, "predictor", None)
     # Move both Ultralytics' model wrapper and predictor model off the GPU
     # before dropping references. This is more reliable than empty_cache()
@@ -155,8 +159,15 @@ def release_sam_model(model_variant, reason="manual_release"):
                 model_object.to("cpu")
         except Exception as error:
             print(f"SAM-{variant.upper()} CPU release warning: {error}")
-    del predictor
-    del sam
+    # The loop variable and the predictor attribute can otherwise keep the
+    # last CUDA model object alive until after empty_cache().
+    try:
+        sam.predictor = None
+    except Exception:
+        pass
+    model_object = None
+    predictor = None
+    sam = None
     gc.collect()
 
     if torch.cuda.is_available():
@@ -172,6 +183,7 @@ def release_sam_model(model_variant, reason="manual_release"):
             f"reason={reason} cudaAllocated={allocated_mb:.0f}MB "
             f"cudaReserved={reserved_mb:.0f}MB"
         )
+        log_cuda_memory(f"after_release:{reason}", variant)
     else:
         print(f"Released high precision SAM-{variant.upper()} model: reason={reason}")
     return True
@@ -219,6 +231,9 @@ def run_sam_bbox_inference(
         predictor.args.imgsz = imgsz
         if hasattr(predictor.model, "set_imgsz"):
             predictor.model.set_imgsz((imgsz, imgsz))
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        log_cuda_memory("inference_before", model_variant)
         try:
             return predictor(
                 source=img,
@@ -229,6 +244,7 @@ def run_sam_bbox_inference(
                 multimask_output=multimask_output
             )
         finally:
+            log_cuda_memory("inference_after", model_variant)
             if hasattr(predictor.model, "set_imgsz"):
                 predictor.model.set_imgsz((previous_imgsz, previous_imgsz))
             predictor.args.imgsz = previous_imgsz
@@ -256,6 +272,9 @@ def run_sam_mask_refine_inference(
         if hasattr(predictor.model, "set_imgsz"):
             predictor.model.set_imgsz((imgsz, imgsz))
         predictor.model.use_mask_input_as_output_without_sam = False
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        log_cuda_memory("mask_refine_before", model_variant)
         try:
             return predictor(
                 source=img,
@@ -265,6 +284,7 @@ def run_sam_mask_refine_inference(
                 multimask_output=multimask_output
             )
         finally:
+            log_cuda_memory("mask_refine_after", model_variant)
             predictor.model.use_mask_input_as_output_without_sam = previous_direct_mask_mode
             if hasattr(predictor.model, "set_imgsz"):
                 predictor.model.set_imgsz((previous_imgsz, previous_imgsz))
@@ -282,11 +302,15 @@ def run_sam_auto_inference(
         predictor.args.imgsz = imgsz
         if hasattr(predictor.model, "set_imgsz"):
             predictor.model.set_imgsz((imgsz, imgsz))
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        log_cuda_memory("auto_before", model_variant)
         try:
             return predictor(
                 source=img
             )
         finally:
+            log_cuda_memory("auto_after", model_variant)
             if hasattr(predictor.model, "set_imgsz"):
                 predictor.model.set_imgsz((previous_imgsz, previous_imgsz))
             predictor.args.imgsz = previous_imgsz
@@ -295,6 +319,18 @@ BBOX_EXPAND_RATIO = 0.18
 SOFT_EDGE_SAM_IMGSZ = 1536
 HARD_EDGE_SAM_IMGSZ = 1536
 HARD_EDGE_LOCAL_SCALE = 2.0
+SAM_MEMORY_LOGGING = str(os.getenv("SAM_MEMORY_LOGGING", "1")).lower() not in {"0", "false", "no"}
+SAM_L_LARGE_IMAGE_MAX_SIDE = int(os.getenv("SAM_L_LARGE_IMAGE_MAX_SIDE", "2400"))
+SAM_L_LARGE_IMAGE_IMGSZ = int(os.getenv("SAM_L_LARGE_IMAGE_IMGSZ", "1280"))
+SAM_L_OOM_RETRY_IMGSZ = int(os.getenv("SAM_L_OOM_RETRY_IMGSZ", "1024"))
+LOCAL_UPSCALE_ENABLED = str(os.getenv("SAM_LOCAL_UPSCALE_ENABLED", "1")).lower() not in {"0", "false", "no"}
+LOCAL_UPSCALE_SAM_IMGSZ = int(os.getenv("SAM_LOCAL_UPSCALE_SAM_IMGSZ", "1280"))
+LOCAL_UPSCALE_MAX_BBOX_SIDE = int(os.getenv("SAM_LOCAL_UPSCALE_MAX_BBOX_SIDE", "960"))
+LOCAL_UPSCALE_MAX_SOURCE_SIDE = int(os.getenv("SAM_LOCAL_UPSCALE_MAX_SOURCE_SIDE", "1800"))
+# Keep local crops isolated to the lighting route. Furniture uses the
+# B/L arbitration path; injecting a local candidate there can make routing
+# accept B while candidate selection still keeps the original B mask.
+LOCAL_UPSCALE_STRATEGIES = {"lighting"}
 HARD_EDGE_STRATEGIES = {
     "furniture",
     "lighting",
@@ -334,7 +370,59 @@ TABLE_SUPPORT_MAX_ASPECT_RATIO = 0.95
 TABLE_SUPPORT_MAX_WIDTH_RATIO = 0.42
 TABLE_SUPPORT_MIN_HEIGHT_RATIO = 0.22
 
-def get_layer_strategy(layer_meta):
+
+def cuda_memory_snapshot():
+    """Return a small, comparable CUDA memory snapshot for lifecycle logs."""
+    if not torch.cuda.is_available():
+        return {"available": False}
+
+    try:
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        return {
+            "available": True,
+            "allocatedMB": round(torch.cuda.memory_allocated() / (1024 * 1024)),
+            "reservedMB": round(torch.cuda.memory_reserved() / (1024 * 1024)),
+            "freeMB": round(free_bytes / (1024 * 1024)),
+            "totalMB": round(total_bytes / (1024 * 1024)),
+            "peakAllocatedMB": round(torch.cuda.max_memory_allocated() / (1024 * 1024))
+        }
+    except Exception as error:
+        return {"available": True, "error": str(error)}
+
+
+def log_cuda_memory(stage, model_variant=None):
+    if not SAM_MEMORY_LOGGING:
+        return
+    snapshot = cuda_memory_snapshot()
+    variant = f" model={str(model_variant).upper()}" if model_variant else ""
+    print(f"SAM CUDA memory stage={stage}{variant}: {snapshot}")
+
+
+def is_cuda_oom(error):
+    message = str(error).lower()
+    return "cuda out of memory" in message or "out of memory" in message
+
+
+def choose_sam_imgsz(img, strategy_type=None, model_variant="b", policy=None):
+    """Choose internal inference size without changing the source/output resolution."""
+    if policy is not None:
+        base_imgsz = int(policy.get("samImgSize", 1024))
+    elif strategy_type == "soft_edge":
+        base_imgsz = SOFT_EDGE_SAM_IMGSZ
+    elif strategy_type in HARD_EDGE_STRATEGIES:
+        base_imgsz = HARD_EDGE_SAM_IMGSZ
+    else:
+        base_imgsz = 1024
+
+    if str(model_variant).lower() != "l":
+        return base_imgsz
+    if img is None or not hasattr(img, "shape") or len(img.shape) < 2:
+        return base_imgsz
+    if max(img.shape[:2]) >= SAM_L_LARGE_IMAGE_MAX_SIDE:
+        return min(base_imgsz, SAM_L_LARGE_IMAGE_IMGSZ)
+    return base_imgsz
+
+def _get_legacy_layer_strategy(layer_meta):
     extraction_profile = str(layer_meta.get("extractionProfile", "")).lower()
     semantic_type = str(layer_meta.get("semanticType", "")).lower()
     design_role = str(layer_meta.get("designRole", "")).lower()
@@ -384,6 +472,27 @@ def get_layer_strategy(layer_meta):
             "prefer_rectangular": extraction_profile != "text_layer",
             "max_masks": 1,
             "require_overlap_for_attachments": True
+        }
+
+    # Upstream semantic labels are sometimes coarse: a poster character can
+    # arrive as product_food simply because the poster also advertises food.
+    # An explicit person/character name is stronger evidence than that broad
+    # label. Route it as one hard entity before layout_embedded_product would
+    # otherwise send it through compound-food expansion and cleanup.
+    if any(token in profile_text for token in [
+        "person", "people", "woman", "man", "girl", "boy", "portrait",
+        "character", "figure", "人物", "女子", "女人", "女孩", "男孩",
+        "男性", "女性", "肖像", "角色"
+    ]):
+        return {
+            "type": "hard_product",
+            "max_fill": 0.88,
+            "max_merged_fill": 0.86,
+            "max_attachment_distance": 18,
+            "allow_attachments": True,
+            "prefer_rectangular": False,
+            "max_masks": 6,
+            "require_overlap_for_attachments": False
         }
 
     if extraction_profile == "layout_embedded_product":
@@ -518,7 +627,12 @@ def get_layer_strategy(layer_meta):
             "require_overlap_for_attachments": True
         }
 
-    if any(token in text for token in ["wall art", "painting", "artwork", "picture", "poster", "挂画", "画", "装饰画"]):
+    # Do not match the single character "画": names such as 插画人物 are
+    # product/scene subjects, not wall art. Use explicit bounded-plane terms.
+    if any(token in text for token in [
+        "wall art", "painting", "artwork", "picture", "poster",
+        "挂画", "装饰画", "壁画", "绘画作品", "墙面艺术"
+    ]):
         return {
             "type": "wall_art",
             # A painting can legitimately occupy almost its entire semantic
@@ -665,6 +779,239 @@ def get_layer_strategy(layer_meta):
         "max_masks": 4,
         "require_overlap_for_attachments": False
     }
+
+def _is_completion_layer_meta(layer_meta):
+    meta = layer_meta or {}
+    return bool(
+        meta.get("completionSegmentation") or
+        str(meta.get("id") or "").startswith("completion-scene-sam-") or
+        str(meta.get("layerId") or "").startswith("completion-scene-sam-")
+    )
+
+
+def get_layer_strategy(layer_meta):
+    """Resolve one coarse profile plus composable capabilities.
+
+    ``type`` and the legacy thresholds remain available to existing mask
+    helpers. New routing should use ``profile``, ``features``, and ``phase``;
+    this keeps object labels from selecting an unrelated end-to-end pipeline.
+    """
+    meta = layer_meta or {}
+    legacy = _get_legacy_layer_strategy(meta)
+    base_type = legacy.get("type", "default")
+    text = " ".join([
+        str(meta.get("name", "")),
+        str(meta.get("semanticType", "")),
+        str(meta.get("designRole", "")),
+        str(meta.get("category", "")),
+        str(meta.get("runtimeType", "")),
+        str(meta.get("extractionProfile", ""))
+    ]).lower()
+
+    spatial_types = {
+        "table", "furniture", "lighting", "decor_arrangement", "decor_atomic"
+    }
+    spatial_tokens = [
+        "interior", "room", "space", "furniture", "table", "desk", "console",
+        "sideboard", "cabinet", "chair", "sofa", "stool", "lamp", "lighting",
+        "curtain", "window", "窗", "窗纱", "纱帘",
+        "室内", "空间", "家具", "桌", "台", "柜", "椅", "凳", "沙发", "灯具"
+    ]
+    profile = "spatial_design" if (
+        base_type in spatial_types or any(token in text for token in spatial_tokens)
+    ) else "flat_design"
+
+    phase = "completion" if _is_completion_layer_meta(meta) else "initial"
+    features = set()
+    if base_type == "soft_edge" or any(token in text for token in [
+        "feather", "plume", "hair", "fur", "smoke", "cloud", "fog", "sheer",
+        "curtain", "tulle", "transparent", "羽毛", "毛发", "烟", "云", "雾",
+        "窗纱", "纱", "薄纱", "透明"
+    ]):
+        features.add("soft_edge")
+    else:
+        features.add("hard_edge")
+
+    if base_type in {"food_product", "decor_arrangement"} or any(token in text for token in [
+        "compound", "arrangement", "plate", "dish", "meal", "food", "食物", "菜品",
+        "餐盘", "组合", "花艺", "插花"
+    ]):
+        features.add("compound")
+    if base_type in {"flat_shape"} or any(token in text for token in [
+        "text", "label", "badge", "logo", "panel", "文字", "文本", "徽章", "标志"
+    ]):
+        features.add("text_overlap")
+    if base_type in {"table", "furniture", "lighting"}:
+        features.add("supports")
+        # A material word such as "transparent" describes a glass tabletop,
+        # not a feathered silhouette. Spatial hard objects must retain their
+        # original prompt raster and safe-matte route.
+        features.discard("soft_edge")
+        features.add("hard_edge")
+    if phase == "completion" or meta.get("completionOccluder"):
+        features.add("occluded")
+
+    # Canonical completion is an execution phase with one stable candidate
+    # contract. The original semantic type remains metadata, except that a
+    # spatial hard object retains its proven alpha treatment after selection.
+    execution = {
+        "type": "completion_object",
+        "max_fill": 0.90,
+        "max_merged_fill": 0.90,
+        "max_attachment_distance": 18,
+        "allow_attachments": True,
+        "prefer_rectangular": False,
+        "max_masks": 8,
+        "require_overlap_for_attachments": False
+    } if phase == "completion" else legacy
+
+    result = {
+        **execution,
+        "profile": profile,
+        "features": sorted(features),
+        "phase": phase,
+        "baseStrategyType": base_type,
+        "selectionType": "completion_object" if phase == "completion" else base_type
+    }
+    return result
+
+
+# The legacy type names below are implementation details kept for compatibility
+# with the existing matte helpers. Routing and quality decisions must use this
+# policy instead of growing another object-name branch.
+MASK_POLICY_VERSION = "profiles-v2-phase3.1"
+
+
+def resolve_mask_policy(layer_meta=None, quality_profile="publish"):
+    """Resolve the small set of capabilities shared by all segmentation paths."""
+    strategy = get_layer_strategy(layer_meta or {})
+    features = set(strategy.get("features", []))
+    phase = strategy.get("phase", "initial")
+    profile = strategy.get("profile", "flat_design")
+    base_type = strategy.get("baseStrategyType", strategy.get("type", "default"))
+    completion = phase == "completion"
+    soft_edge = "soft_edge" in features
+    completion_occluder = bool(
+        (layer_meta or {}).get("completionOccluder") and
+        phase == "initial" and
+        "soft_edge" not in features
+    )
+    compound = "compound" in features
+    spatial = profile == "spatial_design"
+
+    if completion:
+        selector = "generic_completion"
+        selection_type = "completion_object"
+    elif compound and base_type == "food_product":
+        selector = "compound_food"
+        selection_type = "food_product"
+    else:
+        selector = "profile_object"
+        selection_type = base_type
+
+    # Keep the established high-resolution spatial/soft-edge paths. Flat
+    # products use 1024 unless a later quality decision escalates them to L.
+    # Completion must match the stable completion_object route: the scene is
+    # already normalized before this request, so use 1024 regardless of the
+    # source object's initial-pass category. In particular, do not inherit the
+    # 1536 spatial size used by the initial table/furniture pass.
+    sam_imgsz = 1024 if completion else (
+        SOFT_EDGE_SAM_IMGSZ if soft_edge else
+        HARD_EDGE_SAM_IMGSZ if base_type in HARD_EDGE_STRATEGIES else
+        1024
+    )
+    # Completion changes how SAM ranks masks, not the proven alpha treatment
+    # for spatial hard objects. A table/furniture completion still needs the
+    # safe matte that prevents GrabCut from reintroducing wall or floor pixels.
+    matte_type = (
+        base_type if completion and base_type in {"table", "furniture"} else
+        selection_type if completion else (
+        "soft_edge" if soft_edge else
+        base_type if base_type in {"table", "furniture"} else
+        selection_type
+        )
+    )
+    return {
+        "version": MASK_POLICY_VERSION,
+        "profile": profile,
+        "phase": phase,
+        "features": sorted(features),
+        "baseStrategyType": base_type,
+        "selectionType": selection_type,
+        "selector": selector,
+        "matteType": matte_type,
+        "softEdge": soft_edge,
+        "compound": compound,
+        "spatial": spatial,
+        "completion": completion,
+        "completionOccluder": completion_occluder,
+        "samImgSize": sam_imgsz,
+        "allowLocalRefine": completion or not (soft_edge or compound or spatial),
+        "allowLocalUpscale": completion or not (soft_edge or compound),
+        # Initial compound objects keep their established B-first route unless
+        # their alpha will define a destructive scene-inpaint mask. Those
+        # foreground occluders receive an independent SAM-L review regardless
+        # of semantic name or product category.
+        "allowModelEscalation": (
+            True if completion or completion_occluder
+            else (not soft_edge and not compound)
+        ),
+        "qualityProfile": normalize_sam_quality_profile(quality_profile)
+    }
+
+
+def policy_for_strategy_type(strategy_type=None, layer_meta=None, quality_profile="publish"):
+    """Return a policy even for old callers that only pass a strategy string."""
+    if layer_meta is not None:
+        return resolve_mask_policy(layer_meta, quality_profile)
+    strategy_type = str(strategy_type or "default")
+    return resolve_mask_policy({
+        "semanticType": strategy_type,
+        "extractionProfile": strategy_type,
+        "completionSegmentation": strategy_type == "completion_object"
+    }, quality_profile)
+
+
+def mask_integrity_audit(mask, target_bbox):
+    """Produce model-independent diagnostics for a selected binary mask."""
+    binary = np.asarray(mask > 0.5, dtype=np.uint8)
+    bbox = mask_bbox(binary)
+    if bbox is None:
+        return {
+            "status": "empty",
+            "pixels": 0,
+            "components": 0,
+            "enclosedHolePixels": 0,
+            "bbox": None,
+            "touchesTargetEdges": 0
+        }
+
+    x1, y1, x2, y2 = [int(value) for value in target_bbox]
+    crop = binary[max(0, y1):min(binary.shape[0], y2), max(0, x1):min(binary.shape[1], x2)]
+    component_count, _, component_stats, _ = cv2.connectedComponentsWithStats(crop, connectivity=8)
+    substantial = sum(
+        1 for label in range(1, component_count)
+        if int(component_stats[label, cv2.CC_STAT_AREA]) >= MASK_COMPONENT_MIN_PIXELS
+    )
+    inverted = (crop == 0).astype(np.uint8)
+    hole_count, _, hole_stats, _ = cv2.connectedComponentsWithStats(inverted, connectivity=8)
+    enclosed_holes = 0
+    for label in range(1, hole_count):
+        hx, hy, hw, hh, area = [int(value) for value in hole_stats[label]]
+        if hx > 0 and hy > 0 and hx + hw < inverted.shape[1] and hy + hh < inverted.shape[0]:
+            enclosed_holes += area
+    bx1, by1, bx2, by2 = bbox
+    touches = int(bx1 <= x1 + 2) + int(by1 <= y1 + 2)
+    touches += int(bx2 >= x2 - 2) + int(by2 >= y2 - 2)
+    return {
+        "status": "ok",
+        "pixels": int(np.count_nonzero(binary)),
+        "components": int(substantial),
+        "enclosedHolePixels": int(enclosed_holes),
+        "bbox": [int(value) for value in bbox],
+        "touchesTargetEdges": int(touches)
+    }
+
 
 def is_drink_product_layer(layer_meta):
     text = " ".join([
@@ -1073,7 +1420,7 @@ def build_furniture_internal_refine_prompts(img, mask, target_bbox):
     connected to the scene through a narrow opening.  Those regions are not
     holes, so a post-processing fill cannot safely repair them.  This helper
     only proposes pixels that a bounded closing would surround and whose color
-    is continuous with the immediately adjacent accepted furniture mask.
+    is continuous with the immediately adjacent accepted entity mask.
     """
     binary = np.asarray(mask > 0.5, dtype=bool)
     height, width = binary.shape[:2]
@@ -1220,7 +1567,13 @@ def build_furniture_internal_refine_prompts(img, mask, target_bbox):
     }
 
 
-def refine_furniture_mask_with_internal_points(img, mask, target_bbox, layer_name):
+def refine_furniture_mask_with_internal_points(
+    img,
+    mask,
+    target_bbox,
+    layer_name,
+    model_variant="l"
+):
     """Retry SAM once when a textured furniture silhouette has supported gaps."""
     positive_points, negative_points, expected_growth, prompt_debug = build_furniture_internal_refine_prompts(
         img,
@@ -1242,7 +1595,8 @@ def refine_furniture_mask_with_internal_points(img, mask, target_bbox, layer_nam
             multimask_output=True,
             imgsz=HARD_EDGE_SAM_IMGSZ,
             points=[prompt_points],
-            labels=[prompt_labels]
+            labels=[prompt_labels],
+            model_variant=model_variant
         )
         candidates = normalize_result_masks(
             results,
@@ -1324,6 +1678,250 @@ def refine_furniture_mask_with_internal_points(img, mask, target_bbox, layer_nam
         "status": "accepted",
         "areaBefore": original_area,
         "areaAfter": int(np.count_nonzero(best > 0.5)),
+    }
+
+
+def refine_furniture_mask_with_cross_model_evidence(
+    img,
+    b_masks,
+    l_mask,
+    target_bbox,
+    layer_name
+):
+    """Ask L to validate regions present in B but absent from the L primary.
+
+    This is intentionally class-agnostic. It does not assume that the missing
+    region is a base, leg, arm, or any other named part. A B-only region must
+    be close to the L silhouette, receive an L positive point, and survive L's
+    own mask selection before it can be added.
+    """
+    if b_masks is None or len(b_masks) == 0:
+        return l_mask, False, {"status": "skipped:no_b_masks", "components": 0, "pixels": 0}
+    # Keep every B multimask as evidence, but never use it as output. A lower
+    # confidence peer can contain a real attached part omitted by the primary;
+    # L point validation below decides whether that evidence is trustworthy.
+    b_binary = np.zeros_like(np.asarray(l_mask > 0.5, dtype=bool), dtype=bool)
+    for b_candidate in b_masks:
+        b_binary |= np.asarray(b_candidate > 0.5, dtype=bool)
+    l_binary = np.asarray(l_mask > 0.5, dtype=bool)
+    if not np.any(b_binary) or not np.any(l_binary):
+        return l_mask, False, {"status": "skipped:no_masks", "components": 0, "pixels": 0}
+
+    height, width = l_binary.shape
+    tx1, ty1, tx2, ty2 = [int(value) for value in target_bbox]
+    tx1 = clamp(tx1, 0, width - 1)
+    ty1 = clamp(ty1, 0, height - 1)
+    tx2 = clamp(tx2, tx1 + 1, width)
+    ty2 = clamp(ty2, ty1 + 1, height)
+    target_area = max(1, (tx2 - tx1) * (ty2 - ty1))
+    min_side = max(1, min(tx2 - tx1, ty2 - ty1))
+
+    # Use B only as a source of disagreement evidence. Large B envelopes are
+    # not fed back wholesale; only bounded components near the L silhouette
+    # become point-prompt proposals.
+    near_radius = max(8, min(28, int(round(min_side * 0.045))))
+    near_l = cv2.dilate(
+        l_binary.astype(np.uint8),
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (near_radius * 2 + 1, near_radius * 2 + 1)
+        ),
+        iterations=1
+    ) > 0
+    disagreement = b_binary & (~l_binary) & near_l
+    disagreement[:ty1] = False
+    disagreement[ty2:] = False
+    disagreement[:, :tx1] = False
+    disagreement[:, tx2:] = False
+    if not np.any(disagreement):
+        return l_mask, False, {
+            "status": "skipped:no_near_disagreement",
+            "components": 0,
+            "pixels": 0,
+        }
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        disagreement.astype(np.uint8),
+        connectivity=8
+    )
+    proposal = np.zeros_like(disagreement, dtype=bool)
+    proposal_components = 0
+    proposal_pixels = 0
+    max_component_area = max(128, int(target_area * 0.10))
+    max_total_area = max(256, int(target_area * 0.18))
+    for label in range(1, count):
+        x, y, comp_w, comp_h, area = [int(value) for value in stats[label]]
+        if area < max(32, int(target_area * 0.00015)) or area > max_component_area:
+            continue
+        component = labels == label
+        proposal |= component
+        proposal_components += 1
+        proposal_pixels += area
+        if proposal_pixels >= max_total_area:
+            break
+
+    if not np.any(proposal):
+        return l_mask, False, {
+            "status": "skipped:disagreement_filtered",
+            "components": 0,
+            "pixels": 0,
+        }
+
+    positive_points = []
+    proposal_count, proposal_labels, _, _ = cv2.connectedComponentsWithStats(
+        proposal.astype(np.uint8),
+        connectivity=8
+    )
+    for label in range(1, proposal_count):
+        component = proposal_labels == label
+        distance = cv2.distanceTransform(component.astype(np.uint8), cv2.DIST_L2, 5)
+        py, px = np.unravel_index(int(np.argmax(distance)), distance.shape)
+        if distance[py, px] >= 2:
+            positive_points.append([int(px), int(py)])
+        if len(positive_points) >= 6:
+            break
+
+    if not positive_points:
+        return l_mask, False, {
+            "status": "skipped:no_disagreement_points",
+            "components": proposal_components,
+            "pixels": proposal_pixels,
+        }
+
+    # Anchor the existing L body and explicitly discourage bbox-edge growth.
+    anchor_distance = cv2.distanceTransform(l_binary.astype(np.uint8), cv2.DIST_L2, 5)
+    for _ in range(5):
+        py, px = np.unravel_index(int(np.argmax(anchor_distance)), anchor_distance.shape)
+        if anchor_distance[py, px] < 3:
+            break
+        positive_points.append([int(px), int(py)])
+        cv2.circle(anchor_distance, (int(px), int(py)), max(16, int(min_side * 0.12)), 0, thickness=-1)
+    # Do not place a background point on a bbox edge that contains a disputed
+    # B/L region. Missing subject parts often touch the semantic bbox edge;
+    # marking that same edge as negative makes the validation self-contradictory.
+    negative_points = build_boundary_negative_points(
+        l_binary | proposal,
+        [tx1, ty1, tx2, ty2],
+        max_points=4
+    )
+    points = positive_points + negative_points
+    labels_prompt = ([1] * len(positive_points)) + ([0] * len(negative_points))
+    evidence_debug = {
+        "bEvidencePixels": int(np.count_nonzero(b_binary[ty1:ty2, tx1:tx2])),
+        "disagreementPixels": int(np.count_nonzero(disagreement)),
+        "positivePoints": len(positive_points),
+        "negativePoints": len(negative_points),
+    }
+
+    try:
+        results = run_sam_bbox_inference(
+            img,
+            target_bbox,
+            multimask_output=True,
+            imgsz=HARD_EDGE_SAM_IMGSZ,
+            points=[points],
+            labels=[labels_prompt],
+            model_variant="l"
+        )
+        candidates = normalize_result_masks(
+            results,
+            width,
+            height,
+            interpolation=cv2.INTER_LINEAR,
+            debug_label=f"{layer_name} strategy=cross_model_refine model=L"
+        )
+        del results
+    except Exception as error:
+        print(f"Furniture cross-model SAM refine failed for {layer_name}: {error}")
+        return l_mask, False, {
+            "status": "failed:sam_error",
+            "components": proposal_components,
+            "pixels": proposal_pixels,
+            **evidence_debug,
+        }
+
+    l_area = max(1, int(np.count_nonzero(l_binary)))
+    l_core_radius = max(2, min(10, int(round(min_side * 0.012))))
+    l_core = cv2.erode(
+        l_binary.astype(np.uint8),
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (l_core_radius * 2 + 1, l_core_radius * 2 + 1)
+        ),
+        iterations=1
+    ) > 0
+    proposal_support = cv2.dilate(
+        proposal.astype(np.uint8),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)),
+        iterations=1
+    ) > 0
+    best = None
+    best_score = None
+    proposal_area = max(1, int(np.count_nonzero(proposal)))
+    for candidate in candidates:
+        candidate_binary = constrain_mask_to_bbox(candidate, target_bbox) > 0.5
+        if not np.any(candidate_binary):
+            continue
+        raw_new_pixels = candidate_binary & (~l_binary)
+        raw_new_area = int(np.count_nonzero(raw_new_pixels))
+        if raw_new_area <= 0:
+            continue
+        # Treat the existing L silhouette as authoritative. The refinement is
+        # allowed to contribute only its validated additions; a point-guided
+        # SAM response may otherwise shave a few pixels from the original body.
+        # SAM may redraw a wider contour around the prompted region. Only the
+        # part supported by the B/L disagreement is eligible for merging.
+        new_pixels = raw_new_pixels & proposal_support
+        new_area = int(np.count_nonzero(new_pixels))
+        evidence_coverage = new_area / proposal_area
+        if new_area <= 0:
+            continue
+        merged_binary = l_binary | new_pixels
+        preserved_core = int(np.count_nonzero(merged_binary & l_core)) / max(1, int(np.count_nonzero(l_core)))
+        preserved_l = int(np.count_nonzero(merged_binary & l_binary)) / l_area
+        expected_coverage = int(np.count_nonzero(new_pixels & proposal)) / max(1, new_area)
+        unsupported = int(np.count_nonzero(new_pixels & (~near_l)))
+        growth = (l_area + new_area) / l_area
+        if (
+            preserved_core < 0.985 or
+            preserved_l < 0.94 or
+            evidence_coverage < 0.10 or
+            expected_coverage < 0.55 or
+            unsupported > max(64, int(new_area * 0.10)) or
+            growth > 1.30
+        ):
+            continue
+        score = (
+            evidence_coverage * 2.0 +
+            expected_coverage * 2.0 +
+            preserved_l * 1.5 -
+            unsupported / max(1, new_area)
+        )
+        if best_score is None or score > best_score:
+            best = merged_binary.astype(np.float32)
+            best_score = score
+            best_debug = {
+                "rawNewPixels": raw_new_area,
+                "validatedPixels": new_area,
+                "evidenceCoverage": evidence_coverage,
+                "expectedCoverage": expected_coverage,
+            }
+
+    if best is None:
+        return l_mask, False, {
+            "status": "rejected:no_safe_candidate",
+            "components": proposal_components,
+            "pixels": proposal_pixels,
+            **evidence_debug,
+        }
+    return best, True, {
+        "status": "accepted",
+        "components": proposal_components,
+        "pixels": proposal_pixels,
+        "areaBefore": l_area,
+        "areaAfter": int(np.count_nonzero(best > 0.5)),
+        **evidence_debug,
+        **best_debug,
     }
 
 
@@ -3155,7 +3753,14 @@ def build_hard_edge_completion_points(img, mask, target_bbox, max_points=4):
     return points
 
 
-def recover_hard_edge_mask_with_points(img, mask, target_bbox, layer_name):
+def recover_hard_edge_mask_with_points(
+    img,
+    mask,
+    target_bbox,
+    layer_name,
+    strategy_type=None,
+    model_variant="b"
+):
     """Ask SAM to recover hard-object regions omitted by the bbox candidate."""
     positive = build_hard_edge_completion_points(img, mask, target_bbox)
     if not positive:
@@ -3179,9 +3784,10 @@ def recover_hard_edge_mask_with_points(img, mask, target_bbox, layer_name):
             crop,
             local_bbox,
             multimask_output=True,
-            imgsz=HARD_EDGE_SAM_IMGSZ,
+            imgsz=choose_sam_imgsz(crop, strategy_type, model_variant=model_variant),
             points=[local_points],
-            labels=[[1] * len(local_points)]
+            labels=[[1] * len(local_points)],
+            model_variant=model_variant
         )
         candidates = normalize_result_masks(
             results,
@@ -3787,18 +4393,28 @@ def is_food_support_shape(shape_features):
         shape_features.get("isRectangularPlane")
     )
 
-def build_quality_gate(score, primary_score, target_fill_ratio, selected, strategy_type, high_coverage_entity=False):
+def build_quality_gate(
+    score,
+    primary_score,
+    target_fill_ratio,
+    selected,
+    strategy_type,
+    high_coverage_entity=False,
+    policy=None
+):
+    policy = policy or policy_for_strategy_type(strategy_type)
+    effective_strategy_type = policy.get("selectionType", strategy_type)
     min_score = MIN_RUNTIME_ACCEPT_SCORE
     min_primary_score = MIN_RUNTIME_ACCEPT_PRIMARY_SCORE
     min_fill_ratio = MIN_RUNTIME_ACCEPT_FILL_RATIO
     max_fill_ratio = MAX_RUNTIME_ACCEPT_FILL_RATIO
 
-    if strategy_type == "food_product":
+    if policy.get("selector") == "compound_food" or effective_strategy_type == "food_product":
         min_score = 0.28
         min_primary_score = 0.22
         min_fill_ratio = 0.05
         max_fill_ratio = 0.82
-    elif strategy_type == "wall_art":
+    elif effective_strategy_type == "wall_art":
         # A framed painting is a bounded opaque plane. Its valid silhouette may
         # cover nearly all of its semantic bbox, unlike room/background masks.
         max_fill_ratio = 0.98
@@ -3830,7 +4446,7 @@ def build_quality_gate(score, primary_score, target_fill_ratio, selected, strate
         "needsHigherPrecision": not should_generate_runtime_layer,
         "issues": issues,
         "recommendedEngine": "fastsam_multi_mask" if should_generate_runtime_layer else (
-            "matting_or_hq_sam" if strategy_type in ["furniture", "table"] else "hq_sam"
+            "matting_or_hq_sam" if policy.get("spatial") else "hq_sam"
         )
     }
 
@@ -3922,7 +4538,10 @@ def build_exclude_bboxes(layer_meta, context_layers, target_bbox, img_w, img_h):
         )
         excludes.append({
             "bbox": other_bbox,
-            "strong": bool(same_parent and should_strong_exclude_sibling(layer_meta, other))
+            "strong": bool(
+                other.get("completionOccluder") or
+                (same_parent and should_strong_exclude_sibling(layer_meta, other))
+            )
         })
 
     return excludes
@@ -3946,6 +4565,68 @@ def build_exclude_mask(bboxes, img_w, img_h):
         x1, y1, x2, y2 = get_exclude_bbox(entry)
         exclude_mask[y1:y2, x1:x2] = True
     return exclude_mask
+
+
+def decode_completion_observation_mask(mask_data, img_w, img_h):
+    """Decode the first-pass visible target mask for completion ranking."""
+    if not isinstance(mask_data, str) or not mask_data:
+        return None
+    try:
+        encoded = mask_data.split(",", 1)[1] if "," in mask_data else mask_data
+        raw = base64.b64decode(encoded.replace(" ", "").replace("\n", "").replace("\r", ""))
+        source = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+        if source is None:
+            return None
+        if source.ndim == 3 and source.shape[2] == 4:
+            mask = source[:, :, 3]
+        elif source.ndim == 3:
+            mask = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
+        else:
+            mask = source
+        if mask.shape != (img_h, img_w):
+            mask = cv2.resize(mask, (img_w, img_h), interpolation=cv2.INTER_NEAREST)
+        return mask > 48
+    except Exception as error:
+        print(f"Completion observation mask decode failed: {error}")
+        return None
+
+
+def decode_completion_occlusion_mask(mask_data, img_w, img_h):
+    """Decode the foreground region that the completion must recover behind."""
+    return decode_completion_observation_mask(mask_data, img_w, img_h)
+
+
+def completion_observation_is_consistent(
+    observation_area,
+    observation_recall,
+    observation_iou,
+    containment,
+    base_strategy_type=None,
+    spatial=False
+):
+    """Reject post-inpaint scene leakage without blocking normal completions.
+
+    A first-pass observation is only a visible fragment, so generic subjects
+    may legitimately have a modest IoU after inpainting. Tables and furniture
+    are different: their hard silhouette is a reliable anchor, and a very low
+    IoU with high recall is the characteristic signature of a background
+    envelope added around that anchor.
+    """
+    if observation_area <= 0 or observation_recall is None:
+        return True, "no_observation_anchor"
+    if observation_recall < 0.72:
+        return False, "low_observation_recall"
+
+    hard_spatial_target = spatial and base_strategy_type in {
+        "table", "furniture", "lighting"
+    }
+    if not hard_spatial_target:
+        return True, "generic_observation_anchor"
+    if containment < 0.88:
+        return False, "spatial_completion_outside_target"
+    if observation_iou is None or observation_iou < 0.32:
+        return False, "spatial_completion_observation_iou"
+    return True, "spatial_observation_anchor"
 
 
 def is_non_subject_layout_layer(layer):
@@ -5257,7 +5938,13 @@ def score_candidate(metrics, strategy):
     else:
         plausible_fill = 1.0 - min(1.0, abs(fill - 0.38) / 0.38)
         background_penalty = max(0, fill - 0.58) * 1.8 + max(0, area - 0.75) * 0.9
-    background_penalty += metrics.get("exclude_mask_ratio", 0) * 0.2
+    # During canonical completion, overlap with a known foreground bbox is
+    # expected: it is the region where the hidden target must be recovered.
+    # Exact foreground ownership is resolved by the frontend's real alpha mask
+    # after this candidate is returned, so a coarse bbox must not downgrade the
+    # complete target candidate here.
+    if not metrics.get("completion_recovery"):
+        background_penalty += metrics.get("exclude_mask_ratio", 0) * 0.2
     rectangular_bonus = 0
     if strategy.get("prefer_rectangular"):
         bbox = metrics["bbox"]
@@ -5629,10 +6316,26 @@ def select_food_masks_from_candidates(candidate_masks, target_bbox, img_w, img_h
     }
     return merged.astype(np.float32), len(selected), quality
 
-def select_and_merge_masks(candidate_masks, target_bbox, img_w, img_h, layer_meta=None, context_layers=None):
-    strategy = get_layer_strategy(layer_meta or {})
-    if strategy["type"] == "food_product":
-        return select_food_masks_from_candidates(
+def select_and_merge_masks(
+    candidate_masks,
+    target_bbox,
+    img_w,
+    img_h,
+    layer_meta=None,
+    context_layers=None,
+    quality_profile="publish"
+):
+    policy = resolve_mask_policy(layer_meta or {}, quality_profile)
+    resolved_strategy = get_layer_strategy(layer_meta or {})
+    base_strategy_type = resolved_strategy.get("baseStrategyType", resolved_strategy.get("type"))
+    strategy = dict(resolved_strategy)
+    if policy["completion"]:
+        # Completion is a phase shared by both profiles. Use one generic
+        # candidate selector, while retaining the base type for output matte
+        # and structural post-processing later in the pipeline.
+        strategy["type"] = "completion_object"
+    if policy["selector"] == "compound_food":
+        food_result = select_food_masks_from_candidates(
             candidate_masks,
             target_bbox,
             img_w,
@@ -5640,6 +6343,18 @@ def select_and_merge_masks(candidate_masks, target_bbox, img_w, img_h, layer_met
             layer_meta=layer_meta,
             context_layers=context_layers
         )
+        if food_result[2] is not None:
+            food_result[2].update({
+                "baseStrategyType": base_strategy_type,
+                "profile": resolved_strategy.get("profile", "flat_design"),
+                "features": resolved_strategy.get("features", []),
+                "phase": resolved_strategy.get("phase", "initial")
+            })
+            food_result[2].update({
+                "policyVersion": policy["version"],
+                "selectionMode": policy["selector"]
+            })
+        return food_result
 
     exclude_bboxes = build_exclude_bboxes(layer_meta or {}, context_layers or [], target_bbox, img_w, img_h)
     exclude_mask_union = build_exclude_mask(exclude_bboxes, img_w, img_h) if exclude_bboxes else None
@@ -5657,6 +6372,44 @@ def select_and_merge_masks(candidate_masks, target_bbox, img_w, img_h, layer_met
     debug_candidates = []
     debug_rows = []
     tx1, ty1, tx2, ty2 = target_bbox
+    # The second-pass layer marker is authoritative. The broad `completion`
+    # profile is also used by the initial observation pass, so it must not
+    # relax ordinary first-pass extraction for every layer in that batch.
+    completion_observation_fallback = bool(
+        (layer_meta or {}).get("_completionObservationFallback")
+    )
+    completion_full_scene_mask = bool(
+        (layer_meta or {}).get("_completionFullSceneMask")
+    )
+    completion_recovery = (
+        is_completion_segmentation_layer(layer_meta) and
+        not completion_observation_fallback
+    )
+    # B can pass the completion gates without entering B/L arbitration. It is
+    # still a valid full-scene result for flat hard-edge entities; otherwise
+    # that route would silently fall back to the old first-observation clip.
+    completion_full_scene_candidate = bool(
+        completion_recovery and
+        policy["profile"] == "flat_design" and
+        not policy["spatial"] and
+        policy["softEdge"] is False and
+        "hard_edge" in policy["features"]
+    )
+    completion_observation = decode_completion_observation_mask(
+        (layer_meta or {}).get("completionObservationMask"),
+        img_w,
+        img_h
+    ) if completion_recovery else None
+    completion_occlusion_mask = decode_completion_occlusion_mask(
+        (layer_meta or {}).get("completionOcclusionMask"),
+        img_w,
+        img_h
+    ) if completion_recovery else None
+    completion_observation_area = int(np.count_nonzero(completion_observation)) if completion_observation is not None else 0
+    completion_occlusion_target_area = (
+        int(np.count_nonzero(completion_occlusion_mask[ty1:ty2, tx1:tx2]))
+        if completion_occlusion_mask is not None else 0
+    )
 
     for index, mask in enumerate(candidate_masks):
         if mask.shape != (img_h, img_w):
@@ -5682,6 +6435,39 @@ def select_and_merge_masks(candidate_masks, target_bbox, img_w, img_h, layer_met
         mask_area_ratio = mask_area / target_area
         center_inside = box_center_inside(current_bbox, target_bbox)
         bbox_touch_count = int(current_bbox[0] <= tx1 + 2) + int(current_bbox[1] <= ty1 + 2) + int(current_bbox[2] >= tx2 - 2) + int(current_bbox[3] >= ty2 - 2)
+        completion_observation_recall = None
+        completion_observation_iou = None
+        if completion_observation is not None and completion_observation_area > 0:
+            candidate_observation_overlap = int(np.count_nonzero(mask_binary & completion_observation))
+            candidate_observation_union = int(np.count_nonzero(mask_binary | completion_observation))
+            completion_observation_recall = candidate_observation_overlap / completion_observation_area
+            completion_observation_iou = candidate_observation_overlap / max(1, candidate_observation_union)
+        completion_observation_consistent, completion_observation_reason = (
+            completion_observation_is_consistent(
+                completion_observation_area,
+                completion_observation_recall,
+                completion_observation_iou,
+                mask_inside_target_ratio,
+                base_strategy_type=base_strategy_type,
+                spatial=policy["spatial"]
+        ) if completion_recovery else (True, "not_completion")
+        )
+        completion_recovery_pixels = 0
+        completion_recovery_ratio = None
+        if completion_occlusion_mask is not None:
+            completion_region = mask_binary[ty1:ty2, tx1:tx2]
+            if completion_observation is not None:
+                completion_region = completion_region & (~completion_observation[ty1:ty2, tx1:tx2])
+            completion_recovery_pixels = int(np.count_nonzero(
+                completion_region & completion_occlusion_mask[ty1:ty2, tx1:tx2]
+            ))
+            if completion_occlusion_target_area > 0:
+                completion_recovery_ratio = completion_recovery_pixels / completion_occlusion_target_area
+        completion_zone_ok = (
+            not completion_recovery or
+            completion_occlusion_target_area <= 0 or
+            completion_recovery_pixels >= max(256, int(completion_occlusion_target_area * 0.03))
+        )
         shape_features = compute_shape_features(current_bbox, target_bbox, mask_area)
         decor_base = strategy["type"] == "decor_arrangement" and is_decor_base_shape(shape_features)
         shape_allowed, shape_reject_reason = shape_strategy_gate(shape_features, strategy)
@@ -5725,6 +6511,43 @@ def select_and_merge_masks(candidate_masks, target_bbox, img_w, img_h, layer_met
             bbox_touch_count >= 3 and
             mask_inside_target_ratio < 0.96
         )
+        completion_anchor_candidate = bool(
+        completion_recovery and
+            completion_observation_recall is not None and
+            completion_observation_consistent and
+            completion_observation_recall >= 0.72 and
+            mask_inside_target_ratio >= 0.72 and
+            0.10 <= target_fill_ratio <= 0.78 and
+            mask_area_ratio <= 0.82 and
+            bbox_overlap_ratio >= 0.70
+        )
+        completion_recovery_candidate = bool(
+            completion_recovery and
+            mask_inside_target_ratio >= 0.72 and
+            0.10 <= target_fill_ratio <= 0.78 and
+            mask_area_ratio <= 0.82 and
+            bbox_overlap_ratio >= 0.70
+        )
+        # A completed target may grow only from the hidden/edited region. Its
+        # original visible silhouette is the non-negotiable identity anchor;
+        # without this check SAM can select a background-shaped candidate that
+        # happens to fit the completion bbox.
+        completion_observation_candidate = bool(
+            completion_recovery_candidate and
+            completion_observation_area > 0 and
+            completion_observation_recall is not None and
+            completion_observation_consistent and
+            (
+                completion_observation_recall >= 0.72 or
+                (
+                    completion_observation_recall >= 0.60 and
+                    mask_inside_target_ratio >= 0.90 and
+                    0.50 <= target_fill_ratio <= 0.78 and
+                    mask_area_ratio <= 0.78
+                )
+            )
+            and completion_zone_ok
+        )
 
         metrics = {
             "index": index,
@@ -5743,6 +6566,7 @@ def select_and_merge_masks(candidate_masks, target_bbox, img_w, img_h, layer_met
             "multi_entity_coverage": multi_entity_coverage,
             "multi_entity_count": multi_entity_count
         }
+        metrics["completion_recovery"] = completion_recovery
         high_coverage_entity, high_coverage_reason = is_high_coverage_entity(
             metrics,
             strategy,
@@ -5767,9 +6591,20 @@ def select_and_merge_masks(candidate_masks, target_bbox, img_w, img_h, layer_met
             and (bbox_overlap_ratio >= MIN_BBOX_OVERLAP_RATIO or center_inside)
             and shape_allowed
             and not lighting_background_like
-            and not table_background_like
-            and (not furniture_background_like or multi_entity_coverage)
-            and strong_exclude_mask_ratio < 0.22
+            and (not table_background_like or completion_observation_candidate)
+            # A bounded high-coverage entity may touch the semantic bbox. The
+            # previous gate rejected it as background even when the geometry
+            # audit had already marked it as a valid entity.
+            and (
+                not furniture_background_like or
+                multi_entity_coverage or
+                (
+                    high_coverage_entity and
+                    strong_exclude_mask_ratio < 0.22 and
+                    mask_inside_target_ratio >= 0.84
+                )
+            )
+            and (not completion_recovery or completion_observation_candidate)
         )
         score = score_candidate(metrics, strategy)
         debug_candidate = {
@@ -5787,14 +6622,28 @@ def select_and_merge_masks(candidate_masks, target_bbox, img_w, img_h, layer_met
             "decorBase": bool(decor_base),
             "highCoverageEntity": bool(high_coverage_entity),
             "multiEntityCoverage": bool(multi_entity_coverage),
+            "observationRecall": round(completion_observation_recall, 3) if completion_observation_recall is not None else None,
+            "observationIoU": round(completion_observation_iou, 3) if completion_observation_iou is not None else None,
+            "completionRecoveryPixels": completion_recovery_pixels,
+            "completionRecoveryRatio": round(completion_recovery_ratio, 3) if completion_recovery_ratio is not None else None,
+            "completionObservationReason": completion_observation_reason,
+            "completionAnchor": completion_anchor_candidate,
+            "completionRecoveryCandidate": completion_recovery_candidate,
+            "completionObservationCandidate": completion_observation_candidate,
             "candidate": bool(is_probable_foreground),
             "selected": False,
             "rejectReason": "" if is_probable_foreground else (
                 "lighting_background_like" if lighting_background_like else (
                     "table_background_like" if table_background_like else (
                         "furniture_background_like" if furniture_background_like else (
-                            "sibling_overlap" if strong_exclude_mask_ratio >= 0.22 else (
+                            completion_observation_reason if completion_recovery and not completion_observation_consistent else (
+                            "completion_occlusion_coverage_low" if completion_recovery and not completion_zone_ok else (
+                            "missing_completion_observation_anchor" if completion_recovery and not completion_observation_candidate else (
+                                "sibling_overlap" if strong_exclude_mask_ratio >= 0.22 and not completion_recovery_candidate else (
                                 high_coverage_reason if high_coverage_entity else (shape_reject_reason or "gate")
+                                )
+                            )
+                            )
                             )
                         )
                     )
@@ -5817,7 +6666,8 @@ def select_and_merge_masks(candidate_masks, target_bbox, img_w, img_h, layer_met
             f"support={shape_features['isTableSupport']}, block={shape_features['isBlockLike']}, "
             f"bottom={shape_features['bottomBand']:.3f}, "
             f"touch={bbox_touch_count}, center={center_inside}, score={score:.3f}, "
-            f"candidate={is_probable_foreground}"
+            f"candidate={is_probable_foreground} "
+            f"completionAudit={completion_observation_reason}"
         )
 
         if is_probable_foreground:
@@ -5854,7 +6704,7 @@ def select_and_merge_masks(candidate_masks, target_bbox, img_w, img_h, layer_met
         return None, 0, None
 
     exclude_values = [item["metrics"].get("exclude_mask_ratio", 0) for item in candidates]
-    exclude_reliable = bool(exclude_bboxes) and not (
+    exclude_reliable = bool(exclude_bboxes) and not completion_recovery and not (
         len(exclude_values) > 0 and
         sum(1 for value in exclude_values if value >= 0.95) / len(exclude_values) >= 0.8
     )
@@ -6214,6 +7064,27 @@ def select_and_merge_masks(candidate_masks, target_bbox, img_w, img_h, layer_met
             f"Food cleanup context: labels={label_cleanup_count} flat={cleanup_count} accepted=False fill={target_fill_ratio:.3f}"
         )
 
+    if completion_recovery and not (completion_full_scene_mask or completion_full_scene_candidate):
+        # Completion context may contain coarse sibling bboxes, but entries
+        # explicitly marked as real foreground occluders are safe to remove
+        # from the canonical target mask. This prevents detached lemon,
+        # label, or other occluder pixels from becoming part of the target
+        # without trusting every semantic bbox in the scene. A selected full
+        # completion silhouette intentionally retains its pixels behind the
+        # foreground layer; composition restores that occluder by z-index.
+        strong_completion_excludes = [
+            entry for entry in exclude_bboxes if is_strong_exclude(entry)
+        ]
+        if strong_completion_excludes:
+            strong_mask = build_exclude_mask(strong_completion_excludes, img_w, img_h)
+            cleaned = merged * (~strong_mask).astype(np.float32)
+            cleaned_binary = cleaned > 0.5
+            cleaned_target_area = int(np.count_nonzero(cleaned_binary[ty1:ty2, tx1:ty2]))
+            cleaned_fill_ratio = cleaned_target_area / target_area
+            if cleaned_fill_ratio >= max(0.08, target_fill_ratio * 0.45):
+                merged = cleaned
+                target_fill_ratio = cleaned_fill_ratio
+
     if exclude_reliable and target_fill_ratio > 0.18:
         exclude_mask = np.ones((img_h, img_w), dtype=np.float32)
         for entry in exclude_bboxes:
@@ -6237,7 +7108,8 @@ def select_and_merge_masks(candidate_masks, target_bbox, img_w, img_h, layer_met
         target_fill_ratio,
         selected,
         strategy["type"],
-        high_coverage_entity=high_coverage_selected
+        high_coverage_entity=high_coverage_selected,
+        policy=policy
     )
     strategy_profile = str((layer_meta or {}).get("extractionProfile", "")).lower() or strategy["type"]
     quality_reason = ",".join(quality_gate["issues"]) if quality_gate["issues"] else (
@@ -6256,17 +7128,32 @@ def select_and_merge_masks(candidate_masks, target_bbox, img_w, img_h, layer_met
         "flatAdCleanupCount": flat_ad_cleanup_count,
         "flatAdCleanedFillRatio": round(float(flat_ad_cleaned_fill_ratio), 3) if flat_ad_cleaned_fill_ratio is not None else None,
         "strategy": strategy["type"],
+        "baseStrategyType": base_strategy_type,
+        "profile": resolved_strategy.get("profile", "flat_design"),
+        "features": resolved_strategy.get("features", []),
+        "phase": resolved_strategy.get("phase", "initial"),
         "strategyProfile": strategy_profile,
         "selectedIndexes": [item["metrics"]["index"] for item in selected],
         "highCoverageEntity": high_coverage_selected,
         "debugCandidates": sorted(debug_candidates, key=lambda item: item["score"], reverse=True)[:12],
         "reason": "wall_art_quality_fallback" if forced_wall_art_fallback else quality_reason,
+        "selectionMode": "completion_recovery" if completion_recovery else "publish",
         "runtimeAction": "accept" if forced_wall_art_fallback else quality_gate["runtimeAction"],
         "shouldGenerateRuntimeLayer": True if forced_wall_art_fallback else (quality_gate["shouldGenerateRuntimeLayer"] if selected else False),
         "needsHigherPrecision": False if forced_wall_art_fallback else (quality_gate["needsHigherPrecision"] or not selected),
         "issues": ["wall_art_quality_fallback"] if forced_wall_art_fallback else (quality_gate["issues"] if selected else ["no_selected_mask"]),
         "recommendedEngine": quality_gate["recommendedEngine"]
     }
+    quality["policyVersion"] = policy["version"]
+    quality["selectionMode"] = policy["selector"]
+    quality["matteType"] = policy["matteType"]
+    quality["completionOutputMode"] = (
+        "full_scene_sam" if (completion_full_scene_mask or completion_full_scene_candidate) else
+        "observation_fallback" if completion_observation_fallback else
+        "incremental_recovery" if completion_recovery else
+        "not_applicable"
+    )
+    quality["maskAudit"] = mask_integrity_audit(merged, target_bbox)
 
     return merged, len(selected), quality
 
@@ -6375,19 +7262,61 @@ def detect_multi_entity_candidate_disagreement(candidate_masks, target_bbox, str
     return False, ""
 
 
-def should_escalate_sam_to_l(candidate_masks, target_bbox, strategy_type):
-    """Route only difficult B-model masks to the larger SAM-L model."""
-    if strategy_type in {"food_product", "soft_edge"}:
+def normalize_sam_quality_profile(profile):
+    value = str(profile or "").strip().lower()
+    if value in {"completion", "completion_candidate", "completion_review", "canonical_completion"}:
+        return "completion"
+    return "publish"
+
+
+def is_completion_segmentation_layer(layer_meta):
+    """Identify the post-inpaint SAM request without relaxing first-pass SAM."""
+    meta = layer_meta or {}
+    return bool(
+        meta.get("completionSegmentation") or
+        str(meta.get("id") or "").startswith("completion-scene-sam-") or
+        str(meta.get("layerId") or "").startswith("completion-scene-sam-")
+    )
+
+
+def should_escalate_sam_to_l(
+    candidate_masks,
+    target_bbox,
+    strategy_type,
+    quality_profile="publish",
+    completion_observation=None,
+    policy=None
+):
+    """Route only genuinely unsafe B masks to SAM-L.
+
+    Completion candidates do not need a publish-ready matte before inpainting.
+    They only need enough reliable foreground and containment to establish the
+    target/occluder relationship. Keep L for structural failures, not ordinary
+    holes or small visible-area loss.
+    """
+    quality_profile = normalize_sam_quality_profile(quality_profile)
+    policy = policy or policy_for_strategy_type(strategy_type, quality_profile=quality_profile)
+    if not policy.get("allowModelEscalation", True):
         return False, "strategy_prefers_b"
     if candidate_masks is None or len(candidate_masks) == 0:
         return True, "no_b_candidates"
+
+    # The alpha for a foreground occluder becomes the model edit mask. It
+    # therefore needs an independent model review even when B produced a
+    # plausible-looking partial component. This is intentionally based on the
+    # execution role, not an object label such as food, fruit, or furniture.
+    if policy.get("completionOccluder") and not policy.get("softEdge"):
+        return True, "completion_occluder_independent_l_review"
 
     multi_entity, multi_entity_reason = detect_multi_entity_candidate_disagreement(
         candidate_masks,
         target_bbox,
         strategy_type
     )
-    if multi_entity:
+    # A larger alternative can be useful evidence for publish-quality
+    # extraction, but it is not by itself a reason to pay for SAM-L when this
+    # mask is only the observation used by object completion.
+    if multi_entity and quality_profile != "completion":
         return True, multi_entity_reason
 
     x1, y1, x2, y2 = [int(value) for value in target_bbox]
@@ -6416,23 +7345,102 @@ def should_escalate_sam_to_l(candidate_masks, target_bbox, strategy_type):
         if hx > 0 and hy > 0 and hx + hw < inverted.shape[1] and hy + hh < inverted.shape[0]:
             best_holes += hole_area
 
-    hard_entity = strategy_type in HARD_EDGE_STRATEGIES or strategy_type in {"table", "furniture"}
-    fill_threshold = 0.56 if hard_entity else 0.48
+    hard_entity = (
+        strategy_type in HARD_EDGE_STRATEGIES or
+        strategy_type in {"table", "furniture", "completion_object"}
+    )
+    if quality_profile == "completion":
+        # A partially visible hard object is intentionally allowed here: the
+        # completion model will infer the hidden body later. Containment and
+        # structural sanity remain stricter than the fill threshold.
+        fill_threshold = 0.30 if hard_entity else 0.24
+        inside_threshold = 0.82
+        hole_ratio = 0.04
+        max_holes = 5000
+    else:
+        fill_threshold = 0.56 if hard_entity else 0.48
+        inside_threshold = 0.94
+        hole_ratio = 0.006 if hard_entity else 0.012
+        max_holes = 1400 if hard_entity else 1200
     # At high resolution, a fixed hole count is too lenient for a large
     # textured object. Conversely, a pure percentage is too aggressive for a
     # small object. The hard-entity threshold catches real internal breaks
     # while leaving ordinary SAM raster noise on the B path.
     hole_threshold = max(
-        1400 if hard_entity else 1200,
-        int(target_area * (0.006 if hard_entity else 0.012))
+        max_holes,
+        int(target_area * hole_ratio)
     )
+    if quality_profile == "completion" and strategy_type == "completion_object":
+        reference_bbox = mask_bbox(reference)
+        if reference_bbox:
+            rx1, ry1, rx2, ry2 = reference_bbox
+            reference_touch_count = int(rx1 <= x1 + 2) + int(ry1 <= y1 + 2)
+            reference_touch_count += int(rx2 >= x2 - 2) + int(ry2 >= y2 - 2)
+            # A post-inpaint mask touching several prompt edges is commonly a
+            # scene envelope or a partial foreground mask. Give SAM-L a
+            # chance to resolve it before the generic completion gate runs.
+            if reference_touch_count >= 3 or best_inside < 0.90:
+                return True, (
+                    f"completion_b_shape_ambiguous_touch={reference_touch_count}"
+                )
+
+    # A tightly framed furniture bbox can touch several prompt edges without
+    # being a background envelope. If containment is borderline, let SAM-L
+    # inspect it instead of trusting B's coarse fill acceptance.
+    if strategy_type in {"table", "furniture"}:
+        reference_bbox = mask_bbox(reference)
+        if reference_bbox:
+            rx1, ry1, rx2, ry2 = reference_bbox
+            reference_touch_count = (
+                int(rx1 <= x1 + 2) + int(ry1 <= y1 + 2) +
+                int(rx2 >= x2 - 2) + int(ry2 >= y2 - 2)
+            )
+            reference_area_ratio = area / target_area
+            if (
+                reference_touch_count >= 3 and
+                0.84 <= best_inside < 0.94 and
+                0.96 <= reference_area_ratio <= 1.05
+            ):
+                return True, (
+                    f"{strategy_type}_b_bbox_envelope_inside={best_inside:.3f}"
+                )
+
     if best_fill < fill_threshold:
-        return True, f"low_b_fill={best_fill:.3f}"
+        return True, f"low_b_fill={best_fill:.3f}_profile={quality_profile}"
     if best_holes > hole_threshold:
-        return True, f"b_internal_gaps={best_holes}>{hole_threshold}"
-    if best_inside < 0.94:
-        return True, f"low_b_inside={best_inside:.3f}"
-    return False, f"b_accepted_fill={best_fill:.3f}"
+        return True, f"b_internal_gaps={best_holes}>{hole_threshold}_profile={quality_profile}"
+    if best_inside < inside_threshold:
+        return True, f"low_b_inside={best_inside:.3f}_profile={quality_profile}"
+
+    if quality_profile == "completion" and completion_observation is not None:
+        observation_area = int(np.count_nonzero(completion_observation > 0.5))
+        if observation_area > 0:
+            observed_overlap = int(np.count_nonzero(binary & (completion_observation > 0.5)))
+            observation_recall = observed_overlap / observation_area
+            if observation_recall < 0.72:
+                return True, (
+                    f"low_completion_observation_recall={observation_recall:.3f}"
+                )
+
+    # A highly fragmented mask is not a useful completion observation even if
+    # its total fill and containment ratios look acceptable.
+    target_crop = binary[y1:y2, x1:x2].astype(np.uint8)
+    component_count, _, component_stats, _ = cv2.connectedComponentsWithStats(
+        target_crop,
+        connectivity=8
+    )
+    substantial_components = [
+        int(component_stats[label, cv2.CC_STAT_AREA])
+        for label in range(1, component_count)
+        if int(component_stats[label, cv2.CC_STAT_AREA]) >= max(64, int(target_area * 0.01))
+    ]
+    if quality_profile == "completion" and len(substantial_components) >= 5:
+        return True, f"fragmented_b_mask={len(substantial_components)}_profile={quality_profile}"
+
+    if quality_profile == "completion" and best_fill > 0.94 and area / target_area > 0.98:
+        return True, f"background_like_b_mask=fill:{best_fill:.3f}_area:{area / target_area:.3f}"
+
+    return False, f"b_accepted_fill={best_fill:.3f}_profile={quality_profile}"
 
 
 def choose_b_reference_mask(b_masks, target_bbox, strategy_type=None):
@@ -6451,7 +7459,7 @@ def choose_b_reference_mask(b_masks, target_bbox, strategy_type=None):
         inside_area = int(np.count_nonzero(binary[y1:y2, x1:x2]))
         fill = inside_area / target_area
         inside_ratio = inside_area / area
-        if strategy_type in HARD_EDGE_STRATEGIES or strategy_type in {"table", "furniture"}:
+        if strategy_type in HARD_EDGE_STRATEGIES or strategy_type in {"table", "furniture", "completion_object"}:
             # Prefer the plausible primary object when B also returns a
             # bbox-filling envelope. The latter may be a group or background;
             # L arbitration can decide whether its extra components are real.
@@ -6468,8 +7476,162 @@ def choose_b_reference_mask(b_masks, target_bbox, strategy_type=None):
     return best
 
 
-def arbitrate_sam_b_l_masks(b_masks, l_masks, target_bbox, strategy_type=None):
-    """Accept L only where it improves B without introducing detached growth."""
+def merge_furniture_l_peer_masks(primary_mask, l_masks, primary_index, target_bbox):
+    """Merge safe attached peers from L multimask output into its primary.
+
+    SAM multimask results can split a physical object into a body candidate and
+    a small attached component. The merge is shape-agnostic: it relies on
+    overlap, proximity, bbox containment, and bounded component size rather
+    than naming a furniture part.
+    """
+    merged = np.asarray(primary_mask > 0.5, dtype=bool).copy()
+    if l_masks is None or len(l_masks) < 2 or primary_index < 0:
+        return merged.astype(np.float32), {"peers": 0, "pixels": 0}
+
+    height, width = merged.shape
+    x1, y1, x2, y2 = [int(value) for value in target_bbox]
+    x1 = clamp(x1, 0, width - 1)
+    y1 = clamp(y1, 0, height - 1)
+    x2 = clamp(x2, x1 + 1, width)
+    y2 = clamp(y2, y1 + 1, height)
+    target_area = max(1, (x2 - x1) * (y2 - y1))
+    min_side = max(1, min(x2 - x1, y2 - y1))
+    attach_radius = max(8, min(24, int(round(min_side * 0.035))))
+    contact_radius = max(2, min(6, int(round(min_side * 0.010))))
+    near_merged = cv2.dilate(
+        merged.astype(np.uint8),
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (attach_radius * 2 + 1, attach_radius * 2 + 1)
+        ),
+        iterations=1
+    ) > 0
+    contact_merged = cv2.dilate(
+        merged.astype(np.uint8),
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (contact_radius * 2 + 1, contact_radius * 2 + 1)
+        ),
+        iterations=1
+    ) > 0
+    max_total_added = max(256, int(target_area * 0.18))
+    total_added = 0
+    merged_peers = 0
+
+    peer_rows = []
+    for index, candidate in enumerate(l_masks):
+        if index == primary_index:
+            continue
+        candidate_binary = np.asarray(candidate > 0.5, dtype=bool).copy()
+        candidate_binary[:y1] = False
+        candidate_binary[y2:] = False
+        candidate_binary[:, :x1] = False
+        candidate_binary[:, x2:] = False
+        candidate_area = int(np.count_nonzero(candidate_binary))
+        if candidate_area <= 0:
+            continue
+        overlap = int(np.count_nonzero(candidate_binary & merged)) / candidate_area
+        peer_rows.append((overlap, index, candidate_binary))
+    peer_rows.sort(reverse=True, key=lambda row: row[0])
+
+    for overlap, index, candidate_binary in peer_rows:
+        # A peer may overlap the body, or it may be a detached-but-adjacent
+        # part represented separately by SAM. The latter is accepted only when
+        # most of its pixels are inside the narrow neighborhood of the body.
+        contact_ratio = int(np.count_nonzero(candidate_binary & contact_merged)) / max(
+            1,
+            int(np.count_nonzero(candidate_binary))
+        )
+        if overlap < 0.45 and contact_ratio < 0.60:
+            continue
+        added = candidate_binary & (~merged)
+        if not np.any(added):
+            continue
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            added.astype(np.uint8),
+            connectivity=8
+        )
+        accepted = np.zeros_like(added, dtype=bool)
+        peer_pixels = 0
+        for label in range(1, count):
+            x, y, comp_w, comp_h, area = [int(value) for value in stats[label]]
+            if area < max(24, int(target_area * 0.00012)):
+                continue
+            if area > max(128, int(target_area * 0.10)):
+                continue
+            component = labels == label
+            inside_ratio = int(np.count_nonzero(component[y1:y2, x1:x2])) / max(1, area)
+            if inside_ratio < 0.98:
+                continue
+            if not np.any(component & contact_merged):
+                continue
+            accepted |= component
+            peer_pixels += area
+
+        if peer_pixels <= 0 or total_added + peer_pixels > max_total_added:
+            continue
+        merged |= accepted
+        total_added += peer_pixels
+        merged_peers += 1
+        near_merged = cv2.dilate(
+            merged.astype(np.uint8),
+            cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (attach_radius * 2 + 1, attach_radius * 2 + 1)
+            ),
+            iterations=1
+        ) > 0
+        contact_merged = cv2.dilate(
+            merged.astype(np.uint8),
+            cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (contact_radius * 2 + 1, contact_radius * 2 + 1)
+            ),
+            iterations=1
+        ) > 0
+
+    return merged.astype(np.float32), {
+        "peers": merged_peers,
+        "pixels": total_added,
+    }
+
+
+def arbitrate_sam_b_l_masks(
+    b_masks,
+    l_masks,
+    target_bbox,
+    strategy_type=None,
+    b_failure_reason="",
+    completion_recovery=False,
+    completion_observation=None,
+    completion_occlusion_mask=None,
+    completion_base_strategy_type=None,
+    completion_spatial=False,
+    completion_flat_hard_edge=False
+):
+    """Choose an L recovery mask without allowing background envelopes.
+
+    Furniture and canonical completion use an independent recovery path: when
+    B is partial, requiring L to preserve 98.5% of B makes the damaged B mask
+    the authority and rejects a genuinely complete silhouette. Ordinary table
+    extraction keeps the stricter incremental arbitration because its bbox can
+    contain floor or wall.
+    """
+    if completion_recovery:
+        recovery_masks = l_masks if l_masks is not None and len(l_masks) > 0 else b_masks
+        selected, reason = choose_completion_recovery_mask(
+            recovery_masks,
+            target_bbox,
+            strategy_type=strategy_type,
+            observation_mask=completion_observation,
+            occlusion_mask=completion_occlusion_mask,
+            base_strategy_type=completion_base_strategy_type,
+            spatial=completion_spatial,
+            prefer_full_scene=completion_flat_hard_edge
+        )
+        if selected is not None:
+            return np.stack([selected], axis=0), reason
+
     if l_masks is None or len(l_masks) == 0:
         return b_masks, "b_no_l_candidates"
     if b_masks is None or len(b_masks) == 0:
@@ -6482,6 +7644,131 @@ def arbitrate_sam_b_l_masks(b_masks, l_masks, target_bbox, strategy_type=None):
         return l_masks, "l_fallback_no_b_reference"
     base = reference > 0.5
     base_area = max(1, int(np.count_nonzero(base[y1:y2, x1:x2])))
+
+    b_failed = str(b_failure_reason).startswith((
+        "low_b_",
+        "b_internal_gaps=",
+        "multi_entity_disagreement=",
+        "no_b_",
+        "completion_occluder_"
+    ))
+    # A hard-product mask may be a printed illustration or a complex product
+    # silhouette. When B explicitly escalated because of structural failure,
+    # do not make that damaged B result veto a contained SAM-L candidate. The
+    # same conservative containment/fill/hole checks used for furniture still
+    # reject bbox-sized scene masks.
+    direct_l_recovery = b_failed and strategy_type != "soft_edge"
+    if direct_l_recovery:
+        recovery_candidates = []
+        for index, candidate in enumerate(l_masks):
+            raw_binary = np.asarray(candidate > 0.5, dtype=bool)
+            raw_area = int(np.count_nonzero(raw_binary))
+            if raw_area <= 0:
+                continue
+
+            clipped = raw_binary.copy()
+            clipped[:y1] = False
+            clipped[y2:] = False
+            clipped[:, :x1] = False
+            clipped[:, x2:] = False
+            clipped_area = int(np.count_nonzero(clipped[y1:y2, x1:x2]))
+            if clipped_area <= 0:
+                continue
+
+            fill = clipped_area / target_area
+            raw_inside_ratio = clipped_area / raw_area
+            outside_ratio = 1.0 - raw_inside_ratio
+            if raw_inside_ratio < 0.86 or outside_ratio > 0.14:
+                continue
+            # A bbox-filling envelope is more likely background than a
+            # complete upholstered object. Keep a margin below full coverage.
+            if fill < 0.22 or fill > 0.90:
+                continue
+
+            component_count, _, component_stats, _ = cv2.connectedComponentsWithStats(
+                clipped[y1:y2, x1:x2].astype(np.uint8),
+                connectivity=8
+            )
+            substantial_components = sum(
+                1 for component_label in range(1, component_count)
+                if int(component_stats[component_label, cv2.CC_STAT_AREA]) >= max(64, int(target_area * 0.01))
+            )
+            if substantial_components == 0:
+                continue
+
+            # L can still return a mostly-contained mask with detached pixels
+            # or large internal pockets. Measure those defects before choosing
+            # the direct recovery candidate; otherwise the first reasonable
+            # fill can win despite producing the broken matte seen downstream.
+            crop_binary = clipped[y1:y2, x1:x2]
+            component_count, component_labels, component_stats, _ = cv2.connectedComponentsWithStats(
+                crop_binary.astype(np.uint8),
+                connectivity=8
+            )
+            total_pixels = max(1, int(np.count_nonzero(crop_binary)))
+            largest_component = 0
+            small_component_pixels = 0
+            for component_label in range(1, component_count):
+                component_area = int(component_stats[component_label, cv2.CC_STAT_AREA])
+                largest_component = max(largest_component, component_area)
+                if component_area < max(96, int(target_area * 0.008)):
+                    small_component_pixels += component_area
+            inverted = (~crop_binary).astype(np.uint8)
+            hole_count, _, hole_stats, _ = cv2.connectedComponentsWithStats(
+                inverted,
+                connectivity=8
+            )
+            enclosed_hole_pixels = 0
+            for hole_label in range(1, hole_count):
+                hx, hy, hw, hh, hole_area = [int(value) for value in hole_stats[hole_label]]
+                if hx > 0 and hy > 0 and hx + hw < crop_binary.shape[1] and hy + hh < crop_binary.shape[0]:
+                    enclosed_hole_pixels += hole_area
+            largest_ratio = largest_component / total_pixels
+            fragment_ratio = small_component_pixels / total_pixels
+            hole_ratio = enclosed_hole_pixels / target_area
+
+            # Prefer a contained, reasonably complete silhouette. The score is
+            # intentionally independent of B overlap so damaged B cannot veto L.
+            score = (
+                raw_inside_ratio * 2.4 +
+                (1.0 - min(1.0, abs(fill - 0.58))) -
+                max(0.0, fill - 0.72) * 2.5 +
+                min(0.12, substantial_components * 0.02) +
+                min(0.18, largest_ratio * 0.18) -
+                min(0.32, fragment_ratio * 1.8) -
+                min(0.36, hole_ratio * 1.8)
+            )
+            recovery_candidates.append((
+                score,
+                index,
+                clipped,
+                fill,
+                largest_ratio,
+                fragment_ratio,
+                hole_ratio
+            ))
+
+        if recovery_candidates:
+            recovery_candidates.sort(key=lambda item: item[0], reverse=True)
+            score, index, selected, fill, largest_ratio, fragment_ratio, hole_ratio = recovery_candidates[0]
+            recovered = np.zeros_like(b_masks[0], dtype=np.float32)
+            recovered[selected] = 1.0
+            peer_debug = {"peers": 0, "pixels": 0}
+            if strategy_type == "furniture":
+                recovered, peer_debug = merge_furniture_l_peer_masks(
+                    recovered,
+                    l_masks,
+                    index,
+                    target_bbox
+                )
+            return np.stack([recovered], axis=0), (
+                f"l_direct_{strategy_type}_recovery=index={index} score={score:.3f} "
+                f"fill={fill:.3f} largest={largest_ratio:.3f} "
+                f"fragments={fragment_ratio:.3f} holes={hole_ratio:.3f} "
+                f"peers={peer_debug.get('peers', 0)} "
+                f"peerPixels={peer_debug.get('pixels', 0)}"
+            )
+
     best = base
     best_score = 0.0
     best_added = 0
@@ -6558,13 +7845,383 @@ def arbitrate_sam_b_l_masks(b_masks, l_masks, target_bbox, strategy_type=None):
     return np.stack([merged], axis=0), f"hybrid_added={best_added}"
 
 
+def choose_completion_recovery_mask(
+    candidate_masks,
+    target_bbox,
+    strategy_type=None,
+    observation_mask=None,
+    occlusion_mask=None,
+    base_strategy_type=None,
+    spatial=False,
+    prefer_full_scene=False
+):
+    """Choose a complete-looking completion mask without preserving bad B geometry.
+
+    The first SAM pass is intentionally a partial observation. Requiring SAM-L
+    to preserve it pixel-for-pixel makes the partial mask veto the completed
+    object. Completion mode therefore ranks contained candidates by coverage,
+    while rejecting bbox-sized scene envelopes.
+    """
+    if candidate_masks is None or len(candidate_masks) == 0:
+        return None, "completion_no_candidates"
+
+    x1, y1, x2, y2 = [int(value) for value in target_bbox]
+    target_area = max(1, (x2 - x1) * (y2 - y1))
+    observation_binary = np.asarray(observation_mask > 0.5, dtype=bool) if observation_mask is not None else None
+    occlusion_binary = np.asarray(occlusion_mask > 0.5, dtype=bool) if occlusion_mask is not None else None
+    observation_area = int(np.count_nonzero(observation_binary)) if observation_binary is not None else 0
+    occlusion_target_area = (
+        int(np.count_nonzero(occlusion_binary[y1:y2, x1:x2]))
+        if occlusion_binary is not None else 0
+    )
+    best = None
+    rows = []
+    for index, candidate in enumerate(candidate_masks):
+        binary = np.asarray(candidate > 0.5, dtype=bool)
+        area = int(np.count_nonzero(binary))
+        if area <= 0:
+            continue
+        inside = int(np.count_nonzero(binary[y1:y2, x1:x2]))
+        bbox = mask_bbox(candidate)
+        if not bbox:
+            continue
+        fill = inside / target_area
+        containment = inside / area
+        overlap = intersection_area(bbox, target_bbox) / target_area
+        area_ratio = area / target_area
+        observation_recall = None
+        observation_iou = None
+        if observation_area > 0:
+            observation_overlap = int(np.count_nonzero(binary & observation_binary))
+            observation_recall = observation_overlap / observation_area
+            observation_iou = observation_overlap / max(
+                1, int(np.count_nonzero(binary | observation_binary))
+            )
+        completion_recovery_pixels = 0
+        completion_recovery_ratio = None
+        if occlusion_target_area > 0:
+            new_pixels = binary[y1:y2, x1:x2]
+            if observation_binary is not None:
+                new_pixels = new_pixels & (~observation_binary[y1:y2, x1:x2])
+            completion_recovery_pixels = int(np.count_nonzero(
+                new_pixels & occlusion_binary[y1:y2, x1:x2]
+            ))
+            completion_recovery_ratio = completion_recovery_pixels / occlusion_target_area
+        observation_consistent, observation_reason = completion_observation_is_consistent(
+            observation_area,
+            observation_recall,
+            observation_iou,
+            containment,
+            base_strategy_type=base_strategy_type,
+            spatial=spatial
+        )
+        # The completion crop includes scene context. A valid target must be
+        # mostly contained by the prompt bbox, but it should not be the whole
+        # crop or a room/background envelope.
+        # The initial observation is a visible-only mask and can be slightly
+        # misregistered after the scene inpaint/rescale round-trip. For a
+        # bounded, well-contained completion candidate, allow a small recall
+        # loss; reconciliation restores any missing original pixels and the
+        # final observation audit remains the authoritative safety check.
+        observation_anchor_ok = (
+            observation_area == 0 or
+            observation_recall >= 0.72 or
+            (
+                observation_recall >= 0.60 and
+                containment >= 0.90 and
+                0.50 <= fill <= 0.78 and
+                area_ratio <= 0.78
+            )
+        )
+        # A completion candidate must contribute pixels in the actual
+        # foreground region that was removed for inpainting. Otherwise a
+        # visible-only SAM mask can pass the observation checks while silently
+        # dropping the completed part of the object.
+        minimum_recovery_pixels = max(256, int(occlusion_target_area * 0.03))
+        completion_zone_ok = (
+            occlusion_target_area <= 0 or
+            completion_recovery_pixels >= minimum_recovery_pixels
+        )
+        accepted = (
+            containment >= 0.72 and
+            0.10 <= fill <= 0.78 and
+            area_ratio <= 0.82 and
+            overlap >= 0.70 and
+            observation_anchor_ok and
+            completion_zone_ok and
+            observation_consistent
+        )
+        row = {
+            "index": index,
+            "fill": round(fill, 3),
+            "inside": round(containment, 3),
+            "area": round(area_ratio, 3),
+            "bboxOverlap": round(overlap, 3),
+            "observationRecall": round(observation_recall, 3) if observation_recall is not None else None,
+            "observationIoU": round(observation_iou, 3) if observation_iou is not None else None,
+            "completionRecoveryPixels": completion_recovery_pixels,
+            "completionRecoveryRatio": round(completion_recovery_ratio, 3) if completion_recovery_ratio is not None else None,
+            "reason": observation_reason,
+            "accepted": accepted
+        }
+        rows.append(row)
+        if not accepted:
+            continue
+        # Coverage is the useful signal after inpaint. Containment and bbox
+        # overlap break ties against a scene envelope.
+        recovery_bonus = min(0.9, (completion_recovery_ratio or 0.0) * 2.0)
+        score = (
+            fill * 3.0 + containment * 1.2 + overlap * 0.25 + recovery_bonus
+            - max(0.0, area_ratio - 0.55) * 0.8
+        )
+        if best is None or score > best[0]:
+            best = (score, index, binary.astype(np.float32), row)
+
+    if best is None:
+        # A post-inpaint SAM candidate is not required to be a trustworthy
+        # full-object mask. In practice SAM-L may return a scene envelope
+        # whose useful information is only the small part inside the region
+        # that was occluded during completion. Recover that delta locally and
+        # keep the first-pass visible silhouette as the identity anchor.
+        incremental_best = None
+        if observation_binary is not None and occlusion_binary is not None:
+            image_h, image_w = observation_binary.shape[:2]
+            anchor_radius = max(8, min(28, int(round(min(image_h, image_w) * 0.04))))
+            anchor_support = cv2.dilate(
+                observation_binary.astype(np.uint8),
+                cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE,
+                    (anchor_radius * 2 + 1, anchor_radius * 2 + 1)
+                ),
+                iterations=1
+            ) > 0
+            allowed_zone = occlusion_binary.copy()
+            allowed_zone[:y1] = False
+            allowed_zone[y2:] = False
+            allowed_zone[:, :x1] = False
+            allowed_zone[:, x2:] = False
+            target_area_float = float(target_area)
+            occlusion_area = max(1, int(np.count_nonzero(allowed_zone)))
+            minimum_delta_pixels = max(64, int(occlusion_area * 0.005))
+            maximum_delta_pixels = max(256, int(target_area_float * 0.22))
+
+            for index, candidate in enumerate(candidate_masks):
+                candidate_binary = np.asarray(candidate > 0.5, dtype=bool)
+                delta = candidate_binary & (~observation_binary) & allowed_zone
+                # Only accept newly generated pixels that are close to the
+                # known silhouette. This prevents a broad background mask
+                # from turning the complete occluder into the target object.
+                delta &= anchor_support
+                delta_pixels = int(np.count_nonzero(delta))
+                if delta_pixels < minimum_delta_pixels or delta_pixels > maximum_delta_pixels:
+                    continue
+
+                component_count, component_labels, component_stats, _ = cv2.connectedComponentsWithStats(
+                    delta.astype(np.uint8),
+                    connectivity=8
+                )
+                substantial_components = 0
+                for component_index in range(1, component_count):
+                    component_area = int(component_stats[component_index, cv2.CC_STAT_AREA])
+                    if component_area >= max(24, int(target_area_float * 0.0005)):
+                        substantial_components += 1
+                if substantial_components == 0:
+                    continue
+
+                merged_binary = observation_binary | delta
+                merged_binary[:y1] = False
+                merged_binary[y2:] = False
+                merged_binary[:, :x1] = False
+                merged_binary[:, x2:] = False
+                merged_area = int(np.count_nonzero(merged_binary))
+                merged_inside = int(np.count_nonzero(merged_binary[y1:y2, x1:x2]))
+                merged_fill = merged_inside / target_area_float
+                merged_containment = merged_inside / max(1, merged_area)
+                if merged_fill < 0.10 or merged_fill > 0.90 or merged_containment < 0.88:
+                    continue
+
+                delta_ratio = delta_pixels / target_area_float
+                score = (
+                    min(0.22, delta_ratio) * 3.0 +
+                    min(1.0, merged_containment) * 0.8 -
+                    max(0.0, delta_ratio - 0.12) * 2.0
+                )
+                if incremental_best is None or score > incremental_best[0]:
+                    incremental_best = (
+                        score,
+                        index,
+                        merged_binary.astype(np.float32),
+                        delta_pixels,
+                        merged_fill,
+                        merged_containment,
+                        int(np.count_nonzero(delta & occlusion_binary)) / occlusion_area
+                    )
+
+        if incremental_best is not None:
+            (
+                score,
+                index,
+                selected,
+                delta_pixels,
+                merged_fill,
+                merged_containment,
+                recovery_ratio
+            ) = incremental_best
+            print(
+                f"Completion candidate selection: incremental_recovery index={index} "
+                f"score={score:.3f} deltaPixels={delta_pixels} "
+                f"fill={merged_fill:.3f} inside={merged_containment:.3f} "
+                f"recoveryRatio={recovery_ratio:.3f}"
+            )
+            return selected, (
+                f"completion_incremental_recovery=index={index} "
+                f"deltaPixels={delta_pixels}"
+            )
+
+        if observation_binary is not None and observation_area > 0:
+            # A failed recovery must not erase a valid first-pass layer. The
+            # caller marks this result so normal completion-zone validation
+            # does not reject the deliberate observation-only fallback.
+            print(
+                f"Completion candidate selection: observation_fallback "
+                f"pixels={observation_area} rows={rows[:8]}"
+            )
+            return observation_binary.astype(np.float32), "completion_observation_fallback"
+
+        print(f"Completion candidate selection: no accepted mask rows={rows[:8]}")
+        return None, "completion_no_acceptable_candidate"
+
+    score, index, selected, row = best
+    # A completed flat hard-edge entity is materially different from a table,
+    # chair, or soft edge: when its full-scene candidate passes containment,
+    # observation, and occlusion-zone checks above, keep that silhouette as
+    # the canonical result.  The original first-pass mask remains an audit
+    # reference, not a pixel-level clipping constraint.  Spatial objects keep
+    # the established conservative incremental/reconciliation path.
+    full_scene_direct = bool(prefer_full_scene and not spatial)
+    print(
+        f"Completion candidate selection: {'full_scene_sam' if full_scene_direct else 'model_independent'} index={index} "
+        f"score={score:.3f} fill={row['fill']:.3f} inside={row['inside']:.3f} "
+        f"area={row['area']:.3f} overlap={row['bboxOverlap']:.3f} "
+        f"recoveryPixels={row.get('completionRecoveryPixels', 0)} "
+        f"recoveryRatio={row.get('completionRecoveryRatio')}"
+    )
+    output_mode = "completion_full_scene_sam" if full_scene_direct else "completion_direct_recovery"
+    return selected, (
+        f"{output_mode}=index={index} score={score:.3f} "
+        f"fill={row['fill']:.3f} inside={row['inside']:.3f}"
+    )
+
+
+def run_sam_l_with_retry(img, prompt_bbox, strategy_type, layer_name, policy=None):
+    """Run L at a bounded size and retry once at a lower size after CUDA OOM."""
+    initial_imgsz = choose_sam_imgsz(
+        img,
+        strategy_type,
+        model_variant="l",
+        policy=policy
+    )
+    attempts = [initial_imgsz]
+    retry_imgsz = min(initial_imgsz, SAM_L_OOM_RETRY_IMGSZ)
+    if retry_imgsz < initial_imgsz:
+        attempts.append(retry_imgsz)
+
+    last_error = None
+    for attempt_index, imgsz in enumerate(attempts):
+        if attempt_index > 0:
+            print(
+                f"SAM-L retry for {layer_name}: imgsz={imgsz} "
+                f"after_cuda_oom={initial_imgsz}"
+            )
+        if imgsz != HARD_EDGE_SAM_IMGSZ and strategy_type in HARD_EDGE_STRATEGIES:
+            print(
+                f"SAM-L adaptive imgsz for {layer_name}: "
+                f"source={img.shape[:2]} imgsz={imgsz}"
+            )
+        try:
+            results = run_sam_bbox_inference(
+                img,
+                prompt_bbox,
+                multimask_output=True,
+                imgsz=imgsz,
+                points=None,
+                labels=None,
+                model_variant="l"
+            )
+            return results, imgsz
+        except Exception as error:
+            last_error = error
+            if not is_cuda_oom(error) or attempt_index >= len(attempts) - 1:
+                raise
+            release_sam_model("l", reason=f"oom_retry_{imgsz}")
+
+    raise last_error or RuntimeError("SAM-L inference failed")
+
+
+def should_run_local_upscale(candidate_masks, target_bbox, strategy_type):
+    """Use local upscaling for small lighting or difficult furniture masks."""
+    if not LOCAL_UPSCALE_ENABLED or strategy_type not in LOCAL_UPSCALE_STRATEGIES:
+        return False, "strategy_disabled"
+    if candidate_masks is None or len(candidate_masks) == 0:
+        return True, "no_b_candidates"
+
+    x1, y1, x2, y2 = [int(value) for value in target_bbox]
+    bbox_width = max(1, x2 - x1)
+    bbox_height = max(1, y2 - y1)
+    if (
+        strategy_type == "lighting" and
+        max(bbox_width, bbox_height) <= LOCAL_UPSCALE_MAX_BBOX_SIDE
+    ):
+        return True, f"small_{strategy_type}_bbox={bbox_width}x{bbox_height}"
+
+    reference = choose_b_reference_mask(candidate_masks, target_bbox, strategy_type)
+    if reference is None:
+        return True, "no_b_reference"
+    target_area = max(1, bbox_width * bbox_height)
+    binary = reference > 0.5
+    inside_pixels = int(np.count_nonzero(binary[y1:y2, x1:x2]))
+    area = int(np.count_nonzero(binary))
+    fill = inside_pixels / target_area
+    inside = inside_pixels / max(1, area)
+    fill_threshold = 0.56 if strategy_type == "lighting" else 0.68
+    inside_threshold = 0.94 if strategy_type == "lighting" else 0.95
+    if fill < fill_threshold:
+        return True, f"low_{strategy_type}_fill={fill:.3f}"
+    if inside < inside_threshold:
+        return True, f"low_{strategy_type}_inside={inside:.3f}"
+    return False, f"{strategy_type}_primary_accepted={fill:.3f}"
+
+
+def should_run_l_local_upscale(candidate_masks, target_bbox, strategy_type):
+    """Run a local L pass only for a difficult furniture escalation."""
+    if strategy_type != "furniture" or candidate_masks is None or len(candidate_masks) == 0:
+        return False, "strategy_disabled"
+
+    reference = choose_b_reference_mask(candidate_masks, target_bbox, strategy_type)
+    if reference is None:
+        return True, "no_b_reference"
+
+    x1, y1, x2, y2 = [int(value) for value in target_bbox]
+    target_area = max(1, (x2 - x1) * (y2 - y1))
+    binary = reference > 0.5
+    inside_pixels = int(np.count_nonzero(binary[y1:y2, x1:x2]))
+    area = int(np.count_nonzero(binary))
+    fill = inside_pixels / target_area
+    inside = inside_pixels / max(1, area)
+    if fill < 0.70 or inside < 0.95:
+        return True, f"difficult_furniture_fill={fill:.3f}_inside={inside:.3f}"
+    return False, f"furniture_local_l_not_needed={fill:.3f}"
+
+
 def run_upscaled_hard_edge_bbox_inference(
     img,
     prompt_bbox,
     target_bbox,
     img_w,
     img_h,
-    layer_name
+    layer_name,
+    model_variant="b",
+    imgsz=LOCAL_UPSCALE_SAM_IMGSZ
 ):
     """Run hard-object SAM on an enlarged local crop for finer mask sampling."""
     px1, py1, px2, py2 = [int(value) for value in prompt_bbox]
@@ -6578,7 +8235,7 @@ def run_upscaled_hard_edge_bbox_inference(
         return None
 
     scale = HARD_EDGE_LOCAL_SCALE
-    max_upscaled_side = 1800
+    max_upscaled_side = LOCAL_UPSCALE_MAX_SOURCE_SIDE
     scale = min(scale, max_upscaled_side / max(crop_w, crop_h))
     scale = max(1.0, scale)
     up_w = max(crop_w, int(round(crop_w * scale)))
@@ -6600,7 +8257,8 @@ def run_upscaled_hard_edge_bbox_inference(
             upscaled,
             local_bbox,
             multimask_output=True,
-            imgsz=HARD_EDGE_SAM_IMGSZ
+            imgsz=imgsz,
+            model_variant=model_variant
         )
         upscaled_masks = normalize_result_masks(
             results,
@@ -6609,6 +8267,7 @@ def run_upscaled_hard_edge_bbox_inference(
             interpolation=cv2.INTER_LINEAR,
             debug_label=f"{layer_name} strategy=local_upscaled"
         )
+        del results
     except Exception as error:
         print(f"Local upscaled SAM failed for {layer_name}: {error}")
         return None
@@ -6857,7 +8516,8 @@ def process_prompted_cutouts(
     mask_provider,
     engine_name,
     refine_masks=False,
-    original_target_bboxes=None
+    original_target_bboxes=None,
+    quality_profile="publish"
 ):
     h, w = img.shape[:2]
     cutouts = []
@@ -6867,6 +8527,14 @@ def process_prompted_cutouts(
             break
 
         layer_meta = layer_metas[i] if isinstance(layer_metas, list) and i < len(layer_metas) else {}
+        layer_policy = resolve_mask_policy(layer_meta, quality_profile)
+        completion_layer = is_completion_segmentation_layer(layer_meta)
+        if completion_layer:
+            print(
+                f"Completion SAM selection enabled for {layer_ids[i]}: "
+                f"completionSegmentation={bool((layer_meta or {}).get('completionSegmentation'))} "
+                f"layerId={layer_meta.get('id') or layer_meta.get('layerId')}"
+            )
         candidate_masks = mask_provider(target_bbox, layer_meta, i)
         if candidate_masks is None or len(candidate_masks) == 0:
             continue
@@ -6876,22 +8544,39 @@ def process_prompted_cutouts(
             w,
             h,
             layer_meta,
-            context_layers
+            context_layers,
+            quality_profile=quality_profile
         )
+        if quality is not None:
+            quality["qualityProfile"] = normalize_sam_quality_profile(quality_profile)
+            quality["policyVersion"] = layer_policy["version"]
+            if layer_policy["completionOccluder"]:
+                quality["completionOccluderAudit"] = layer_meta.get("_completionOccluderAudit") or {
+                    "status": "unverified",
+                    "selectedModel": "b",
+                    "reason": "l_review_not_completed"
+                }
         strategy_name = quality.get("strategy") if quality else "unknown"
         strategy_profile = quality.get("strategyProfile") if quality else "unknown"
         print(
             f"Layer {layer_ids[i]} engine={engine_name} "
             f"semanticStrategy={strategy_name} profile={strategy_profile} "
+            f"base={quality.get('baseStrategyType') if quality else 'unknown'} "
+            f"domain={quality.get('profile') if quality else 'unknown'} "
+            f"phase={quality.get('phase') if quality else 'unknown'} "
+            f"features={','.join(quality.get('features', [])) if quality else ''} "
             f"merged {selected_count} candidate masks"
         )
         if quality and quality.get("debugCandidates"):
             debug_summary = " | ".join([
                 f"#{row['index']} s={row['score']} fill={row['fill']} excl={row['exclude']} "
                 f"inside={row['inside']} area={row['area']} ov={row['bboxOverlap']} touch={row['touch']} "
+                f"recovery={row.get('completionRecoveryPixels', 0)}/"
+                f"{row.get('completionRecoveryRatio')} "
                 f"base={row.get('decorBase', False)} bot={row['shapeFeatures']['bottomBand']} "
                 f"cy={row['shapeFeatures']['centerY']} block={row['shapeFeatures']['isBlockLike']} "
-                f"thin={row['shapeFeatures']['isThinVertical']} sel={row['selected']} why={row['rejectReason']}"
+                f"thin={row['shapeFeatures']['isThinVertical']} "
+                f"sel={row['selected']} why={row['rejectReason']}"
                 for row in quality["debugCandidates"][:8]
             ])
             print(f"Layer {layer_ids[i]} candidates: {debug_summary}")
@@ -6899,23 +8584,65 @@ def process_prompted_cutouts(
             continue
 
         strategy_type = quality.get("strategy") if quality else None
-        effective_bbox, bbox_evidence = derive_safe_entity_bbox(
-            mask,
-            target_bbox,
-            strategy_type=strategy_type
-        )
-        if bbox_evidence:
-            print(
-                f"Entity bbox evidence extension for {layer_ids[i]}: "
-                f"original={target_bbox} effective={effective_bbox} evidence={bbox_evidence}"
+        base_strategy_type = quality.get("baseStrategyType", strategy_type) if quality else strategy_type
+        if not layer_meta.get("completionSegmentation"):
+            effective_bbox, bbox_evidence = derive_safe_entity_bbox(
+                mask,
+                target_bbox,
+                strategy_type=strategy_type
             )
-            target_bbox = effective_bbox
+            if bbox_evidence:
+                print(
+                    f"Entity bbox evidence extension for {layer_ids[i]}: "
+                    f"original={target_bbox} effective={effective_bbox} evidence={bbox_evidence}"
+                )
+                target_bbox = effective_bbox
 
         cleanup_candidates = None
         if quality and quality.get("postProcess"):
             cleanup_candidates = None
 
-        if strategy_type in HARD_EDGE_STRATEGIES:
+        if strategy_type == "completion_object":
+            mask = constrain_mask_to_bbox(mask, target_bbox)
+            full_scene_completion = bool(
+                quality and quality.get("completionOutputMode") == "full_scene_sam"
+            )
+            if full_scene_completion:
+                # A flat hard-edge completion has already passed the complete
+                # silhouette gate. Morphology can bridge printed poster gaps
+                # or erase intentional line-art details, so preserve SAM's
+                # selected contour verbatim.
+                print(
+                    f"Completion full-scene mask preserved for {layer_ids[i]}: "
+                    "topology_repair=skipped micro_gap_repair=skipped"
+                )
+            else:
+                # Incremental/spatial completion may contain narrow raster
+                # cracks. Repair only enclosed, geometry-supported gaps.
+                target_area = max(1, bbox_area(target_bbox))
+                mask_fill = int(np.count_nonzero(mask > 0.5)) / target_area
+                if mask_fill < 0.84:
+                    mask, topology_repair = recover_entity_topology_gaps(
+                        mask,
+                        target_bbox
+                    )
+                    mask = constrain_mask_to_bbox(mask, target_bbox)
+                    print(
+                        f"Completion topology recovery for {layer_ids[i]}: "
+                        f"status={topology_repair['status']} "
+                        f"components={topology_repair['components']} "
+                        f"pixels={topology_repair['pixels']} "
+                        f"fill={mask_fill:.3f}"
+                    )
+                mask, micro_repair = recover_micro_entity_gaps(mask, target_bbox)
+                mask = constrain_mask_to_bbox(mask, target_bbox)
+                if micro_repair["components"]:
+                    print(
+                        f"Completion micro-gap recovery for {layer_ids[i]}: "
+                        f"components={micro_repair['components']} "
+                        f"pixels={micro_repair['pixels']}"
+                    )
+        elif strategy_type in HARD_EDGE_STRATEGIES:
             target_area = max(1, bbox_area(target_bbox))
             mask_fill = int(np.count_nonzero(mask > 0.5)) / target_area
             if mask_fill < 0.84:
@@ -6931,12 +8658,32 @@ def process_prompted_cutouts(
                     f"pixels={topology_repair['pixels']} "
                     f"fill={mask_fill:.3f}"
                 )
-        if strategy_type in {"table", "furniture"}:
+        # Furniture/table recovery is tuned for the original scene. A second
+        # completion pass must preserve the canonical completion mask instead
+        # of applying those object-specific repairs a second time.
+        if not completion_layer and base_strategy_type in {"table", "furniture"}:
             # Tables and textured furniture use the accepted SAM silhouette as
             # the source of truth. Do not run another completion pass before
-            # matting: it can reinterpret floor, seams, or upholstery texture.
+            # matting: it can reinterpret floor, seams, or surface texture.
             mask = constrain_mask_to_bbox(mask, target_bbox)
             if strategy_type == "furniture":
+                if str(layer_meta.get("_samModelVariant", "b")).lower() == "l":
+                    refined_mask, internal_refined, internal_debug = refine_furniture_mask_with_internal_points(
+                        img,
+                        mask,
+                        target_bbox,
+                        layer_ids[i],
+                        model_variant="l"
+                    )
+                    print(
+                        f"Furniture internal SAM refine for {layer_ids[i]}: "
+                        f"status={internal_debug.get('status')} "
+                        f"candidates={internal_debug.get('candidates', 0)} "
+                        f"growth={internal_debug.get('candidatePixels', 0)} "
+                        f"accepted={bool(internal_refined)}"
+                    )
+                    if internal_refined and np.any(refined_mask > 0.5):
+                        mask = constrain_mask_to_bbox(refined_mask, target_bbox)
                 mask, furniture_cleanup = cleanup_furniture_mask(mask, target_bbox)
                 mask = constrain_mask_to_bbox(mask, target_bbox)
                 print(
@@ -6987,7 +8734,9 @@ def process_prompted_cutouts(
                 img,
                 mask,
                 target_bbox,
-                layer_ids[i]
+                layer_ids[i],
+                strategy_type=strategy_type,
+                model_variant=str(layer_meta.get("_samModelVariant", "b")).lower()
             )
             if completion_changed:
                 mask = constrain_mask_to_bbox(mask, target_bbox)
@@ -7096,14 +8845,11 @@ def process_prompted_cutouts(
 
         local_refined = False
         initial_mask_area = int(np.count_nonzero(mask > 0.5))
-        allow_local_refine = not (
-            quality and quality.get("strategy") in {
-                "food_product",
-                "soft_edge",
-                "table",
-                *HARD_EDGE_STRATEGIES
-            }
+        full_scene_completion = bool(
+            completion_layer and quality and
+            quality.get("completionOutputMode") == "full_scene_sam"
         )
+        allow_local_refine = layer_policy["allowLocalRefine"] and not full_scene_completion
         if refine_masks and engine_name.startswith("sam") and allow_local_refine:
             refine_cleanup_mask = None
             if quality and quality.get("strategy") == "food_product":
@@ -7137,24 +8883,36 @@ def process_prompted_cutouts(
                     f"accepted={bool(local_refined)} area={initial_mask_area}->{refined_area}"
                 )
 
-        alpha_mask = generate_alpha_matte(
-            img,
-            mask,
-            target_bbox,
-            cleanup_mask=matte_cleanup_mask,
-            strategy_type=quality.get("strategy") if quality else None,
-            label_cleanup_mask=label_cleanup_mask,
-            flat_cleanup_mask=flat_cleanup_mask
-        )
-        if quality and quality.get("strategy") == "soft_edge":
+        # Completion and initial extraction share the same matte policy. The
+        # phase changes candidate selection, not the alpha treatment of a
+        # proven table, furniture, or soft-edge silhouette.
+        matte_strategy_type = layer_policy["matteType"]
+        if full_scene_completion:
+            # GrabCut is a color-model classifier. On a poster completion it
+            # mistakes headline fills and strong ink outlines for foreground
+            # while cutting holes in skin/shirt gradients. The accepted SAM-L
+            # mask is the authoritative alpha in this narrowly gated route.
+            alpha_mask = build_hard_edge_alpha(mask, target_bbox)
+            alpha_mask = np.where(mask > 0.5, alpha_mask, 0).astype(np.uint8)
+        else:
+            alpha_mask = generate_alpha_matte(
+                img,
+                mask,
+                target_bbox,
+                cleanup_mask=matte_cleanup_mask,
+                strategy_type=matte_strategy_type,
+                label_cleanup_mask=label_cleanup_mask,
+                flat_cleanup_mask=flat_cleanup_mask
+            )
+        if matte_strategy_type == "soft_edge":
             alpha_mask = build_soft_edge_alpha(img, mask, target_bbox)
-        if quality and quality.get("strategy") == "furniture":
+        if matte_strategy_type == "furniture":
             alpha_mask = build_hard_edge_alpha(mask, target_bbox)
             # Keep antialiasing inside the accepted furniture silhouette only.
             # Rasterizing a contour can otherwise place a fractional pixel on
             # the far side of a small hole or a tight concavity.
             alpha_mask = np.where(mask > 0.5, alpha_mask, 0).astype(np.uint8)
-        if quality and quality.get("strategy") == "food_product":
+        if matte_strategy_type == "food_product":
             # GrabCut may classify a bright background patch immediately outside
             # the accepted SAM contour as probable foreground. Keep only a tiny
             # antialias guard around the semantic mask; never let matte restore
@@ -7169,7 +8927,16 @@ def process_prompted_cutouts(
             constrain_mask_to_bbox(alpha_mask.astype(np.float32), target_bbox),
             dtype=np.uint8
         )
-        if quality and quality.get("strategy") in {"table", "furniture"}:
+        if matte_strategy_type == "table":
+            final_mask_bbox = mask_bbox(mask > 0.5)
+            alpha_bbox = mask_bbox(alpha_mask > 0)
+            print(
+                f"Table cutout geometry for {layer_ids[i]}: "
+                f"output_bbox={target_bbox} mask_bbox={final_mask_bbox} "
+                f"alpha_bbox={alpha_bbox} output_size="
+                f"({target_bbox[2] - target_bbox[0]},{target_bbox[3] - target_bbox[1]})"
+            )
+        if matte_strategy_type in {"table", "furniture"}:
             opaque_pixels = int(np.count_nonzero(alpha_mask >= 245))
             edge_pixels = int(np.count_nonzero((alpha_mask > 0) & (alpha_mask < 245)))
             print(
@@ -7177,7 +8944,7 @@ def process_prompted_cutouts(
                 f"preservedMaskPixels={int(np.count_nonzero(mask > 0.5))} "
                 f"opaque={opaque_pixels} antialiasedEdge={edge_pixels}"
             )
-        elif quality and quality.get("strategy") in HARD_EDGE_STRATEGIES:
+        elif matte_strategy_type in HARD_EDGE_STRATEGIES:
             opaque_pixels = int(np.count_nonzero(alpha_mask >= 245))
             edge_pixels = int(np.count_nonzero((alpha_mask > 0) & (alpha_mask < 245)))
             print(
@@ -7185,14 +8952,18 @@ def process_prompted_cutouts(
                 f"opaque={opaque_pixels} antialiasedEdge={edge_pixels}"
             )
         output_img = img
-        if quality and quality.get("strategy") == "soft_edge":
+        if matte_strategy_type == "soft_edge":
             output_img = despill_soft_edge_image(
                 img,
                 alpha_mask,
                 target_bbox,
                 context_bbox=expand_bbox(*target_bbox, w, h)
             )
-        elif quality and quality.get("strategy") in HARD_EDGE_STRATEGIES and quality.get("strategy") not in {"table", "furniture"}:
+        elif (
+            matte_strategy_type in HARD_EDGE_STRATEGIES and
+            matte_strategy_type not in {"table", "furniture"} and
+            not full_scene_completion
+        ):
             output_img = despill_hard_edge_image(img, alpha_mask, target_bbox)
         if quality is None:
             quality = {}
@@ -7201,7 +8972,7 @@ def process_prompted_cutouts(
             "localRefine": bool(local_refined),
             "matting": (
                 "sam_safe_matte"
-                if strategy_type in {"table", "furniture"}
+                if full_scene_completion or matte_strategy_type in {"table", "furniture"}
                 else "opencv_grabcut"
             )
         }
@@ -7218,6 +8989,8 @@ def process_prompted_cutouts(
             alpha_mask=alpha_mask
         )
         if cutout is not None:
+            if quality is not None:
+                quality["finalMaskAudit"] = mask_integrity_audit(mask, target_bbox)
             cutouts.append(cutout)
 
     return cutouts
@@ -7226,18 +8999,28 @@ def process_prompted_cutouts(
 async def segment(request: Request):
     try:
         data = await request.json()
+        request_id = str(
+            data.get("taskId") or data.get("requestId") or
+            f"segment-{int(time.time() * 1000)}"
+        )
         requested_engine = normalize_requested_engine(data.get("engine"))
         image_b64 = data.get("image")
         bboxes_norm = data.get("bboxes", [])
         layer_ids = data.get("layerIds", [])
         layer_metas = data.get("layers", [])
         context_layers = data.get("contextLayers", layer_metas)
+        quality_profile = normalize_sam_quality_profile(data.get("qualityProfile"))
+        print(
+            f"SAM request start id={request_id} profile={quality_profile} "
+            f"engine={requested_engine} requestedLayers={len(layer_ids)} "
+            f"contextLayers={len(context_layers) if isinstance(context_layers, list) else 0}"
+        )
         
         if not image_b64:
             return JSONResponse(status_code=400, content={"error": "No image provided"})
 
         img = base64_to_cv2(image_b64)
-        print("Image received, size:", img.shape)
+        print(f"SAM request image id={request_id} sourceSize={img.shape[1]}x{img.shape[0]}")
         h, w = img.shape[:2]
         
         # Determine if we should use bounding box prompts
@@ -7265,12 +9048,18 @@ async def segment(request: Request):
                 layer_meta = layer_metas[len(pixel_bboxes)] if (
                     isinstance(layer_metas, list) and len(pixel_bboxes) < len(layer_metas)
                 ) else {}
-                is_food_product = get_layer_strategy(layer_meta or {}).get("type") == "food_product"
+                resolved_layer_strategy = get_layer_strategy(layer_meta or {})
+                layer_policy = resolve_mask_policy(layer_meta or {}, quality_profile)
+                is_food_product = layer_policy["selector"] == "compound_food"
                 # Restore the previous cloud-parity food path: food products
                 # use the expanded bbox for candidate/output parity.
                 pixel_bboxes.append(prompt_bbox if is_food_product else output_bbox)
                 if is_food_product:
                     legacy_food_output_count += 1
+                # The expanded prompt gives SAM enough context to recover the
+                # complete hard object. The output remains constrained by the
+                # original bbox, so this must not be confused with output
+                # expansion.
                 sam_prompt_bboxes.append(prompt_bbox)
 
             print(
@@ -7284,10 +9073,41 @@ async def segment(request: Request):
                 )
             if requested_engine == "sam":
                 def sam_mask_provider(target_bbox, layer_meta, index):
-                    strategy_type = get_layer_strategy(layer_meta or {}).get("type")
+                    layer_policy = resolve_mask_policy(layer_meta or {}, quality_profile)
+                    resolved_layer_strategy = get_layer_strategy(layer_meta or {})
+                    strategy_type = layer_policy["selectionType"]
                     prompt_bbox = sam_prompt_bboxes[index]
                     layer_name = layer_meta.get("name") or layer_ids[index] or index
-                    if strategy_type == "food_product":
+                    completion_layer = is_completion_segmentation_layer(layer_meta)
+                    completion_observation = (
+                        decode_completion_observation_mask(layer_meta.get("completionObservationMask"), w, h)
+                        if completion_layer else None
+                    )
+                    completion_occlusion_mask = (
+                        decode_completion_occlusion_mask(layer_meta.get("completionOcclusionMask"), w, h)
+                        if completion_layer else None
+                    )
+                    completion_flat_hard_edge = bool(
+                        completion_layer and
+                        layer_policy["profile"] == "flat_design" and
+                        "hard_edge" in layer_policy["features"] and
+                        not layer_policy["softEdge"]
+                    )
+                    # The post-processing stage may issue one local recovery
+                    # query. Record which model owns the accepted mask so that
+                    # recovery does not accidentally reload the other variant.
+                    layer_meta["_samModelVariant"] = "b"
+                    print(
+                        f"SAM layer policy id={request_id} layer={layer_name} "
+                        f"profile={layer_policy['profile']} phase={layer_policy['phase']} "
+                        f"selector={layer_policy['selector']} matte={layer_policy['matteType']} "
+                        f"features={','.join(layer_policy['features'])} "
+                        f"imgsz={layer_policy['samImgSize']}"
+                    )
+                    if (
+                        layer_policy["selector"] == "compound_food" and
+                        not layer_policy["completionOccluder"]
+                    ):
                         print(
                             f"SAM prompts for {layer_meta.get('name') or layer_ids[index] or index}: "
                             f"bbox-only strategy=food_product"
@@ -7319,19 +9139,18 @@ async def segment(request: Request):
                         prompt_bbox,
                         multimask_output=True,
                         imgsz=(
-                            SOFT_EDGE_SAM_IMGSZ
-                            if strategy_type == "soft_edge"
-                            else HARD_EDGE_SAM_IMGSZ
-                            if strategy_type in HARD_EDGE_STRATEGIES
-                            else 1024
+                            layer_policy["samImgSize"]
                         ),
                         points=soft_edge_prompts["points"] if soft_edge_prompts else None,
                         labels=soft_edge_prompts["labels"] if soft_edge_prompts else None,
                         model_variant="b"
                     )
+                    # Preserve the established raster mode for tables/chairs;
+                    # profile classification must not silently change their
+                    # mask edge behavior.
                     use_subpixel_masks = (
-                        strategy_type == "soft_edge" or
-                        strategy_type in HARD_EDGE_STRATEGIES
+                        layer_policy["softEdge"] or
+                        layer_policy["baseStrategyType"] in HARD_EDGE_STRATEGIES
                     )
                     candidate_masks = normalize_result_masks(
                         results,
@@ -7349,11 +9168,53 @@ async def segment(request: Request):
                     del results
                     if soft_edge_prompts:
                         candidate_masks = filter_soft_edge_masks_by_points(candidate_masks, soft_edge_prompts)
-                    if strategy_type not in {"food_product", "soft_edge"}:
-                        escalate, escalation_reason = should_escalate_sam_to_l(
+                    if layer_policy["allowLocalUpscale"]:
+                        local_upscale, local_reason = should_run_local_upscale(
                             candidate_masks,
                             target_bbox,
                             strategy_type
+                        )
+                        if local_upscale:
+                            print(
+                                f"SAM local-upscale route for {layer_name}: "
+                                f"model=B reason={local_reason}"
+                            )
+                            local_masks = run_upscaled_hard_edge_bbox_inference(
+                                img,
+                                prompt_bbox,
+                                target_bbox,
+                                w,
+                                h,
+                                layer_name,
+                                model_variant="b",
+                                imgsz=LOCAL_UPSCALE_SAM_IMGSZ
+                            )
+                            if local_masks is not None and len(local_masks) > 0:
+                                # normalize_result_masks returns an ndarray,
+                                # while candidate augmentation is list-based.
+                                candidate_masks = [
+                                    np.asarray(mask, dtype=np.float32)
+                                    for mask in candidate_masks
+                                ]
+                                before_count = len(candidate_masks)
+                                append_unique_masks(
+                                    candidate_masks,
+                                    local_masks,
+                                    min_pixels=64,
+                                    dedupe_iou=0.96
+                                )
+                                print(
+                                    f"SAM local-upscale candidates for {layer_name}: "
+                                    f"before={before_count} after={len(candidate_masks)}"
+                                )
+                    if layer_policy["allowModelEscalation"]:
+                        escalate, escalation_reason = should_escalate_sam_to_l(
+                            candidate_masks,
+                            target_bbox,
+                            strategy_type,
+                            quality_profile=quality_profile,
+                            completion_observation=completion_observation,
+                            policy=layer_policy
                         )
                         layer_label = layer_meta.get("name") or layer_ids[index] or index
                         if escalate:
@@ -7362,35 +9223,133 @@ async def segment(request: Request):
                                 f"reason={escalation_reason}"
                             )
                             try:
-                                l_results = run_sam_bbox_inference(
+                                l_results, l_imgsz = run_sam_l_with_retry(
                                     img,
                                     prompt_bbox,
-                                    multimask_output=True,
-                                    imgsz=(
-                                        SOFT_EDGE_SAM_IMGSZ
-                                        if strategy_type == "soft_edge"
-                                        else HARD_EDGE_SAM_IMGSZ
-                                    ),
-                                    model_variant="l"
+                                    strategy_type,
+                                    layer_label,
+                                    policy=layer_policy
                                 )
                                 l_masks = normalize_result_masks(
                                     l_results,
                                     w,
                                     h,
                                     interpolation=cv2.INTER_LINEAR if use_subpixel_masks else cv2.INTER_NEAREST,
-                                    debug_label=f"{layer_label} strategy={strategy_type} model=L"
+                                    debug_label=(
+                                        f"{layer_label} strategy={strategy_type} "
+                                        f"model=L imgsz={l_imgsz}"
+                                    )
                                 )
                                 del l_results
+                                local_l_upscale, local_l_reason = should_run_l_local_upscale(
+                                    candidate_masks,
+                                    target_bbox,
+                                    strategy_type
+                                )
+                                if local_l_upscale:
+                                    print(
+                                        f"SAM local-upscale route for {layer_label}: "
+                                        f"model=L reason={local_l_reason}"
+                                    )
+                                    local_l_masks = run_upscaled_hard_edge_bbox_inference(
+                                        img,
+                                        prompt_bbox,
+                                        target_bbox,
+                                        w,
+                                        h,
+                                        layer_label,
+                                        model_variant="l",
+                                        imgsz=LOCAL_UPSCALE_SAM_IMGSZ
+                                    )
+                                    if local_l_masks is not None and len(local_l_masks) > 0:
+                                        l_masks = [
+                                            np.asarray(mask, dtype=np.float32)
+                                            for mask in l_masks
+                                        ]
+                                        before_count = len(l_masks)
+                                        append_unique_masks(
+                                            l_masks,
+                                            local_l_masks,
+                                            min_pixels=64,
+                                            dedupe_iou=0.96
+                                        )
+                                        print(
+                                            f"SAM local-upscale L candidates for {layer_label}: "
+                                            f"before={before_count} after={len(l_masks)}"
+                                        )
+                                b_candidate_masks_for_arbitration = candidate_masks
                                 candidate_masks, arbitration = arbitrate_sam_b_l_masks(
                                     candidate_masks,
                                     l_masks,
                                     target_bbox,
-                                    strategy_type=strategy_type
+                                    strategy_type=strategy_type,
+                                    b_failure_reason=escalation_reason,
+                                    completion_recovery=completion_layer,
+                                    completion_observation=completion_observation,
+                                    completion_occlusion_mask=completion_occlusion_mask,
+                                    completion_base_strategy_type=layer_policy["baseStrategyType"],
+                                    completion_spatial=layer_policy["spatial"],
+                                    completion_flat_hard_edge=completion_flat_hard_edge
                                 )
+                                if layer_policy["completionOccluder"]:
+                                    l_selected = (
+                                        arbitration.startswith("l_") or
+                                        arbitration.startswith("hybrid_added=")
+                                    )
+                                    layer_meta["_completionOccluderAudit"] = {
+                                        "status": "verified" if l_selected else "unverified",
+                                        "selectedModel": "l" if l_selected else "b",
+                                        "reason": arbitration
+                                    }
+                                if arbitration == "completion_observation_fallback":
+                                    layer_meta["_completionObservationFallback"] = True
+                                elif arbitration.startswith("completion_full_scene_sam="):
+                                    layer_meta["_completionFullSceneMask"] = True
                                 print(
                                     f"SAM arbitration for {layer_label}: "
                                     f"{arbitration} candidates={len(candidate_masks)}"
                                 )
+                                if arbitration.startswith("l_"):
+                                    if strategy_type == "furniture" and len(candidate_masks) > 0:
+                                        peer_merge_count = 0
+                                        for arbitration_token in arbitration.split():
+                                            if arbitration_token.startswith("peers="):
+                                                try:
+                                                    peer_merge_count = int(arbitration_token.split("=", 1)[1])
+                                                except (TypeError, ValueError):
+                                                    peer_merge_count = 0
+                                                break
+                                        if (
+                                            peer_merge_count == 0 and
+                                            b_candidate_masks_for_arbitration is not None and
+                                            len(b_candidate_masks_for_arbitration) > 0
+                                        ):
+                                            cross_mask, cross_changed, cross_debug = refine_furniture_mask_with_cross_model_evidence(
+                                                img,
+                                                b_candidate_masks_for_arbitration,
+                                                candidate_masks[0],
+                                                target_bbox,
+                                                layer_label
+                                            )
+                                            print(
+                                                f"Furniture cross-model refine for {layer_label}: "
+                                                f"status={cross_debug.get('status')} "
+                                                f"components={cross_debug.get('components', 0)} "
+                                                f"pixels={cross_debug.get('pixels', 0)} "
+                                                f"bEvidence={cross_debug.get('bEvidencePixels', 0)} "
+                                                f"disagreement={cross_debug.get('disagreementPixels', 0)} "
+                                                f"points={cross_debug.get('positivePoints', 0)}/"
+                                                f"{cross_debug.get('negativePoints', 0)} "
+                                                f"accepted={bool(cross_changed)}"
+                                            )
+                                            if cross_changed and np.any(cross_mask > 0.5):
+                                                candidate_masks = np.stack([cross_mask], axis=0)
+                                    layer_meta["_samModelVariant"] = "l"
+                                elif arbitration == "b_kept_l_rejected":
+                                    layer_meta["_samModelVariant"] = "b"
+                                    release_sam_model("l", reason="b_arbitration_kept")
+                                else:
+                                    layer_meta["_samModelVariant"] = "l"
                             except Exception as error:
                                 print(f"SAM-L escalation failed for {layer_label}: {error}")
                                 # An OOM can leave the L predictor and its
@@ -7398,7 +9357,14 @@ async def segment(request: Request):
                                 # the request can still finish with B and the
                                 # next invocation starts from a clean state.
                                 release_sam_model("l", reason="escalation_failed")
+                                layer_meta["_samModelVariant"] = "b"
                         else:
+                            if layer_policy["completionOccluder"]:
+                                layer_meta["_completionOccluderAudit"] = {
+                                    "status": "unverified",
+                                    "selectedModel": "b",
+                                    "reason": escalation_reason
+                                }
                             print(
                                 f"SAM route for {layer_label}: model=B "
                                 f"reason={escalation_reason}"
@@ -7414,8 +9380,26 @@ async def segment(request: Request):
                     sam_mask_provider,
                     "sam_bbox_prompt",
                     refine_masks=True,
-                    original_target_bboxes=original_target_bboxes
+                    original_target_bboxes=original_target_bboxes,
+                    quality_profile=quality_profile
                 )
+                completion_request = any(
+                    is_completion_segmentation_layer(meta)
+                    for meta in layer_metas
+                ) if isinstance(layer_metas, list) else False
+                if completion_request and len(layer_ids) == 1 and not cutouts:
+                    # A successful HTTP response with no cutout is not a
+                    # successful completion. Surface this as an error so the
+                    # client records the actual segmentation failure.
+                    return JSONResponse(
+                        status_code=422,
+                        content={
+                            "success": False,
+                            "error": "补全模式未通过候选筛选，未返回 cutout",
+                            "layerId": layer_ids[0] if layer_ids else None,
+                            "qualityProfile": quality_profile
+                        }
+                    )
                 return JSONResponse(content={"success": True, "engine": "sam", "cutouts": cutouts})
 
             # Default FastSAM path: global candidate masks + existing merge logic.
@@ -7435,7 +9419,8 @@ async def segment(request: Request):
                 fastsam_mask_provider,
                 "fastsam_multi_mask",
                 refine_masks=False,
-                original_target_bboxes=original_target_bboxes
+                original_target_bboxes=original_target_bboxes,
+                quality_profile=quality_profile
             )
             return JSONResponse(content={"success": True, "engine": "fastsam", "cutouts": cutouts})
         else:
@@ -7490,7 +9475,282 @@ async def segment(request: Request):
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
 
+def run_deterministic_self_tests():
+    """Run model-free regression checks for policy, gates, and mask audits."""
+    checks = []
+
+    def check(name, condition):
+        if not condition:
+            raise AssertionError(name)
+        checks.append(name)
+
+    table_meta = {
+        "name": "大理石玄关桌",
+        "semanticType": "other",
+        "designRole": "scene_object",
+        "extractionProfile": "multi_part_hard_object"
+    }
+    table = get_layer_strategy(table_meta)
+    check("table_spatial_profile", table["profile"] == "spatial_design")
+    check("table_hard_edge_feature", "hard_edge" in table["features"])
+    check("table_support_feature", "supports" in table["features"])
+    check("table_initial_phase", table["phase"] == "initial")
+    table_policy = resolve_mask_policy(table_meta, "publish")
+    check("table_policy_is_spatial", table_policy["profile"] == "spatial_design")
+    check("table_policy_keeps_matte", table_policy["matteType"] == "table")
+    check("table_policy_preserves_table_size", table_policy["samImgSize"] == 1024)
+
+    transparent_table_meta = {
+        **table_meta,
+        "name": "透明玻璃玄关桌"
+    }
+    transparent_table = get_layer_strategy(transparent_table_meta)
+    transparent_table_policy = resolve_mask_policy(transparent_table_meta, "publish")
+    check("transparent_table_stays_hard_edge", "soft_edge" not in transparent_table["features"])
+    check("transparent_table_keeps_safe_matte", transparent_table_policy["matteType"] == "table")
+
+    curtain_meta = {"name": "半透明窗纱", "semanticType": "other"}
+    curtain = get_layer_strategy(curtain_meta)
+    check("soft_edge_spatial_profile", curtain["profile"] == "spatial_design")
+    check("soft_edge_feature", "soft_edge" in curtain["features"])
+    check("soft_edge_not_hard", "hard_edge" not in curtain["features"])
+    curtain_policy = resolve_mask_policy(curtain_meta, "publish")
+    check("soft_edge_policy_uses_soft_matte", curtain_policy["matteType"] == "soft_edge")
+    check("soft_edge_policy_keeps_high_res", curtain_policy["samImgSize"] == SOFT_EDGE_SAM_IMGSZ)
+
+    food_meta = {
+        "name": "一盘复合食物",
+        "semanticType": "product_food",
+        "designRole": "product_image"
+    }
+    food = get_layer_strategy(food_meta)
+    check("food_flat_profile", food["profile"] == "flat_design")
+    check("food_compound_feature", "compound" in food["features"])
+    food_policy = resolve_mask_policy(food_meta, "publish")
+    check("food_policy_uses_compound_selector", food_policy["selector"] == "compound_food")
+    check("food_policy_is_not_completion", not food_policy["completion"])
+    check("food_policy_keeps_b_first", not food_policy["allowModelEscalation"])
+
+    verified_occluder_policy = resolve_mask_policy({
+        **food_meta,
+        "completionOccluder": True
+    }, "completion")
+    check("completion_occluder_policy_is_initial", not verified_occluder_policy["completion"])
+    check("completion_occluder_policy_allows_l_review", verified_occluder_policy["allowModelEscalation"])
+    check("completion_occluder_policy_marks_execution_role", verified_occluder_policy["completionOccluder"])
+
+    soft_occluder_policy = resolve_mask_policy({
+        "name": "半透明窗纱",
+        "semanticType": "other",
+        "completionOccluder": True
+    }, "completion")
+    check("soft_occluder_keeps_existing_route", not soft_occluder_policy["completionOccluder"])
+
+    poster_policy = resolve_mask_policy({
+        "name": "主视觉波普人物",
+        "semanticType": "other",
+        "designRole": "product_image"
+    }, "publish")
+    check("poster_policy_is_flat", poster_policy["profile"] == "flat_design")
+    check("poster_policy_allows_quality_escalation", poster_policy["allowModelEscalation"])
+
+    mislabeled_person_policy = resolve_mask_policy({
+        "name": "酸表情人物插画",
+        "semanticType": "product_food",
+        "designRole": "product_image",
+        "extractionProfile": "layout_embedded_product"
+    }, "completion")
+    check("person_overrides_coarse_food_label", mislabeled_person_policy["baseStrategyType"] == "hard_product")
+    check("person_avoids_compound_food_selector", mislabeled_person_policy["selector"] != "compound_food")
+
+    completion_meta = {
+        "id": "completion-scene-sam-person-1",
+        "name": "插画人物",
+        "semanticType": "product_food",
+        "designRole": "product_image",
+        "completionSegmentation": True
+    }
+    completion = get_layer_strategy(completion_meta)
+    check("completion_phase", completion["phase"] == "completion")
+    check("completion_generic_selector", completion["selectionType"] == "completion_object")
+    check("completion_person_uses_hard_entity_mode", completion["baseStrategyType"] == "hard_product")
+    check("completion_uses_canonical_threshold", completion["max_fill"] == 0.90)
+    check("completion_uses_canonical_attachments", completion["max_masks"] == 8)
+    completion_policy = resolve_mask_policy(completion_meta, "completion")
+    check("completion_policy_is_generic", completion_policy["selector"] == "generic_completion")
+    check("completion_policy_has_occlusion", "occluded" in completion_policy["features"])
+    check("completion_policy_allows_model_escalation", completion_policy["allowModelEscalation"])
+    check("completion_policy_allows_local_refine", completion_policy["allowLocalRefine"])
+    check("completion_policy_uses_canonical_matte", completion_policy["matteType"] == "completion_object")
+    check("completion_policy_uses_stable_imgsz", completion_policy["samImgSize"] == 1024)
+
+    furniture_completion_meta = {
+        "id": "completion-scene-sam-table-1",
+        "name": "被遮挡的玄关桌",
+        "semanticType": "other",
+        "designRole": "scene_object",
+        "extractionProfile": "multi_part_hard_object",
+        "completionSegmentation": True
+    }
+    furniture_completion = get_layer_strategy(furniture_completion_meta)
+    furniture_completion_policy = resolve_mask_policy(furniture_completion_meta, "completion")
+    check("furniture_completion_keeps_canonical_threshold", furniture_completion["max_fill"] == 0.90)
+    check("furniture_completion_keeps_safe_matte", furniture_completion_policy["matteType"] == "table")
+    check("furniture_completion_allows_local_refine", furniture_completion_policy["allowLocalRefine"])
+
+    consistent, reason = completion_observation_is_consistent(
+        100,
+        0.985,
+        0.67,
+        0.96,
+        base_strategy_type="table",
+        spatial=True
+    )
+    check("spatial_completion_accepts_consistent_observation", consistent and reason == "spatial_observation_anchor")
+    consistent, reason = completion_observation_is_consistent(
+        100,
+        0.966,
+        0.194,
+        0.96,
+        base_strategy_type="table",
+        spatial=True
+    )
+    check("spatial_completion_rejects_background_expansion", not consistent and reason == "spatial_completion_observation_iou")
+
+    image_size = 100
+    target_bbox = [20, 20, 80, 80]
+    observed = np.zeros((image_size, image_size, 4), dtype=np.uint8)
+    observed[25:75, 25:75, 3] = 255
+    ok, encoded = cv2.imencode(".png", observed)
+    check("observation_mask_encoded", bool(ok))
+    completion_meta["completionObservationMask"] = (
+        "data:image/png;base64," + base64.b64encode(encoded.tobytes()).decode("ascii")
+    )
+    candidate = np.zeros((image_size, image_size), dtype=np.float32)
+    candidate[24:76, 24:76] = 1.0
+    selected_mask, selected_count, quality = select_and_merge_masks(
+        [candidate],
+        target_bbox,
+        image_size,
+        image_size,
+        completion_meta,
+        [],
+        quality_profile="completion"
+    )
+    check("completion_candidate_selected", selected_mask is not None and selected_count == 1)
+    check("completion_quality_phase", quality and quality["phase"] == "completion")
+    check("completion_quality_generic_strategy", quality and quality["strategy"] == "completion_object")
+    check("completion_quality_base_mode", quality and quality["baseStrategyType"] == "hard_product")
+    check("completion_quality_policy_version", quality and quality["policyVersion"] == MASK_POLICY_VERSION)
+    check("completion_quality_mask_audit", quality and quality["maskAudit"]["status"] == "ok")
+
+    direct_completion_meta = {
+        **completion_meta,
+        "_completionFullSceneMask": True
+    }
+    _, _, direct_quality = select_and_merge_masks(
+        [candidate],
+        target_bbox,
+        image_size,
+        image_size,
+        direct_completion_meta,
+        [],
+        quality_profile="completion"
+    )
+    check(
+        "flat_completion_exposes_full_scene_output_mode",
+        direct_quality and direct_quality["completionOutputMode"] == "full_scene_sam"
+    )
+
+    occlusion_mask = np.zeros((image_size, image_size, 4), dtype=np.uint8)
+    occlusion_mask[70:75, 45:75, 3] = 255
+    ok, encoded = cv2.imencode(".png", occlusion_mask)
+    check("completion_occlusion_mask_encoded", bool(ok))
+    occluded_completion_meta = {
+        **completion_meta,
+        "completionOcclusionMask": (
+            "data:image/png;base64," + base64.b64encode(encoded.tobytes()).decode("ascii")
+        )
+    }
+    visible_only_candidate = np.zeros((image_size, image_size), dtype=np.float32)
+    visible_only_candidate[25:70, 25:75] = 1.0
+    selected_mask, selected_count, _ = select_and_merge_masks(
+        [visible_only_candidate],
+        target_bbox,
+        image_size,
+        image_size,
+        occluded_completion_meta,
+        [],
+        quality_profile="completion"
+    )
+    check("completion_rejects_visible_only_candidate", selected_mask is None and selected_count == 0)
+
+    spatial_completion_meta = {
+        **furniture_completion_meta,
+        "completionObservationMask": completion_meta["completionObservationMask"]
+    }
+    spatial_candidate = np.zeros((image_size, image_size), dtype=np.float32)
+    spatial_candidate[24:76, 24:76] = 1.0
+    selected_mask, selected_count, spatial_quality = select_and_merge_masks(
+        [spatial_candidate],
+        target_bbox,
+        image_size,
+        image_size,
+        spatial_completion_meta,
+        [],
+        quality_profile="completion"
+    )
+    check("spatial_completion_accepts_consistent_candidate", selected_mask is not None and selected_count == 1)
+    check(
+        "spatial_completion_does_not_expose_full_scene_output_mode",
+        spatial_quality and spatial_quality["completionOutputMode"] != "full_scene_sam"
+    )
+
+    leaked_candidate = np.zeros((image_size, image_size), dtype=np.float32)
+    leaked_candidate[24:76, 24:76] = 1.0
+    leaked_observation = np.zeros((image_size, image_size, 4), dtype=np.uint8)
+    leaked_observation[44:56, 44:56, 3] = 255
+    ok, encoded = cv2.imencode(".png", leaked_observation)
+    check("leaked_observation_mask_encoded", bool(ok))
+    leaked_completion_meta = {
+        **furniture_completion_meta,
+        "completionObservationMask": "data:image/png;base64," + base64.b64encode(encoded.tobytes()).decode("ascii")
+    }
+    selected_mask, selected_count, _ = select_and_merge_masks(
+        [leaked_candidate],
+        target_bbox,
+        image_size,
+        image_size,
+        leaked_completion_meta,
+        [],
+        quality_profile="completion"
+    )
+    check("spatial_completion_rejects_leaked_candidate", selected_mask is None and selected_count == 0)
+
+    cracked = candidate.copy()
+    cracked[48:52, 48:52] = 0
+    crack_audit = mask_integrity_audit(cracked, target_bbox)
+    check("mask_audit_detects_enclosed_hole", crack_audit["enclosedHolePixels"] > 0)
+    rejected = build_quality_gate(
+        0.0,
+        -1.0,
+        0.0,
+        [],
+        "completion_object",
+        policy=completion_policy
+    )
+    check("quality_gate_rejects_empty_candidate", not rejected["shouldGenerateRuntimeLayer"])
+    check("quality_gate_reports_empty_mask", "no_selected_mask" in rejected["issues"])
+
+    print(f"SAM deterministic self-tests passed: {len(checks)} checks")
+    return True
+
+
 if __name__ == "__main__":
-    import uvicorn
-    print("Starting FastSAM Backend on http://0.0.0.0:8000")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import sys
+    if "--self-test" in sys.argv or os.getenv("SAM_SELF_TEST") == "1":
+        run_deterministic_self_tests()
+    else:
+        import uvicorn
+        print("Starting FastSAM Backend on http://0.0.0.0:8000")
+        uvicorn.run(app, host="0.0.0.0", port=8000)
