@@ -25,7 +25,10 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --upgrade pip && \
     pip install -r /app/requirements.txt
 
-COPY main.py /app/main.py
+# Keep model weights out of the image. The runtime downloads them into
+# MODEL_CACHE_DIR when first needed; only the deployable backend modules are
+# copied into the image.
+COPY main.py api.py candidate_selection.py diagnostics.py mask_ops.py matte_ops.py sam_runtime.py segmentation_core.py segmentation_policy.py segmentation_primitives.py /app/
 
 ENV PORT=8000
 
