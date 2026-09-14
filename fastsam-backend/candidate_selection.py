@@ -2585,16 +2585,6 @@ def select_and_merge_masks(
                 policy["spatialCanonicalCompletion"] and
                 completion_foreground_mask_ratio >= 0.025
             )
-            # A coarse foreground-context bbox cannot prove pixel ownership,
-            # but a candidate fully covered by it and lacking a strong
-            # observed anchor is still unsafe to publish. Keep the anchored
-            # recovery candidate available for the reconciliation/hold path.
-            and not (
-                policy["spatialCanonicalCompletion"] and
-                completion_foreground_context_mask is None and
-                strong_exclude_mask_ratio >= 0.22 and
-                not spatial_completion_anchor_candidate
-            )
         )
         score = score_candidate(metrics, strategy)
         # When the prompt contains a verified occluder, prefer an otherwise
