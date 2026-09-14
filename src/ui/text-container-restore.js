@@ -1,5 +1,6 @@
 import { getProxiedUrl } from '../core/utils.js';
 import { state } from '../core/state.js';
+import { updateLayerExtractionMetadata } from '../services/semantic-layer-views.js';
 
 function bboxArea(bbox) {
     if (!Array.isArray(bbox) || bbox.length !== 4) return 0;
@@ -931,7 +932,9 @@ function safeDiagnosePanelRefineCandidate(params) {
 
 export function prepareTextContainerCandidates(item, textLines = [], sourceImage = null) {
     const layers = [
+        ...(Array.isArray(item?.semanticViews?.motionReadyLayers) ? item.semanticViews.motionReadyLayers : []),
         ...(Array.isArray(item?.semanticViews?.editableSceneLayers) ? item.semanticViews.editableSceneLayers : []),
+        ...(Array.isArray(item?.semanticViews?.cleanPlateLayers) ? item.semanticViews.cleanPlateLayers : []),
         ...(Array.isArray(item?.scene?.layers) ? item.scene.layers : []),
         ...(Array.isArray(item?.layers) ? item.layers : [])
     ];
@@ -948,6 +951,25 @@ export function prepareTextContainerCandidates(item, textLines = [], sourceImage
             return bboxArea(intersection) / Math.max(1, bboxArea(textBbox)) >= 0.45;
         });
     });
+
+    const semanticPanelCandidates = layers.filter(layer => {
+        if (!isContainerLayer(layer) || !Array.isArray(layer?.bbox) || layer.bbox.length !== 4) return false;
+        const area = bboxArea(layer.bbox);
+        return area >= 4000 && area <= 260000;
+    });
+    if (semanticPanelCandidates.length) {
+        const merged = [...candidates];
+        semanticPanelCandidates.forEach(candidate => {
+            const duplicated = merged.some(existing =>
+                bboxContains(existing.bbox, candidate.bbox, 8) ||
+                bboxContains(candidate.bbox, existing.bbox, 8)
+            );
+            if (!duplicated) {
+                merged.push(candidate);
+            }
+        });
+        candidates = merged;
+    }
 
     const fallbackCandidates = buildFallbackContainers(textLines);
     if (fallbackCandidates.length) {
@@ -1178,6 +1200,18 @@ function hasRestoredContainerShape(parentId, bbox) {
     return !!findRestoredContainerShape(parentId, bbox);
 }
 
+function buildRestoredShapeStyleText(shapeType, fillColor, rect) {
+    const backgroundColor = fillColor || 'transparent';
+    if (shapeType === 'ellipse') {
+        return `background:${backgroundColor};border:none;border-radius:50%;`;
+    }
+
+    const radius = shapeType === 'rect'
+        ? Math.min(18, Math.max(6, Number(rect?.height || 0) * 0.12))
+        : 0;
+    return `background:${backgroundColor};border:none;${radius > 0 ? `border-radius:${radius}px;` : ''}`;
+}
+
 export async function restoreTextContainerShapes({
     item,
     itemId,
@@ -1231,6 +1265,7 @@ export async function restoreTextContainerShapes({
             ? 'ellipse'
             : 'rect';
         const rect = bboxToWorkbenchRect(layer.bbox, baseX, baseY, parentWidth, parentHeight);
+        const semanticZIndex = Number.isFinite(Number(layer?.zIndex)) ? Number(layer.zIndex) : index;
         const fillColor = await sampleBboxFillColor(sourceImage, layer.bbox, imageContext);
         const diagnostic = safeDiagnosePanelRefineCandidate({
             layer,
@@ -1243,9 +1278,38 @@ export async function restoreTextContainerShapes({
         const clipPath = diagnostic.status === 'candidate'
             ? polygonToClipPath(diagnostic.candidatePolygon)
             : null;
+        const shapeStyleText = buildRestoredShapeStyleText(shapeType, fillColor, rect);
+        const metadataIdentity = {
+            id: layer.id,
+            name: layer.name,
+            cleanPlateLayerId: layer.cleanPlateLayerId,
+            sourceTextLayerId: layer.sourceTextLayerId
+        };
+        const metadataPayload = {
+            extractEngine: 'runtime_vector_or_css',
+            quality: {
+                status: 'ok',
+                runtimeAction: 'accept',
+                shouldGenerateRuntimeLayer: true,
+                reason: 'text_container_restore_shape_ready'
+            },
+            bbox: layer.bbox,
+            shapeStyleText,
+            clipPath,
+            shapeType,
+            fillColor
+        };
         const existingShape = findRestoredContainerShape(itemId, layer.bbox);
         if (existingShape) {
             applyShapeClipPath(existingShape, clipPath);
+            existingShape.el.style.backgroundColor = fillColor || 'transparent';
+            existingShape.el.style.zIndex = String(Math.max(0, zIndexBase + semanticZIndex));
+            if (shapeType === 'ellipse') {
+                existingShape.el.style.borderRadius = '50%';
+            } else if (shapeType === 'rect') {
+                existingShape.el.style.borderRadius = `${Math.min(18, Math.max(6, rect.height * 0.12))}px`;
+            }
+            updateLayerExtractionMetadata(item, metadataIdentity, metadataPayload);
             diagnostics.push({
                 ...diagnostic,
                 status: diagnostic.status === 'candidate' ? 'applied_existing' : 'skipped_existing',
@@ -1260,7 +1324,7 @@ export async function restoreTextContainerShapes({
             top: rect.top,
             width: rect.width,
             height: rect.height,
-            zIndex: Math.max(0, zIndexBase - 1),
+            zIndex: Math.max(0, zIndexBase + semanticZIndex),
             fillColor,
             borderWidth: 0,
             borderColor: 'transparent',
@@ -1270,6 +1334,7 @@ export async function restoreTextContainerShapes({
             layerName: layer.name || 'text-container',
             originalBbox: layer.bbox
         });
+        updateLayerExtractionMetadata(item, metadataIdentity, metadataPayload);
         restored += 1;
         diagnostics.push({
             ...diagnostic,

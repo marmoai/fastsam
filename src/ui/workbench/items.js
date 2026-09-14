@@ -1,12 +1,78 @@
 import { state } from '../../core/state.js';
+import { syncWorkspaceContext, recordWorkspaceAction } from '../../services/workspace-context.js';
 import { dbHelper } from '../../core/session.js';
 import { checkProximity } from '../injection-engine.js';
 import { startOutpaintDrag } from '../outpaint-interaction.js';
 import { uploadImageToOSS } from '../../services/ossService.js';
 import { fileToDataURL, dataURLToFile, getProxiedUrl } from '../../core/utils.js';
+import { resultFeedbackRuntime } from '../../runtime/ResultFeedbackRuntime';
+import { interactionAttributionRuntime } from '../../runtime/InteractionAttributionRuntime';
 
 const { workbenchItems, selectedWorkbenchItems, fileToWorkbenchIdMap, isCtrlPressed } = state;
 const pendingWorkbenchUploads = new Map();
+
+const NON_IMAGE_WORKBENCH_TYPES = new Set([
+    'text-note',
+    'group-label',
+    'shape',
+    'atmosphere',
+    'atmosphere-node'
+]);
+
+export function isExtractedLayerWorkbenchItem(item) {
+    return ['layer-explode', 'layer-extract', 'isolated-edit', 'extraction']
+        .includes(String(item.type || '').toLowerCase());
+}
+
+export function isPureImageWorkbenchAsset(item) {
+    return Boolean(item && !NON_IMAGE_WORKBENCH_TYPES.has(String(item.type || '').toLowerCase()) && !isExtractedLayerWorkbenchItem(item));
+}
+
+window.isExtractedLayerWorkbenchItem = isExtractedLayerWorkbenchItem;
+window.isPureImageWorkbenchAsset = isPureImageWorkbenchAsset;
+
+function publishWorkbenchSelection(itemId, source = 'workbench') {
+    state.currentActiveWorkbenchItemId = itemId || null;
+    syncWorkspaceContext(state, { activeItemId: itemId || null });
+    window.dispatchEvent(new CustomEvent('marmo:workspace-selection-changed', {
+        detail: { itemId: itemId || null, source }
+    }));
+    if (itemId) {
+        recordWorkspaceAction(state, {
+            actionName: 'layer_selection_changed',
+            itemId,
+            status: 'ready'
+        });
+    }
+}
+
+export function syncWorkbenchEmptyState() {
+    const workbench = document.getElementById('workbench');
+    if (!workbench) return;
+
+    const emptyStates = [...workbench.querySelectorAll('.empty-workbench-state')];
+    if (workbenchItems.size > 0) {
+        emptyStates.forEach(emptyState => emptyState.remove());
+        return;
+    }
+
+    // Several legacy flows used to create their own placeholder. Retain one
+    // canonical prompt when empty, never stack prompts on top of a canvas.
+    const [primaryState, ...duplicateStates] = emptyStates;
+    duplicateStates.forEach(emptyState => emptyState.remove());
+    if (primaryState) return;
+
+    const emptyState = document.createElement('div');
+    emptyState.className = 'empty-workbench-state';
+    emptyState.innerHTML = `
+        <i class="fas fa-image"></i>
+        <p>上传或生成的图片将出现在这里</p>
+        <p style="font-size: 12px; margin-top: 10px;">拖拽图片重叠可触发融合反应</p>
+    `;
+    workbench.appendChild(emptyState);
+}
+
+window.syncWorkbenchEmptyState = syncWorkbenchEmptyState;
 
 function beginPendingWorkbenchUpload(itemId, source = 'unknown') {
     const token = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -28,6 +94,10 @@ function finishPendingWorkbenchUpload(itemId, token) {
     if (task && task.token === token) {
         pendingWorkbenchUploads.delete(itemId);
     }
+}
+
+export function waitForWorkbenchItemPersistence(itemId) {
+    return pendingWorkbenchUploads.get(itemId)?.promise || Promise.resolve();
 }
 
 export function invalidatePendingWorkbenchUpload(itemId, reason = 'invalidated') {
@@ -79,6 +149,7 @@ export async function deleteSelectedItems(skipConfirm = false) {
         const workspace = window.mvrRuntime ? window.mvrRuntime.getCurrentWorkspace() : null;
         const uidsToRemove = [];
         const itemsToRemove = new Set();
+        const resultDeletePayloads = [];
 
         const collectItemAndChildren = (id) => {
             if (itemsToRemove.has(id)) return;
@@ -94,6 +165,21 @@ export async function deleteSelectedItems(skipConfirm = false) {
 
         itemsToRemove.forEach(id => {
             const item = workbenchItems.get(id);
+            if (item) {
+                resultDeletePayloads.push({
+                    assetUid: id,
+                    context: {
+                        taskType: item.type || undefined,
+                        layerName: item.layerName || item.label || item.name || undefined,
+                        workflowStage: 'workbench_delete'
+                    },
+                    metadata: {
+                        itemType: item.type || 'image',
+                        parentId: item.parentId || null,
+                        originalBbox: item.originalBbox || null
+                    }
+                });
+            }
             if (item && item.el) {
                 item.el.remove();
             }
@@ -114,12 +200,42 @@ export async function deleteSelectedItems(skipConfirm = false) {
             selectedWorkbenchItems.delete(id);
         });
 
+        if (state.currentActiveWorkbenchItemId && !workbenchItems.has(state.currentActiveWorkbenchItemId)) {
+            publishWorkbenchSelection(null, 'workbench-delete');
+        }
+
         if (workspace && uidsToRemove.length > 0) {
             workspace.dispatcher.dispatch({
                 type: 'REMOVE_ASSETS',
                 payload: { uids: uidsToRemove }
             });
         }
+
+        resultDeletePayloads.forEach((payload) => {
+            try {
+                const source = interactionAttributionRuntime.resolveSource({
+                    assetUid: payload.assetUid,
+                    fallbackSourceType: 'manual'
+                });
+                resultFeedbackRuntime.recordEvent({
+                    type: 'result_deleted',
+                    assetUid: payload.assetUid,
+                    sessionId: state.currentSessionId || undefined,
+                    projectId: workspace?.projectId || undefined,
+                    sourceType: source.sourceType,
+                    sourceId: source.sourceId,
+                    context: payload.context,
+                    metadata: {
+                        ...payload.metadata,
+                        batchDelete: true,
+                        attributionMetadata: source.metadata || null
+                    }
+                });
+            } catch (error) {
+                console.error('[ResultFeedback] Failed to record result_deleted (batch):', error);
+            }
+            interactionAttributionRuntime.clearAssetSource(payload.assetUid);
+        });
 
         itemsToRemove.forEach(id => {
             if (window.currentAdjustingShape && window.currentAdjustingShape.dataset.itemId === id) {
@@ -137,16 +253,7 @@ export async function deleteSelectedItems(skipConfirm = false) {
         if (window.checkProximity) window.checkProximity();
         if (window.drawGenealogyConnections) window.drawGenealogyConnections();
 
-        if (workbenchItems.size === 0) {
-            const emptyState = document.createElement('div');
-            emptyState.className = 'empty-workbench-state';
-            emptyState.innerHTML = `
-                <i class="fas fa-image"></i>
-                <p>上传或生成的图片将出现在这里</p>
-                <p style="font-size: 12px; margin-top: 10px;">拖拽图片重叠可触发融合反应</p>
-            `;
-            document.getElementById('workbench').appendChild(emptyState);
-        }
+        syncWorkbenchEmptyState();
 
         if (window.updateSelectedItems) window.updateSelectedItems();
         if (window.historyManager) window.historyManager.pushState();
@@ -157,11 +264,11 @@ export async function deleteSelectedItems(skipConfirm = false) {
 export function selectWorkbenchItem(id) {
     const item = workbenchItems.get(id);
     if (!item) return;
-    
+
     if (!isCtrlPressed) {
         // 如果不是多选模式，清除所有选中状态
         document.querySelectorAll('.workbench-item').forEach(el => el.classList.remove('selected'));
-        selectedWorkbenchItems.clear();
+    selectedWorkbenchItems.clear();
     }
     
     // 切换当前项的选中状态
@@ -169,9 +276,11 @@ export function selectWorkbenchItem(id) {
     if (itemEl.classList.contains('selected')) {
         itemEl.classList.remove('selected');
         selectedWorkbenchItems.delete(id);
+        publishWorkbenchSelection([...selectedWorkbenchItems][0] || null, 'workbench-toggle');
     } else {
         itemEl.classList.add('selected');
         selectedWorkbenchItems.add(id);
+        publishWorkbenchSelection(id, 'workbench');
     }
     
     // 处理选中项
@@ -196,7 +305,10 @@ export async function addImageToWorkbench(file, label = '', metadata = {}) {
         
         if (!shouldDeferBackgroundUpload) {
             const uploadToken = beginPendingWorkbenchUpload(id, 'file');
-            uploadImageToOSS(file).then(url => {
+            const uploadPromise = Promise.all([
+                uploadImageToOSS(file),
+                uploadImageToOSS(file, { preserveOriginal: true })
+            ]).then(([url, segmentationSourceUrl]) => {
                 if (!isPendingWorkbenchUploadActive(id, uploadToken)) {
                     return;
                 }
@@ -204,15 +316,21 @@ export async function addImageToWorkbench(file, label = '', metadata = {}) {
                 if (item) {
                     item.dataUrl = url;
                     item.originalDataUrl = url; // V2.5
+                    item.segmentationSourceUrl = segmentationSourceUrl;
                     const workspace = window.mvrRuntime ? window.mvrRuntime.getCurrentWorkspace() : null;
                     const asset = workspace ? workspace.currentState.assetRegistry.get(id) : null;
                     if (workspace && asset) {
                         workspace.dispatcher.dispatch({
                             type: 'UPDATE_ASSET_METADATA',
+                            meta: {
+                                skipSnapshot: metadata.skipRuntimeSnapshot === true,
+                                skipNotify: metadata.skipRuntimeNotify === true
+                            },
                             payload: {
                                 uid: id,
                                 sourceImage: url,
                                 originalDataUrl: url,
+                                segmentationSourceUrl,
                                 cleanPlateDataUrl: asset.cleanPlateDataUrl ?? item.cleanPlateDataUrl ?? null,
                                 cleanPlateStatus: asset.cleanPlateStatus ?? item.cleanPlateStatus ?? 'idle'
                             }
@@ -220,7 +338,7 @@ export async function addImageToWorkbench(file, label = '', metadata = {}) {
                     }
                     fileToWorkbenchIdMap.set(url, id);
                     if (dbHelper) dbHelper.saveImageCache(url, file);
-                    if (window.historyManager) window.historyManager.pushState();
+                    if (!metadata.skipRuntimeSnapshot && window.historyManager) window.historyManager.pushState();
                 }
             }).catch(e => {
                 if (isPendingWorkbenchUploadActive(id, uploadToken)) {
@@ -229,6 +347,8 @@ export async function addImageToWorkbench(file, label = '', metadata = {}) {
             }).finally(() => {
                 finishPendingWorkbenchUpload(id, uploadToken);
             });
+            const pendingUpload = pendingWorkbenchUploads.get(id);
+            if (pendingUpload?.token === uploadToken) pendingUpload.promise = uploadPromise;
         }
         
     } else if (metadata.dataUrl && metadata.dataUrl.startsWith('data:')) {
@@ -238,11 +358,14 @@ export async function addImageToWorkbench(file, label = '', metadata = {}) {
         
         if (!shouldDeferBackgroundUpload) {
             const uploadToken = beginPendingWorkbenchUpload(id, 'data_url');
-            dataURLToFile(metadata.dataUrl, `gen_${Date.now()}.png`).then(blobFile => {
+            const uploadPromise = dataURLToFile(metadata.dataUrl, `gen_${Date.now()}.png`).then(blobFile => {
                 if (!blobFile || !isPendingWorkbenchUploadActive(id, uploadToken)) {
                     return null;
                 }
-                return uploadImageToOSS(blobFile).then(url => {
+                return Promise.all([
+                    uploadImageToOSS(blobFile),
+                    uploadImageToOSS(blobFile, { preserveOriginal: true })
+                ]).then(([url, segmentationSourceUrl]) => {
                     if (!isPendingWorkbenchUploadActive(id, uploadToken)) {
                         return;
                     }
@@ -250,15 +373,21 @@ export async function addImageToWorkbench(file, label = '', metadata = {}) {
                     if (item) {
                         item.dataUrl = url;
                         item.originalDataUrl = url; // V2.5
+                        item.segmentationSourceUrl = segmentationSourceUrl;
                         const workspace = window.mvrRuntime ? window.mvrRuntime.getCurrentWorkspace() : null;
                         const asset = workspace ? workspace.currentState.assetRegistry.get(id) : null;
                         if (workspace && asset) {
                             workspace.dispatcher.dispatch({
                                 type: 'UPDATE_ASSET_METADATA',
+                                meta: {
+                                    skipSnapshot: metadata.skipRuntimeSnapshot === true,
+                                    skipNotify: metadata.skipRuntimeNotify === true
+                                },
                                 payload: {
                                     uid: id,
                                     sourceImage: url,
                                     originalDataUrl: url,
+                                    segmentationSourceUrl,
                                     cleanPlateDataUrl: asset.cleanPlateDataUrl ?? item.cleanPlateDataUrl ?? null,
                                     cleanPlateStatus: asset.cleanPlateStatus ?? item.cleanPlateStatus ?? 'idle'
                                 }
@@ -266,7 +395,7 @@ export async function addImageToWorkbench(file, label = '', metadata = {}) {
                         }
                         fileToWorkbenchIdMap.set(url, id);
                         if (dbHelper) dbHelper.saveImageCache(url, blobFile);
-                        if (window.historyManager) window.historyManager.pushState();
+                    if (!metadata.skipRuntimeSnapshot && window.historyManager) window.historyManager.pushState();
                     }
                 });
             }).catch(e => {
@@ -276,6 +405,8 @@ export async function addImageToWorkbench(file, label = '', metadata = {}) {
             }).finally(() => {
                 finishPendingWorkbenchUpload(id, uploadToken);
             });
+            const pendingUpload = pendingWorkbenchUploads.get(id);
+            if (pendingUpload?.token === uploadToken) pendingUpload.promise = uploadPromise;
         }
         
     } else if (metadata.dataUrl) {
@@ -286,14 +417,10 @@ export async function addImageToWorkbench(file, label = '', metadata = {}) {
     // --- NEW: Cache Handling ---
     let displayUrl = finalDataUrl;
     
-    // If we have a local file, use it directly for display (using base64 for better stability)
+    // Keep the durable base64 only for persistence. Rendering a local blob URL
+    // avoids creating a second large base64 string for every extracted layer.
     if (file) {
-        try {
-            displayUrl = await fileToDataURL(file);
-        } catch (e) {
-            console.warn('Failed to convert file to data URL, using blob URL as fallback', e);
-            displayUrl = URL.createObjectURL(file);
-        }
+        displayUrl = URL.createObjectURL(file);
     } else if (finalDataUrl && finalDataUrl.startsWith('http') && dbHelper) {
         // If we have a cloud URL but no file, try to get from cache
         const cachedBlob = await dbHelper.getImageCache(finalDataUrl);
@@ -399,10 +526,12 @@ export async function addImageToWorkbench(file, label = '', metadata = {}) {
                             asset = existingAsset;
                         } else {
                             createdNewAsset = true;
+                            const durableSourceImage = finalDataUrl || safeSourceImage;
                             asset = {
                                 uid: id,
                                 type: metadata.type || 'unknown',
-                                sourceImage: safeSourceImage,
+                                sourceImage: durableSourceImage,
+                                runtimeDisplayUrl: safeSourceImage.startsWith('blob:') ? safeSourceImage : undefined,
                                 masks: [],
                                 variants: [],
                                 metadata: {
@@ -435,6 +564,7 @@ export async function addImageToWorkbench(file, label = '', metadata = {}) {
                                 semanticViews: metadata.semanticViews,
                                 hasFullSemanticAnalysis: metadata.hasFullSemanticAnalysis,
                                 originalDataUrl: metadata.originalDataUrl || finalDataUrl,
+                                segmentationSourceUrl: metadata.segmentationSourceUrl || null,
                                 cleanPlateDataUrl: metadata.cleanPlateDataUrl || null,
                                 cleanPlateStatus: metadata.cleanPlateStatus || 'idle'
                             };
@@ -449,7 +579,14 @@ export async function addImageToWorkbench(file, label = '', metadata = {}) {
 
                             workspace.dispatcher.dispatch({
                                 type: relations.length > 0 ? 'ADD_ASSET_WITH_RELATIONS' : 'ADD_ASSET',
-                                payload: relations.length > 0 ? { asset, relations } : { asset }
+                                payload: relations.length > 0 ? { asset, relations } : { asset },
+                                // A Magic Layers batch already persists its final
+                                // scene state. Avoid cloning the full workspace for
+                                // each transient extraction child.
+                                meta: {
+                                    skipSnapshot: metadata.skipRuntimeSnapshot === true,
+                                    skipNotify: metadata.skipRuntimeNotify === true
+                                }
                             });
                         }
                     }
@@ -481,6 +618,7 @@ export async function addImageToWorkbench(file, label = '', metadata = {}) {
                         ...metadata, 
                         dataUrl: finalDataUrl,
                         originalDataUrl: metadata.originalDataUrl || finalDataUrl, // V2.5
+                        segmentationSourceUrl: metadata.segmentationSourceUrl || null,
                         cleanPlateDataUrl: metadata.cleanPlateDataUrl || null,       // V2.5
                         cleanPlateStatus: metadata.cleanPlateStatus || 'idle',      // V2.5
                         semanticViews: metadata.semanticViews || null,
@@ -492,30 +630,10 @@ export async function addImageToWorkbench(file, label = '', metadata = {}) {
                         spawnTop: actualY
                     });
 
-                    const addedItem = workbenchItems.get(id);
-                    const shouldAutoOpenDecisionPanel =
-                        metadata.autoOpenDecisionPanel === true ||
-                        (typeof window.isExtractedLayerItem === 'function' && window.isExtractedLayerItem(addedItem));
-
-                    const batchAutoOpenToken = metadata.autoOpenDecisionPanelBatchToken;
-                    const shouldOpenForThisBatch =
-                        !batchAutoOpenToken ||
-                        metadata.autoOpenDecisionPanelBatchFinal === true ||
-                        window.__lastDecisionPanelBatchToken !== batchAutoOpenToken;
-
-                    if (shouldAutoOpenDecisionPanel && shouldOpenForThisBatch && typeof window.showFloatingFusionEditor === 'function') {
-                        if (batchAutoOpenToken) {
-                            if (metadata.autoOpenDecisionPanelBatchFinal !== true) {
-                                window.__lastDecisionPanelBatchToken = batchAutoOpenToken;
-                            } else {
-                                window.__lastDecisionPanelBatchToken = null;
-                            }
-                        }
-                        requestAnimationFrame(() => {
-                            state.currentActiveWorkbenchItemId = id;
-                            window.showFloatingFusionEditor(id);
-                        });
-                    }
+                    // Object editing is now entered explicitly from Visual
+                    // Object. Keep the legacy auto-open metadata for restore
+                    // compatibility, but never open the old inspiration
+                    // drawer as a side effect of adding/selecting an asset.
 
                     if (asset && workspace && (
                         metadata.left !== undefined ||
@@ -536,7 +654,7 @@ export async function addImageToWorkbench(file, label = '', metadata = {}) {
                     }
 
                     window.workbenchGrid.appendChild(wrapper);
-                    document.querySelector('#workbench > .empty-workbench-state')?.remove();
+                    syncWorkbenchEmptyState();
                     window.workbenchItemCount = (window.workbenchItemCount || 0) + 1;
 
                     if (window.implicitMemoryEngine) {
@@ -617,10 +735,12 @@ export async function addImageToWorkbench(file, label = '', metadata = {}) {
             ...currentItem, 
             dataUrl, 
             originalDataUrl: currentItem.originalDataUrl || dataUrl,
+            segmentationSourceUrl: currentItem.segmentationSourceUrl || null,
             cleanPlateDataUrl: currentItem.cleanPlateDataUrl,
             cleanPlateStatus: currentItem.cleanPlateStatus || 'idle',
             genealogy: genealogy 
         });
+        syncWorkspaceContext(state, { activeItemId: id });
         
         const renderDataUrl = currentItem.cleanPlateDataUrl || dataUrl;
         wrapper.innerHTML = `<div class="crop-container" style="width: 100%; height: 100%; overflow: hidden; position: relative;"><img src="${renderDataUrl}" alt="${label}" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%;"></div>`;
@@ -702,25 +822,15 @@ export async function addImageToWorkbench(file, label = '', metadata = {}) {
             if (event.target.classList.contains('outpaint-handle')) return;
             if (event.target.classList.contains('resize-handle')) return;
             
-            // 检测是否是提取出来的独立图层项目 (含有 parentId 且为特定提取类型)
             const itemObj = workbenchItems.get(id);
-            if (itemObj) {
-                const isExtractedLayer = itemObj.parentId && (
-                    itemObj.type === 'layer-explode' || 
-                    itemObj.type === 'layer-extract' || 
-                    itemObj.type === 'isolated-edit' || 
-                    itemObj.type === 'extraction'
-                );
-                if (isExtractedLayer) {
-                    state.currentActiveWorkbenchItemId = id;
-                    if (typeof window.showFloatingFusionEditor === 'function') {
-                        window.showFloatingFusionEditor(id);
-                    }
-                    return;
-                }
+            if (!isPureImageWorkbenchAsset(itemObj)) {
+                window.hideWorkbenchToolbox?.();
+                publishWorkbenchSelection(id, 'workbench-layer');
+                return;
             }
-            
-            // 始终显示工具箱，因为它内部会根据类型判断是否显示 fusion editor
+
+            // The toolbox is reserved for standalone image assets. Extracted
+            // Magic Layers use the Visual Object/Object Editor surface instead.
             window.showWorkbenchToolbox(id);
         });
 
@@ -782,10 +892,10 @@ export async function addImageToWorkbench(file, label = '', metadata = {}) {
         if (window.checkProximity) {
             window.checkProximity();
         }
-        if (window.historyManager) window.historyManager.pushState();
+        if (!metadata.skipRuntimeSnapshot && window.historyManager) window.historyManager.pushState();
 
         // 确保会话存在，且仅在非恢复状态下触发
-        if (!window.isRestoringSession && !window.suppressSessionAutoCreate && !(window.historyManager && window.historyManager.isRestoring)) {
+        if (!metadata.skipRuntimeSnapshot && !window.isRestoringSession && !window.suppressSessionAutoCreate && !(window.historyManager && window.historyManager.isRestoring)) {
             if (typeof window.ensureSessionExists === 'function') {
                 Promise.resolve(window.ensureSessionExists('新建项目'))
                     .then(async () => {
@@ -829,6 +939,7 @@ export async function deleteWorkbenchItem(id, skipConfirm = false, isBatch = fal
         const workspace = window.mvrRuntime ? window.mvrRuntime.getCurrentWorkspace() : null;
         const uidsToRemove = [];
         const itemsToRemove = new Set();
+        const resultDeletePayloads = [];
 
         const collectItemAndChildren = (targetId) => {
             if (itemsToRemove.has(targetId)) return;
@@ -844,6 +955,21 @@ export async function deleteWorkbenchItem(id, skipConfirm = false, isBatch = fal
 
         itemsToRemove.forEach(targetId => {
             const item = workbenchItems.get(targetId);
+            if (item) {
+                resultDeletePayloads.push({
+                    assetUid: targetId,
+                    context: {
+                        taskType: item.type || undefined,
+                        layerName: item.layerName || item.label || item.name || undefined,
+                        workflowStage: 'workbench_delete'
+                    },
+                    metadata: {
+                        itemType: item.type || 'image',
+                        parentId: item.parentId || null,
+                        originalBbox: item.originalBbox || null
+                    }
+                });
+            }
             if (item && item.el) {
                 item.el.remove();
             }
@@ -867,9 +993,38 @@ export async function deleteWorkbenchItem(id, skipConfirm = false, isBatch = fal
         if (workspace && uidsToRemove.length > 0) {
             workspace.dispatcher.dispatch({
                 type: 'REMOVE_ASSETS',
-                payload: { uids: uidsToRemove }
+                payload: { uids: uidsToRemove },
+                meta: window.__marmoAgentLayerExtractionActive
+                    ? { silent: true, skipSnapshot: true, skipNotify: true }
+                    : undefined
             });
         }
+
+        resultDeletePayloads.forEach((payload) => {
+            try {
+                const source = interactionAttributionRuntime.resolveSource({
+                    assetUid: payload.assetUid,
+                    fallbackSourceType: 'manual'
+                });
+                resultFeedbackRuntime.recordEvent({
+                    type: 'result_deleted',
+                    assetUid: payload.assetUid,
+                    sessionId: state.currentSessionId || undefined,
+                    projectId: workspace?.projectId || undefined,
+                    sourceType: source.sourceType,
+                    sourceId: source.sourceId,
+                    context: payload.context,
+                    metadata: {
+                        ...payload.metadata,
+                        batchDelete: !!isBatch,
+                        attributionMetadata: source.metadata || null
+                    }
+                });
+            } catch (error) {
+                console.error('[ResultFeedback] Failed to record result_deleted:', error);
+            }
+            interactionAttributionRuntime.clearAssetSource(payload.assetUid);
+        });
 
         itemsToRemove.forEach(targetId => {
             if (window.currentAdjustingShape && window.currentAdjustingShape.dataset.itemId === targetId) {
@@ -887,16 +1042,7 @@ export async function deleteWorkbenchItem(id, skipConfirm = false, isBatch = fal
         if (window.checkProximity) window.checkProximity(); 
         if (window.drawGenealogyConnections) window.drawGenealogyConnections();
 
-        if (workbenchItems.size === 0) {
-            const emptyState = document.createElement('div');
-            emptyState.className = 'empty-workbench-state';
-            emptyState.innerHTML = `
-                <i class="fas fa-image"></i>
-                <p>上传或生成的图片将出现在这里</p>
-                <p style="font-size: 12px; margin-top: 10px;">拖拽图片重叠可触发融合反应</p>
-            `;
-            document.getElementById('workbench').appendChild(emptyState);
-        }
+        syncWorkbenchEmptyState();
         if (!isBatch) {
             if (window.updateSelectedItems) window.updateSelectedItems();
             if (window.historyManager) window.historyManager.pushState();
@@ -972,14 +1118,7 @@ export async function clearWorkbench(skipConfirm = false) {
             });
         }
 
-        const emptyState = document.createElement('div');
-        emptyState.className = 'empty-workbench-state';
-        emptyState.innerHTML = `
-            <i class="fas fa-image"></i>
-            <p>上传或生成的图片将出现在这里</p>
-            <p style="font-size: 12px; margin-top: 10px;">拖拽图片重叠可触发融合反应</p>
-        `;
-        document.getElementById('workbench').appendChild(emptyState);
+        syncWorkbenchEmptyState();
         
         if (window.updateSelectedItems) window.updateSelectedItems();
         if (window.drawGenealogyConnections) window.drawGenealogyConnections();

@@ -246,7 +246,34 @@
             <div class="empty-workbench-state">
                 <i class="fas fa-image"></i>
                 <p>上传或生成的图片将出现在这里</p>
-                <p style="font-size: 12px; margin-top: 10px;">拖拽图片重叠可触发融合反应</p>
+                <p style="font-size: 12px; margin-top: 10px;">在下方视觉目标栏中描述你想要的场景变化</p>
+            </div>
+
+            <!-- Agent Visual Workspace surface: one intent-first entry point. -->
+            <div id="agentVisualPlan" class="agent-visual-plan" aria-live="polite"></div>
+
+            <div id="agentVisualTargetBar" class="agent-visual-target-bar">
+                <div class="agent-target-context" id="agentVisualTargetContext">
+                    <span data-target-context-label>当前场景</span>
+                    <span data-target-context-id></span>
+                </div>
+                <div class="agent-target-edit-controls" data-target-edit-controls hidden>
+                    <div class="agent-target-mode-toggle" role="tablist" aria-label="图层编辑方式">
+                        <button type="button" class="is-active" data-target-mode="variant" role="tab">生成新版本</button>
+                        <button type="button" data-target-mode="current_layer" role="tab">更新当前图层</button>
+                    </div>
+                </div>
+                <div class="agent-target-input-row">
+                    <span class="agent-target-spark"><i class="fas fa-sparkles"></i></span>
+                    <input id="agentVisualTargetInput" type="text" autocomplete="off" placeholder="描述要添加、提取或修改的内容…">
+                    <button id="agentVisualTargetSubmit" type="button"><i class="fas fa-arrow-up"></i><span>执行</span></button>
+                </div>
+                <div class="agent-target-suggestions-popover" data-target-suggestions hidden role="status" aria-live="polite">
+                    <span data-target-suggestions-label>智能建议 · 根据当前对象和指令</span>
+                    <button type="button" data-object-suggestion="换成米白材质">换成米白材质</button>
+                    <button type="button" data-object-suggestion="保留构图，提升质感">保留构图，提升质感</button>
+                    <button type="button" data-object-suggestion="生成电商展示版本">生成电商展示版本</button>
+                </div>
             </div>
         </div>
 
@@ -260,7 +287,7 @@
     <button class="toolbox-btn magic-layers" title="Magic Layers"><i class="fas fa-layer-group"></i></button>
     <button class="toolbox-btn precise-edit" title="精准编辑/局部重绘"><i class="fas fa-eraser"></i></button>
     <button class="toolbox-btn camera-angle" title="相机角度变换"><i class="fas fa-camera"></i></button>
-    <button class="toolbox-btn veo-video" title="Veo 视频生成"><i class="fas fa-video"></i></button>
+    <button class="toolbox-btn veo-video" title="Magic Motion Preview"><i class="fas fa-video"></i></button>
     <button class="toolbox-btn upscale" title="智能高清"><i class="fas fa-wand-magic-sparkles"></i></button>
     <button class="toolbox-btn multiview" title="多维视图 (建筑/空间三视图)"><i class="fas fa-cubes"></i></button>
     <button class="toolbox-btn download" title="下载图片"><i class="fas fa-download"></i></button>
@@ -399,13 +426,12 @@
 </div>
         
         <div class="chat-panel collapsed">
-            <button class="toggle-chat" id="toggleChatBtn" title="切换聊天面板">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="sidebar-icon-svg chat-open-indicator">
-                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
-                </svg>
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="sidebar-icon-svg chat-close-indicator">
-                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
-                    <line x1="15" y1="3" x2="15" y2="21"></line>
+            <button class="toggle-chat agent-dock-toggle" id="toggleChatBtn" title="打开 Agent 任务面板" aria-label="打开 Agent 任务面板">
+                <span class="agent-dock-dot" data-agent-dock-dot aria-hidden="true"></span>
+                <span class="agent-dock-label" data-agent-dock-label>Agent · 空闲</span>
+                <span class="agent-dock-count" data-agent-dock-count hidden></span>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="sidebar-icon-svg agent-dock-chat-icon" aria-hidden="true">
+                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2 2h14a2 2 0 0 1 2 2z"></path>
                 </svg>
             </button>
             <div class="chat-header">
@@ -417,8 +443,8 @@
                 </button>
                 <div style="display: flex; align-items: center; gap: 12px;">
                     <div>
-                        MarmoAid 图像助手
-                        <div style="font-size: 13px; font-weight: normal;"> </div>
+                        Agent 任务中心
+                        <div style="font-size: 13px; font-weight: normal;">任务记录 · 验证 · 确认</div>
                     </div>
                 </div>
                 <div class="header-right">
@@ -462,9 +488,10 @@
                                     <div class="plus-menu-item-select">
                                         <i class="fas fa-cube"></i>
                                         <select id="modelSelect">
-                                            <option value="gpt-image-2" selected>GPT-image-2 (中转高精生成/编辑)</option>
-                                            <option value="qwen-cleanplate">Qwen Clean Plate (仅背景净化)</option>
-                                            <option value="flash">Gemini 3 Flash/Banana 2</option>
+                                            <option value="gpt-image-2">GPT-image-2 (中转高精生成/编辑)</option>
+                                            <option value="qwen-image-3.0-pro">Qwen Image 3.0 Pro (全能生成/编辑)</option>
+                                            <option value="qwen-image-edit-2509">Qwen Image Edit 2509 (全能图片处理)</option>
+                                            <option value="flash" selected>Gemini 3 Flash/Banana 2</option>
                                             <option value="pro">Gemini 3.1 Pro/Banana pro</option>
                                             <option value="lite">Gemini 3.1 Flash Lite/Banana </option>
                                         </select>

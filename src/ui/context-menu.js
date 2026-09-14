@@ -7,6 +7,8 @@ import { editLayerAsset } from './workbench/layer-assets.js';
 import localforage from 'localforage';
 import { uploadImageToOSS } from '../services/ossService.js';
 import { runtime } from '../runtime/CoreRuntime';
+import { resultFeedbackRuntime } from '../runtime/ResultFeedbackRuntime';
+import { interactionAttributionRuntime } from '../runtime/InteractionAttributionRuntime';
 
 function isRuntimeManagedWorkbenchItem(item) {
     if (!item) return false;
@@ -343,6 +345,33 @@ export function initContextMenu() {
         };
         
         await mvrAssetsDB.setItem(assetId, independentAsset);
+        try {
+            const source = interactionAttributionRuntime.resolveSource({
+                assetUid: itemId,
+                fallbackSourceType: currentRightClickedLayer ? 'magic_layers' : 'manual'
+            });
+            resultFeedbackRuntime.recordEvent({
+                type: 'result_saved_to_asset_library',
+                assetUid: assetId,
+                sessionId: state.currentSessionId || undefined,
+                projectId: runtime.getCurrentWorkspace()?.projectId || undefined,
+                sourceType: source.sourceType,
+                sourceId: source.sourceId,
+                context: {
+                    taskType: item?.type || undefined,
+                    layerName: assetName,
+                    workflowStage: currentRightClickedLayer ? 'layer_asset_saved' : 'asset_saved'
+                },
+                metadata: {
+                    assetCategory,
+                    sourceWorkbenchItemId: itemId,
+                    sourceLayerIndex: currentRightClickedLayer ? parseInt(currentRightClickedLayer.dataset.layerIndex, 10) : null,
+                    attributionMetadata: source.metadata || null
+                }
+            });
+        } catch (error) {
+            console.error('[ResultFeedback] Failed to record result_saved_to_asset_library:', error);
+        }
         
         // Show a temporary toast message
         const toast = document.createElement('div');

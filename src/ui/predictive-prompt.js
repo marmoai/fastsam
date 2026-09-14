@@ -1,7 +1,131 @@
 import { implicitMemoryEngine } from '../runtime/ImplicitMemoryEngine';
 import { state } from '../core/state';
+import { interactionAttributionRuntime } from '../runtime/InteractionAttributionRuntime';
+import { resultFeedbackRuntime } from '../runtime/ResultFeedbackRuntime';
+import { describeTaskBucket, inferTaskBucketFromWorkbenchState } from '../runtime/taskBuckets';
+import { memoryLayer } from '../runtime/CreativeMemoryLayer';
+import { proxyGenerateContent } from '../ai-services/gemini-client.js';
 
 let activeMatch = null;
+let activeCompletionSource = null;
+let activeSuggestion = null;
+let predictionRequestSeq = 0;
+let predictiveDebounceTimer = null;
+
+function getTaskBucket(inputText = '') {
+    return inferTaskBucketFromWorkbenchState(state.workbenchItems, state.currentActiveWorkbenchItemId, inputText);
+}
+
+function buildSuggestionFromRule(rule, layerType = 'memory', taskBucket = 'general') {
+    if (!rule) return null;
+    return {
+        ...rule,
+        layerType,
+        taskBucket
+    };
+}
+
+function getCurrentAssetSummary() {
+    const itemId = state.currentActiveWorkbenchItemId;
+    if (!itemId) return null;
+    const item = state.workbenchItems.get(itemId);
+    if (!item) return null;
+
+    return {
+        itemId,
+        type: item.type || 'image',
+        name: item.name || item.label || item.layerName || '',
+        semanticType: item.semanticType || '',
+        designRole: item.designRole || '',
+        tags: Array.isArray(item?.metadata?.tags) ? item.metadata.tags.slice(0, 6) : []
+    };
+}
+
+function getRecentOperationSummary() {
+    const logs = memoryLayer.getLogs().slice(-5);
+    return logs.map(log => ({
+        actionType: log.actionType,
+        intent: log.intent || '',
+        reason: log.reason || ''
+    }));
+}
+
+function getHighAcceptanceStyles(taskBucket) {
+    return implicitMemoryEngine
+        .getTopRules(taskBucket, 3)
+        .map(rule => ({
+            initialPrompt: rule.initialPrompt,
+            finalPrompt: rule.finalPrompt,
+            presetTags: rule.presetTags || []
+        }));
+}
+
+async function generateLLMCompletion(rawInput, taskBucket) {
+    const assetSummary = getCurrentAssetSummary();
+    const recentOps = getRecentOperationSummary();
+    const acceptedStyles = getHighAcceptanceStyles(taskBucket);
+
+    const prompt = [
+        '你是一个垂类视觉工作流补全引擎。你的任务不是回答问题，而是把用户当前未写完的一句话，续写成更完整、更可执行、更专业的中文创意指令。',
+        '要求：',
+        '1. 只输出一条补全后的完整中文句子，不要解释，不要加引号，不要分点。',
+        '2. 必须保留用户已经输入的前缀语义，不要改写用户的核心意图。',
+        '3. 优先贴合当前任务桶、当前选中资产、最近操作和高采纳表达风格。',
+        '4. 补全结果长度控制在 28 到 90 个中文字符之间。',
+        '5. 如果输入本身已经足够完整，就只做轻微补足，不要大幅扩写。',
+        '',
+        `当前任务桶: ${taskBucket}`,
+        `当前选中资产: ${assetSummary ? JSON.stringify(assetSummary) : 'none'}`,
+        `最近操作: ${JSON.stringify(recentOps)}`,
+        `历史高采纳表达风格: ${JSON.stringify(acceptedStyles)}`,
+        `用户当前输入: ${rawInput}`,
+        '',
+        '现在直接输出补全后的完整句子：'
+    ].join('\n');
+
+    const response = await proxyGenerateContent({
+        model: 'gemini-3.1-flash-lite',
+        contents: prompt,
+        config: {
+            thinkingConfig: { thinkingLevel: 'LOW' }
+        }
+    });
+
+    const text = (response?.text || '').trim();
+    if (!text || text.length <= rawInput.trim().length) return null;
+    return {
+        id: `llm_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        initialPrompt: rawInput.trim(),
+        finalPrompt: text.replace(/^["'“”]+|["'“”]+$/g, ''),
+        count: 0,
+        presetTags: ['实时续写', `${describeTaskBucket(taskBucket)}上下文`],
+        layerType: 'llm',
+        taskBucket
+    };
+}
+
+async function resolveBestSuggestion(rawInput) {
+    const taskBucket = getTaskBucket(rawInput);
+
+    const personalMatch = implicitMemoryEngine.findBestMatch(rawInput, {
+        taskType: taskBucket,
+        preferTaskType: true
+    });
+    if (personalMatch && personalMatch.score >= 95) {
+        return buildSuggestionFromRule(personalMatch.rule, 'memory', personalMatch.taskType || taskBucket);
+    }
+
+    const taskBucketMatch = implicitMemoryEngine.findTaskBucketMatch(rawInput, taskBucket);
+    if (taskBucketMatch && taskBucketMatch.score >= 45) {
+        return buildSuggestionFromRule(taskBucketMatch.rule, 'task_bucket', taskBucketMatch.taskType || taskBucket);
+    }
+
+    if (rawInput.trim().length < 6) {
+        return null;
+    }
+
+    return await generateLLMCompletion(rawInput, taskBucket);
+}
 
 // Dynamically inject styles for the Predictive Overlay
 function injectPredictiveStyles() {
@@ -280,19 +404,44 @@ export function initPredictivePromptEngine(userInput) {
     // Monitor input events
     userInput.addEventListener('input', () => {
         const value = userInput.value;
+        const requestId = ++predictionRequestSeq;
         
         if (!value || value.trim().length < 2) {
+            if (predictiveDebounceTimer) {
+                clearTimeout(predictiveDebounceTimer);
+                predictiveDebounceTimer = null;
+            }
             hidePredictiveOverlay();
             return;
         }
 
-        const match = implicitMemoryEngine.findMatch(value);
-        if (match) {
-            activeMatch = match;
-            renderMatchInOverlay(match, value);
-        } else {
-            hidePredictiveOverlay();
+        if (predictiveDebounceTimer) {
+            clearTimeout(predictiveDebounceTimer);
         }
+
+        predictiveDebounceTimer = setTimeout(async () => {
+            const match = await resolveBestSuggestion(value);
+            if (requestId !== predictionRequestSeq) {
+                return;
+            }
+
+            if (match) {
+                activeSuggestion = match;
+                activeMatch = match;
+                activeCompletionSource = interactionAttributionRuntime.registerPromptCompletionShown({
+                    matchId: match.id,
+                    initialPrompt: match.initialPrompt,
+                    finalPrompt: match.finalPrompt,
+                    typedInput: value,
+                    presetTags: match.presetTags || [],
+                    sessionId: state.currentSessionId || undefined,
+                    projectId: window.mvrRuntime?.getCurrentWorkspace?.()?.projectId || undefined
+                });
+                renderMatchInOverlay(match, value);
+            } else {
+                hidePredictiveOverlay();
+            }
+        }, 260);
     });
 
     // Handle keys: Tab or Enter to autocomplete
@@ -318,6 +467,12 @@ export function initPredictivePromptEngine(userInput) {
 function renderMatchInOverlay(match, rawInput) {
     const container = document.getElementById('predictiveContainer');
     if (!container) return;
+    const taskBucket = inferTaskBucketFromWorkbenchState(state.workbenchItems, state.currentActiveWorkbenchItemId, rawInput);
+    const bucketInsights = taskBucket !== 'general'
+        ? resultFeedbackRuntime.getPromptRuleInsights(match.id, { taskType: taskBucket })
+        : null;
+    const globalInsights = resultFeedbackRuntime.getPromptRuleInsights(match.id);
+    const insights = bucketInsights && bucketInsights.totalEvents > 0 ? bucketInsights : globalInsights;
 
     // Split finalPrompt into "what is typed" versus "what is proposed"
     const lowerInput = rawInput.toLowerCase();
@@ -347,8 +502,16 @@ function renderMatchInOverlay(match, rawInput) {
         }
     }
 
-    const badgeLabel = match.id.startsWith('default') ? '脑电波配方' : '已心有灵犀 💖';
-    const usageTip = `关联 ${match.count} 次满意定稿`;
+    const badgeLabel = match.layerType === 'llm'
+        ? '实时续写'
+        : match.layerType === 'task_bucket'
+            ? `${describeTaskBucket(taskBucket)}习惯`
+            : (match.id.startsWith('default') ? '脑电波配方' : '已心有灵犀 💖');
+    const usageTip = insights.totalEvents > 0
+        ? `${describeTaskBucket(taskBucket)}里${insights.shortLabel} · ${insights.detail}`
+        : match.layerType === 'llm'
+            ? `基于${describeTaskBucket(taskBucket)}上下文实时续写`
+            : `关联 ${match.count} 次满意定稿`;
 
     // Render preset tags
     const tags = match.presetTags || ['双通道融合', '参数自适应'];
@@ -396,6 +559,8 @@ export function hidePredictiveOverlay() {
         container.classList.remove('active');
     }
     activeMatch = null;
+    activeSuggestion = null;
+    activeCompletionSource = null;
 }
 
 function applyAutocomplete() {
@@ -460,6 +625,8 @@ function applyAutocomplete() {
             crop: activeMatch.crop || null,
             aspectRatio: activeMatch.aspectRatio || null
         };
+
+        interactionAttributionRuntime.acceptPromptCompletion(activeCompletionSource);
 
         // 3) Show parameter auto-apply success toast with beautiful styling inside the input area wrap
         const tags = activeMatch.presetTags || ['双通道融合', '高保真参数'];

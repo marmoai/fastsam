@@ -4,9 +4,10 @@ import { dataURLToFile, fileToDataURL } from './utils.js';
 import { addTextNoteToWorkbench, restoreGroupLabelToWorkbench, addAtmosphereNode, addImageToWorkbench } from '../ui/workbench-core.js';
 import { sidebarState } from '../ui/sidebar.js';
 import { closeMagicWandModal } from '../ui/modals.js';
-import { saveSessionsToOSS, getSessionsFromOSS, uploadImageToOSS } from '../services/ossService.js';
+import { saveSessionsToOSS, getSessionsFromOSS, getSessionFromOSS, uploadImageToOSS } from '../services/ossService.js';
 import { updateHeader } from '../ui/header.js';
 import { runtime } from '../runtime/CoreRuntime';
+import { assetCatalog } from '../runtime/AssetCatalog';
 
 import localforage from 'localforage';
 
@@ -14,10 +15,45 @@ const sessionsMetaDB = localforage.createInstance({ name: 'MarmoAid', storeName:
 const sessionDataDB = localforage.createInstance({ name: 'MarmoAid', storeName: 'sessionData' });
 const assetsDB = localforage.createInstance({ name: 'MarmoAid', storeName: 'assets' });
 const imageCacheDB = localforage.createInstance({ name: 'MarmoAid', storeName: 'imageCache' });
+const LAST_ACTIVE_SESSION_STORAGE_KEY = 'marmo:last_active_session_id';
 
 const dbWorker = new Worker(new URL('./db-worker.js', import.meta.url), { type: 'module' });
 const pendingJobs = new Map();
 let jobIdCounter = 0;
+
+export function getLastActiveSessionId() {
+    try {
+        return typeof localStorage !== 'undefined'
+            ? (localStorage.getItem(LAST_ACTIVE_SESSION_STORAGE_KEY) || '')
+            : '';
+    } catch (error) {
+        console.warn('Failed to read last active session id:', error);
+        return '';
+    }
+}
+
+export function setLastActiveSessionId(sessionId) {
+    if (!sessionId) return;
+    try {
+        if (typeof localStorage !== 'undefined') {
+            localStorage.setItem(LAST_ACTIVE_SESSION_STORAGE_KEY, sessionId);
+        }
+    } catch (error) {
+        console.warn('Failed to persist last active session id:', error);
+    }
+}
+
+export function clearLastActiveSessionId(sessionId = '') {
+    try {
+        if (typeof localStorage === 'undefined') return;
+        const current = localStorage.getItem(LAST_ACTIVE_SESSION_STORAGE_KEY) || '';
+        if (!sessionId || current === sessionId) {
+            localStorage.removeItem(LAST_ACTIVE_SESSION_STORAGE_KEY);
+        }
+    } catch (error) {
+        console.warn('Failed to clear last active session id:', error);
+    }
+}
 
 function getSessionRevision(session) {
     if (!session || typeof session !== 'object') return 0;
@@ -204,6 +240,7 @@ function serializeNonRuntimeWorkbenchItems() {
             parentId: item.parentId,
             layerName: item.layerName,
             originalBbox: item.originalBbox,
+            sourceTextLayerId: item.sourceTextLayerId || null,
             key: item.key
         });
     });
@@ -215,13 +252,21 @@ function serializeCurrentRuntimeWorkspace() {
     const workspace = runtime.getCurrentWorkspace();
     if (!workspace) return null;
 
+    // runtimeDisplayUrl can be a page-local blob URL. It must never be
+    // persisted; sourceImage remains the durable OSS address.
+    const assets = workspace.currentState.assetRegistry.getAll().map(asset => {
+        const serializableAsset = { ...asset };
+        delete serializableAsset.runtimeDisplayUrl;
+        return serializableAsset;
+    });
+
     return {
         projectId: workspace.projectId,
         name: workspace.name,
         currentState: {
             stateId: workspace.currentState.stateId,
             canvasState: workspace.currentState.canvasState,
-            assets: workspace.currentState.assetRegistry.getAll(),
+            assets,
             nodes: workspace.currentState.sceneGraph.getNodes(),
             edges: workspace.currentState.sceneGraph.getAllEdges()
         },
@@ -348,6 +393,7 @@ const MEDIA_FIELD_NAMES = new Set([
     'dataUrl',
     'sourceImage',
     'originalDataUrl',
+    'segmentationSourceUrl',
     'cleanPlateDataUrl',
     'image',
     'mask',
@@ -360,6 +406,7 @@ const BLOB_TARGET_FIELD = {
     blob: 'dataUrl',
     sourceImageBlob: 'sourceImage',
     originalBlob: 'originalDataUrl',
+    segmentationSourceBlob: 'segmentationSourceUrl',
     cleanPlateBlob: 'cleanPlateDataUrl',
     maskBlob: 'mask',
     imageBlob: 'image',
@@ -406,6 +453,101 @@ function collectEmbeddedMediaUploadTasks(value, addTask, visited = new WeakSet()
     });
 }
 
+const INLINE_DATA_URL_PATTERN = /data:image\/(?:png|jpe?g|webp|gif|avif);base64,[A-Za-z0-9+/=_-]+/g;
+
+function collectInlineDataUrlUploadTasks(value, addInlineTask, visited = new WeakSet()) {
+    if (!value || typeof value !== 'object') return;
+    if (visited.has(value)) return;
+    visited.add(value);
+
+    if (Array.isArray(value)) {
+        value.forEach(item => collectInlineDataUrlUploadTasks(item, addInlineTask, visited));
+        return;
+    }
+
+    Object.entries(value).forEach(([key, child]) => {
+        // These fields are handled by the regular media walker. Scanning them
+        // again would create duplicate uploads and duplicate replacements.
+        if (MEDIA_FIELD_NAMES.has(key)) return;
+        if (typeof child === 'string' && child.includes('data:image/')) {
+            const matches = child.match(INLINE_DATA_URL_PATTERN);
+            if (matches?.length) {
+                addInlineTask(value, key, matches);
+                return;
+            }
+        }
+        if (child && typeof child === 'object') {
+            collectInlineDataUrlUploadTasks(child, addInlineTask, visited);
+        }
+    });
+}
+
+function replaceInlineDataUrlsInObject(value, replacements, visited = new WeakSet()) {
+    if (!value || typeof value !== 'object') return false;
+    if (visited.has(value)) return false;
+    visited.add(value);
+    let changed = false;
+
+    if (Array.isArray(value)) {
+        value.forEach(item => {
+            if (replaceInlineDataUrlsInObject(item, replacements, visited)) changed = true;
+        });
+        return changed;
+    }
+
+    Object.entries(value).forEach(([key, child]) => {
+        if (MEDIA_FIELD_NAMES.has(key)) return;
+        if (typeof child === 'string' && child.includes('data:image/')) {
+            let next = child;
+            replacements.forEach((replacement, source) => {
+                next = next.split(source).join(replacement);
+            });
+            if (next !== child) {
+                value[key] = next;
+                changed = true;
+            }
+            return;
+        }
+        if (child && typeof child === 'object') {
+            if (replaceInlineDataUrlsInObject(child, replacements, visited)) changed = true;
+        }
+    });
+    return changed;
+}
+
+function removeInlineDataUrlFallback(value, visited = new WeakSet()) {
+    if (!value || typeof value !== 'object') return;
+    if (visited.has(value)) return;
+    visited.add(value);
+
+    if (Array.isArray(value)) {
+        value.forEach(item => removeInlineDataUrlFallback(item, visited));
+        return;
+    }
+
+    Object.entries(value).forEach(([key, child]) => {
+        if (MEDIA_FIELD_NAMES.has(key)) return;
+        if (typeof child === 'string' && child.includes('data:image/')) {
+            value[key] = child.replace(INLINE_DATA_URL_PATTERN, '');
+            return;
+        }
+        if (child && typeof child === 'object') {
+            removeInlineDataUrlFallback(child, visited);
+        }
+    });
+}
+
+function removeIfEmbeddedMedia(obj, key) {
+    const value = obj?.[key];
+    if (typeof value !== 'string') {
+        delete obj[key];
+        return;
+    }
+    if (!value.startsWith('http://') && !value.startsWith('https://')) {
+        delete obj[key];
+    }
+}
+
 function pruneLayerForCloud(layer) {
     if (!layer || typeof layer !== 'object') return;
 
@@ -417,17 +559,6 @@ function pruneLayerForCloud(layer) {
     delete layer.sourceImageBlob;
     delete layer.originalBlob;
     delete layer.cleanPlateBlob;
-
-    const removeIfEmbeddedMedia = (obj, key) => {
-        const value = obj?.[key];
-        if (typeof value !== 'string') {
-            delete obj[key];
-            return;
-        }
-        if (!value.startsWith('http://') && !value.startsWith('https://')) {
-            delete obj[key];
-        }
-    };
 
     removeIfEmbeddedMedia(layer, 'image');
     removeIfEmbeddedMedia(layer, 'mask');
@@ -459,6 +590,24 @@ function pruneLayerForCloud(layer) {
 function pruneSemanticViewsForCloud(semanticViews, rank) {
     if (!semanticViews || typeof semanticViews !== 'object') return;
     delete semanticViews.layerGraph;
+
+    if (Array.isArray(semanticViews.completionAssets)) {
+        semanticViews.completionAssets = semanticViews.completionAssets.map(asset => {
+            const slimAsset = { ...asset };
+            if (slimAsset.observedCutout) {
+                slimAsset.observedCutout = { ...slimAsset.observedCutout };
+                removeIfEmbeddedMedia(slimAsset.observedCutout, 'cutoutUrl');
+                removeIfEmbeddedMedia(slimAsset.observedCutout, 'maskUrl');
+            }
+            if (slimAsset.canonicalAsset) {
+                slimAsset.canonicalAsset = { ...slimAsset.canonicalAsset };
+                removeIfEmbeddedMedia(slimAsset.canonicalAsset, 'cutoutUrl');
+                removeIfEmbeddedMedia(slimAsset.canonicalAsset, 'maskUrl');
+                removeIfEmbeddedMedia(slimAsset.canonicalAsset, 'previewUrl');
+            }
+            return slimAsset;
+        });
+    }
 
     if (Array.isArray(semanticViews.editableSceneLayers)) {
         semanticViews.editableSceneLayers.forEach(pruneLayerForCloud);
@@ -574,7 +723,7 @@ export const dbHelper = {
         return Promise.resolve();
     },
     
-    async saveSession(session) {
+    async saveSession(session, options = {}) {
         try {
             const now = Date.now();
             if (!session.timestamp) {
@@ -667,10 +816,25 @@ export const dbHelper = {
             // 3. Save heavy data
             await sessionDataDB.setItem(session.id, processedSession);
 
-            // 4. 同步到云端
-            this.syncSessionsToCloud();
+            // Keep a lightweight cross-project index. The catalog stores only
+            // IDs and metadata; image payloads remain in sessionDataDB/OSS.
+            await assetCatalog.upsertWorkspaceSnapshot(nextSession.runtimeWorkspace?.currentState ? {
+                projectId: nextSession.runtimeWorkspace.projectId || session.id,
+                projectName: nextSession.runtimeWorkspace.name || session.title || session.id,
+                assets: nextSession.runtimeWorkspace.currentState.assets || []
+            } : { projectId: session.id, projectName: session.title || session.id, assets: [] });
+
+            // 4. 普通保存继续使用延迟同步；撤销/重做恢复会显式等待
+            // 立即同步，确保刷新时不会读到恢复前的 runtimeWorkspace。
+            if (options.syncImmediately) {
+                await this.syncSessionsToCloud({ immediate: true });
+            } else {
+                this.syncSessionsToCloud();
+            }
+            return true;
         } catch (e) {
             console.error('Failed to save session to DB:', e);
+            return false;
         }
     },
     
@@ -700,10 +864,64 @@ export const dbHelper = {
             return null;
         }
     },
+    async rebuildAssetCatalog(sessionMetas = null) {
+        try {
+            const metas = Array.isArray(sessionMetas) ? sessionMetas : await this.getAllSessions();
+            let indexedAssetCount = 0;
+            for (const meta of metas) {
+                const session = await this.getSessionData(meta.id);
+                const runtimeWorkspace = session?.runtimeWorkspace;
+                if (!runtimeWorkspace?.currentState) continue;
+                const assets = Array.isArray(runtimeWorkspace.currentState.assets)
+                    ? runtimeWorkspace.currentState.assets
+                    : [];
+                await assetCatalog.upsertWorkspaceSnapshot({
+                    projectId: runtimeWorkspace.projectId || session.id || meta.id,
+                    projectName: runtimeWorkspace.name || session.title || meta.title || meta.id,
+                    assets
+                });
+                indexedAssetCount += assets.length;
+            }
+            return indexedAssetCount;
+        } catch (error) {
+            console.error('Failed to rebuild asset catalog:', error);
+            return 0;
+        }
+    },
+    async restoreSessionDataFromCloud(sessionId) {
+        try {
+            const cloudSession = await getSessionFromOSS(sessionId);
+            if (!cloudSession) return null;
+
+            const meta = {
+                id: cloudSession.id || sessionId,
+                title: cloudSession.title || '未命名项目',
+                timestamp: cloudSession.timestamp || Date.now(),
+                updatedAt: cloudSession.updatedAt || cloudSession.timestamp || Date.now(),
+                isAutoRenamed: !!cloudSession.isAutoRenamed
+            };
+            await sessionsMetaDB.setItem(sessionId, meta);
+            const processedSession = await runWorkerJob('serializeSession', cloudSession);
+            await sessionDataDB.setItem(sessionId, processedSession);
+            if (cloudSession.runtimeWorkspace?.currentState) {
+                await assetCatalog.upsertWorkspaceSnapshot({
+                    projectId: cloudSession.runtimeWorkspace.projectId || sessionId,
+                    projectName: cloudSession.runtimeWorkspace.name || cloudSession.title || sessionId,
+                    assets: cloudSession.runtimeWorkspace.currentState.assets || []
+                });
+            }
+            return cloudSession;
+        } catch (error) {
+            console.error(`Failed to restore session ${sessionId} from cloud:`, error);
+            return null;
+        }
+    },
     async deleteSession(sessionId) {
         try {
             await sessionsMetaDB.removeItem(sessionId);
             await sessionDataDB.removeItem(sessionId);
+            await assetCatalog.removeProject(sessionId);
+            clearLastActiveSessionId(sessionId);
             // 删除需要尽快同步到云端，避免其他设备继续恢复旧项目
             await this.syncSessionsToCloud({ immediate: true });
         } catch (e) {
@@ -713,9 +931,21 @@ export const dbHelper = {
     // --- NEW: Cloud Sync Functions ---
     _syncTimer: null,
     _syncInFlight: null,
+    _syncQueuedPromise: null,
     async _performSessionsCloudSync() {
         if (this._syncInFlight) {
-            return this._syncInFlight;
+            // A save can happen while an older, potentially stale payload is
+            // still uploading. Queue exactly one follow-up sync so the latest
+            // local session always gets a chance to replace that payload.
+            if (!this._syncQueuedPromise) {
+                const activeSync = this._syncInFlight;
+                this._syncQueuedPromise = activeSync
+                    .then(() => this._performSessionsCloudSync())
+                    .finally(() => {
+                        this._syncQueuedPromise = null;
+                    });
+            }
+            return this._syncQueuedPromise;
         }
 
         this._syncInFlight = (async () => {
@@ -747,6 +977,8 @@ export const dbHelper = {
                     const cloudData = prepareSessionForCloudPayload(data, fullSessions.length);
 
                     const uploadTasks = [];
+                    const inlineReplacements = new Map();
+                    const inlineUploadCache = new Map();
                     const addTask = (obj, sourceProp, targetProp, isBase64 = false, fallbackPrefix = '', sessionId = meta.id) => {
                         let sourceData = obj[sourceProp];
                         if (!sourceData) return;
@@ -755,7 +987,10 @@ export const dbHelper = {
                                 if (isBase64 && typeof sourceData === 'string' && !sourceData.startsWith('data:') && !sourceData.startsWith('http') && sourceData.length > 1000) {
                                     sourceData = fallbackPrefix + sourceData;
                                 }
-                                const url = await uploadImageToOSS(sourceData, { sessionId });
+                                const url = await uploadImageToOSS(sourceData, {
+                                    sessionId,
+                                    preserveOriginal: targetProp === 'segmentationSourceUrl'
+                                });
                                 obj[targetProp] = url;
                                 if (sourceProp !== targetProp) {
                                     delete obj[sourceProp];
@@ -768,6 +1003,32 @@ export const dbHelper = {
                     };
 
                     collectEmbeddedMediaUploadTasks(cloudData, addTask);
+                    collectInlineDataUrlUploadTasks(cloudData, (obj, key, matches) => {
+                        uploadTasks.push(async () => {
+                            let next = String(obj[key] || '');
+                            for (const sourceData of new Set(matches)) {
+                                let url = inlineUploadCache.get(sourceData);
+                                if (!url) {
+                                    try {
+                                        url = await uploadImageToOSS(sourceData, { sessionId: meta.id });
+                                        inlineUploadCache.set(sourceData, url || '');
+                                    } catch (error) {
+                                        console.error('Failed to upload inline HTML media:', error);
+                                        url = '';
+                                        inlineUploadCache.set(sourceData, url);
+                                    }
+                                }
+                                if (url) {
+                                    inlineReplacements.set(sourceData, url);
+                                    next = next.split(sourceData).join(url);
+                                } else {
+                                    next = next.split(sourceData).join('');
+                                }
+                            }
+                            obj[key] = next;
+                            changed = true;
+                        });
+                    });
                     
                     // 处理消息中的图片
                     if (cloudData.messages) {
@@ -798,6 +1059,12 @@ export const dbHelper = {
                                 addTask(item, 'originalBlob', 'originalDataUrl');
                             } else if (item.originalDataUrl && item.originalDataUrl.startsWith('data:')) {
                                 addTask(item, 'originalDataUrl', 'originalDataUrl');
+                            }
+
+                            if (item.segmentationSourceBlob) {
+                                addTask(item, 'segmentationSourceBlob', 'segmentationSourceUrl');
+                            } else if (item.segmentationSourceUrl && item.segmentationSourceUrl.startsWith('data:')) {
+                                addTask(item, 'segmentationSourceUrl', 'segmentationSourceUrl');
                             }
 
                             if (item.cleanPlateBlob) {
@@ -833,6 +1100,9 @@ export const dbHelper = {
                     // 处理 runtime 工作台快照中的图片资产
                     if (cloudData.runtimeWorkspace?.currentState?.assets) {
                         for (const asset of cloudData.runtimeWorkspace.currentState.assets) {
+                            // This is only a current-page preview URL. Never
+                            // send a blob URL to local or cloud persistence.
+                            delete asset.runtimeDisplayUrl;
                             if (asset.sourceImageBlob) {
                                 addTask(asset, 'sourceImageBlob', 'sourceImage');
                             } else if (asset.sourceImage && asset.sourceImage.startsWith('data:')) {
@@ -842,6 +1112,11 @@ export const dbHelper = {
                                 addTask(asset, 'originalBlob', 'originalDataUrl');
                             } else if (asset.originalDataUrl && asset.originalDataUrl.startsWith('data:')) {
                                 addTask(asset, 'originalDataUrl', 'originalDataUrl');
+                            }
+                            if (asset.segmentationSourceBlob) {
+                                addTask(asset, 'segmentationSourceBlob', 'segmentationSourceUrl');
+                            } else if (asset.segmentationSourceUrl && asset.segmentationSourceUrl.startsWith('data:')) {
+                                addTask(asset, 'segmentationSourceUrl', 'segmentationSourceUrl');
                             }
                             if (asset.cleanPlateBlob) {
                                 addTask(asset, 'cleanPlateBlob', 'cleanPlateDataUrl');
@@ -868,20 +1143,40 @@ export const dbHelper = {
                         }
                     }
 
-                    // Execute all captured uploads in chunks of 8 concurrent requests
+                    // The OSS upload endpoint rate-limits bursts. uploadImageToOSS
+                    // also has a global queue, but keep this loop sequential so a
+                    // large historical session cannot create an upload burst.
                     if (uploadTasks.length > 0) {
-                        const chunkSize = 8;
+                        const chunkSize = 1;
                         for (let i = 0; i < uploadTasks.length; i += chunkSize) {
                             const chunk = uploadTasks.slice(i, i + chunkSize);
                             await Promise.all(chunk.map(task => task()));
                         }
                     }
+
+                    // Repair sessions that already contain a Motion HTML
+                    // payload with embedded Base64, so the next sync does not
+                    // rediscover and resend the same oversized content.
+                    if (inlineReplacements.size > 0) {
+                        if (replaceInlineDataUrlsInObject(data, inlineReplacements)) {
+                            changed = true;
+                        }
+                    }
+
+                    // Also scrub unresolved inline media from the local copy.
+                    // Otherwise every later save would rehydrate the old HTML
+                    // and retry the same oversized request forever.
+                    removeInlineDataUrlFallback(data);
                     
                     if (changed) {
                         await sessionDataDB.setItem(meta.id, data);
                     }
 
                     removeEmbeddedMediaFallback(cloudData);
+                    // If an upload failed, never send the original Base64 in
+                    // the JSON request. The preview may lose that media, but
+                    // cloud sync must remain below the gateway limit.
+                    removeInlineDataUrlFallback(cloudData);
 
                     const mergedSession = { ...meta, ...cloudData };
                     const mergedContent = getSessionContentSummary(mergedSession);
@@ -956,51 +1251,20 @@ export const dbHelper = {
                     continue;
                 }
 
-                const localRawData = await sessionDataDB.getItem(session.id);
-                let localSession = null;
-                if (localRawData) {
-                    try {
-                        localSession = await runWorkerJob('deserializeSession', localRawData);
-                    } catch (error) {
-                        console.warn(`Failed to inspect local session ${session.id} before cloud restore:`, error);
-                    }
-                }
-
-                const localContent = getSessionContentSummary(localSession || localMeta);
-                const cloudContent = getSessionContentSummary(session);
-                const cloudLooksEmpty = !cloudContent.hasContent;
-                const localHasMeaningfulContent = localContent.hasContent;
-
-                if (localHasMeaningfulContent && cloudLooksEmpty) {
-                    console.warn(`Skipping cloud overwrite for session ${session.id} because cloud copy is empty while local copy has content.`);
-                    continue;
-                }
-
-                const mergedCloudSession = { ...session };
-                if (localSession && localContent.messageCount > cloudContent.messageCount) {
-                    mergedCloudSession.messages = cloneValue(localSession.messages) || [];
-                }
-                if (
-                    localSession &&
-                    localContent.renderableRuntimeAssetCount > cloudContent.renderableRuntimeAssetCount &&
-                    Array.isArray(localSession.runtimeWorkspace?.currentState?.assets)
-                ) {
-                    mergedCloudSession.runtimeWorkspace = cloneWorkspaceSnapshot(localSession.runtimeWorkspace);
-                }
-
-                // 1. 保存元数据
+                // 启动阶段只同步清单。详情保持本地缓存；若云端更新，则丢弃
+                // 旧详情，等用户真正打开该会话时再按 sessionId 下载。
                 const meta = {
-                    id: mergedCloudSession.id,
-                    title: mergedCloudSession.title,
-                    timestamp: mergedCloudSession.timestamp,
-                    updatedAt: mergedCloudSession.updatedAt || mergedCloudSession.timestamp,
-                    isAutoRenamed: mergedCloudSession.isAutoRenamed || false
+                    id: session.id,
+                    title: session.title || '未命名项目',
+                    timestamp: session.timestamp,
+                    updatedAt: session.updatedAt || session.timestamp,
+                    isAutoRenamed: !!session.isAutoRenamed
                 };
                 await sessionsMetaDB.setItem(session.id, meta);
-                
-                // 2. 保存详细数据（需要序列化）
-                const processedSession = await runWorkerJob('serializeSession', mergedCloudSession);
-                await sessionDataDB.setItem(session.id, processedSession);
+                if (cloudRevision > localRevision) {
+                    await sessionDataDB.removeItem(session.id);
+                    await assetCatalog.removeProject(session.id);
+                }
             }
 
             if (pruneMissingLocal && cloudSessions.length > 0) {
@@ -1017,6 +1281,7 @@ export const dbHelper = {
                     console.log(`Pruning locally cached session ${localMeta.id} because it no longer exists in cloud.`);
                     await sessionsMetaDB.removeItem(localMeta.id);
                     await sessionDataDB.removeItem(localMeta.id);
+                    await assetCatalog.removeProject(localMeta.id);
                 }
             }
             
@@ -1031,32 +1296,14 @@ export const dbHelper = {
             const metaSessions = await this.getAllSessions();
             if (!metaSessions.length) return null;
 
-            let bestSession = null;
-            let bestScore = -1;
-            let bestRevision = -1;
-
-            for (const meta of metaSessions) {
-                const fullSession = await this.getSessionData(meta.id);
-                const mergedSession = { ...meta, ...(fullSession || {}) };
-                const content = getSessionContentSummary(mergedSession);
-                const revision = getSessionRevision(mergedSession);
-
-                const sessionRef = state.sessions.find(session => session.id === meta.id);
-                if (sessionRef) {
-                    Object.assign(sessionRef, mergedSession);
-                }
-
-                if (
-                    content.score > bestScore ||
-                    (content.score === bestScore && revision > bestRevision)
-                ) {
-                    bestSession = mergedSession;
-                    bestScore = content.score;
-                    bestRevision = revision;
+            const lastActiveSessionId = getLastActiveSessionId();
+            if (lastActiveSessionId) {
+                const matchedMeta = metaSessions.find(session => session.id === lastActiveSessionId);
+                if (matchedMeta) {
+                    return matchedMeta;
                 }
             }
-
-            return bestSession || metaSessions[0];
+            return metaSessions[0];
         } catch (error) {
             console.error('Failed to determine best session to open:', error);
             return null;
@@ -1204,17 +1451,8 @@ export async function loadSession(sessionId) {
     '</defs>';
     workbenchGrid.appendChild(svgLayer);
 
-    // 2. 检查并确保视口层 (#workbench) 存在空状态提示
-    if (!document.querySelector('#workbench > .empty-workbench-state')) {
-        const emptyState = document.createElement('div');
-        emptyState.className = 'empty-workbench-state';
-        emptyState.innerHTML = `
-            <i class="fas fa-image"></i>
-            <p>上传或生成的图片将出现在这里</p>
-            <p style="font-size: 12px; margin-top: 10px;">拖拽图片重叠可触发融合反应</p>
-        `;
-        document.getElementById('workbench').appendChild(emptyState);
-    }
+    // The workbench item module owns the single empty-state placeholder.
+    window.syncWorkbenchEmptyState?.();
 
     state.mainImageFile = null;
     state.referenceImageFiles = [];
@@ -1234,17 +1472,16 @@ export async function loadSession(sessionId) {
         // Fetch full data if not already loaded
         if (!session.messages) {
             const fullSession = await dbHelper.getSessionData(sessionId);
-            if (fullSession) {
-                Object.assign(session, fullSession);
-            } else {
-                session.messages = [];
-            }
+            const cloudSession = fullSession || await dbHelper.restoreSessionDataFromCloud(sessionId);
+            if (cloudSession) Object.assign(session, cloudSession);
+            else session.messages = [];
         }
         if (!Array.isArray(session.messages)) {
             session.messages = [];
         }
         
         state.currentSessionId = sessionId;
+        setLastActiveSessionId(sessionId);
         updateHeader(session);
         
         if (typeof window.renderHistoryList === 'function') {
@@ -1347,6 +1584,7 @@ export async function loadSession(sessionId) {
                                 semanticViews: itemState.semanticViews,
                                 hasFullSemanticAnalysis: itemState.hasFullSemanticAnalysis,
                                 originalDataUrl: itemState.originalDataUrl,
+                                segmentationSourceUrl: itemState.segmentationSourceUrl,
                                 cleanPlateDataUrl: itemState.cleanPlateDataUrl,
                                 cleanPlateStatus: itemState.cleanPlateStatus
                             });

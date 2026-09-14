@@ -1,7 +1,8 @@
 import { state } from '../../core/state.js';
 import { editOrQueryImageWithGemini } from '../../ai-services/skills-engine.js';
-import { dataURLToFile, fileToBase64, getProxiedUrl, RECOGNIZE_BACKEND_URL } from '../../core/utils.js';
-import { getCleanupLayerForEditableLayer } from '../../services/semantic-layer-views.js';
+import { dataURLToFile, fileToBase64, getImageDimensions, getProxiedUrl, RECOGNIZE_BACKEND_URL } from '../../core/utils.js';
+import { getCleanupLayerForEditableLayer, getBackgroundSemanticHint } from '../../services/semantic-layer-views.js';
+import { getImageModel, isQwenImageFamilyModel } from '../../ai-services/gemini-client.js';
 
 // We'll need functions to generate mask, cutout, etc.
 // For now, we'll simulate the generation or use basic Gemini calls.
@@ -20,7 +21,7 @@ function stripDataUrlPrefix(dataUrl) {
     return commaIndex >= 0 ? dataUrl.slice(commaIndex + 1) : dataUrl;
 }
 
-async function callExperimentalCleanPlateRouter({ mode, prompt, image, image2 = null, image3 = null, num_inference_steps = 40, cfg = 4, size = null, seed = null, negative_prompt = null }) {
+async function callExperimentalCleanPlateRouter({ model = null, mode, prompt, image, image2 = null, image3 = null, num_inference_steps = 40, cfg = 4, size = null, seed = null, negative_prompt = null }) {
     const payload = {
         mode,
         prompt,
@@ -28,6 +29,7 @@ async function callExperimentalCleanPlateRouter({ mode, prompt, image, image2 = 
         num_inference_steps,
         cfg
     };
+    if (model) payload.model = model;
     if (image2) payload.image2 = stripDataUrlPrefix(image2);
     if (image3) payload.image3 = stripDataUrlPrefix(image3);
     if (size) payload.size = size;
@@ -72,9 +74,19 @@ async function callExperimentalCleanPlateRouter({ mode, prompt, image, image2 = 
 }
 
 function getSelectedCleanPlateModelMode() {
-    if (state.selectedModel === 'qwen-cleanplate') return 'qwen-cleanplate';
-    if (state.selectedModel === 'gpt-image-2') return 'gpt-image-2';
-    return 'gemini';
+    return getImageModel();
+}
+
+async function getExactCleanPlateOutputSize(imageSource) {
+    try {
+        const { width, height } = await getImageDimensions(imageSource);
+        if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
+            return `${Math.round(width)}*${Math.round(height)}`;
+        }
+    } catch (error) {
+        console.warn('[clean plate] Could not read input dimensions; upstream default size may be used:', error);
+    }
+    return null;
 }
 
 function isTextCleanupLayer(layer) {
@@ -148,13 +160,156 @@ function buildQwenObjectRemovalPrompt(layers, customPromptHint = '') {
     return `把图中的${targetLabel}素材去除掉，只移除这些目标本身，保持其他排版、文字、装饰、背景纹理、光影和剩余内容不变。${hint}`.trim();
 }
 
+function buildGptImage2FullCleanPlatePrompt(customPromptHint = '', options = {}) {
+    const hint = customPromptHint ? `Additional hint: ${customPromptHint}` : '';
+    const backgroundHint = options.backgroundHint
+        ? `Recognized background reference: ${options.backgroundHint}`
+        : '';
+    const referenceHint = options.backgroundReferenceImage
+        ? 'Additional reference image: a real background sample from the same source image. Match its stripe pattern, wave lines, texture flow, and decorative details when extending the background.'
+        : '';
+    return `
+        [TASK: FULL CLEAN PLATE]
+        Remove all foreground content inside the masked regions and keep only the original background.
+        The correct background already exists in the visible unmasked parts of the image. You must extend and continue that SAME background through the masked regions.
+        ${backgroundHint}
+        ${referenceHint}
+        Preserve the exact existing background color palette, texture, pattern, lighting, gradients, and graphic structure already visible outside the mask.
+        If the recognized background reference mentions a poster background, menu background, flat design backdrop, color field, gradient, or graphic texture, preserve that exact 2D design language instead of converting it into a new material surface.
+        If the background contains a specific decorative graphic pattern, continue that exact pattern seamlessly. Do not redesign the poster or invent a new background style.
+        Do not introduce dark wood, black boards, paper textures, table surfaces, new colors, new materials, new objects, or any new text.
+        Leave unmasked regions visually unchanged.
+        ${hint}
+    `.trim();
+}
+
+function buildGptImage2SimpleSceneCleanPlatePrompt() {
+    return `
+        Remove all foreground elements from this image, including product photos, text, logos, cards, badges, price labels, decorative panels, and color blocks.
+        Preserve only the original background and extend it naturally through the cleared regions.
+        Do not generate new objects, new materials, or a new background style.
+        Keep the final image as a clean background plate.
+    `.trim();
+}
+
 function areAllTextCleanupLayers(layers) {
     const cleanupLayers = Array.isArray(layers) ? layers.filter(Boolean) : [];
     return cleanupLayers.length > 0 && cleanupLayers.every(isTextCleanupLayer);
 }
 
+function buildMergedCleanupBounds(mergedGroups = [], canvasWidth = 0, canvasHeight = 0) {
+    if (!Array.isArray(mergedGroups) || mergedGroups.length === 0 || !canvasWidth || !canvasHeight) return null;
+    let minX = canvasWidth;
+    let minY = canvasHeight;
+    let maxX = 0;
+    let maxY = 0;
+
+    mergedGroups.forEach(group => {
+        if (!group) return;
+        const expandX = group.isText
+            ? Math.min(Math.max(group.w * 0.12, 28), 90)
+            : Math.min(Math.max(group.w * 0.05, 20), 50);
+        const expandTop = group.isText
+            ? Math.min(Math.max(group.h * 0.28, 28), 90)
+            : Math.min(Math.max(group.h * 0.10, 20), 50);
+        const expandBottom = group.isText
+            ? Math.min(Math.max(group.h * 0.22, 28), 90)
+            : Math.min(Math.max(group.h * 0.10, 20), 50);
+
+        const outerX = Math.max(0, group.x - expandX);
+        const outerY = Math.max(0, group.y - expandTop);
+        const rightEdge = Math.min(canvasWidth, group.x + group.w + expandX);
+        const bottomEdge = Math.min(canvasHeight, group.y + group.h + expandBottom);
+
+        minX = Math.min(minX, outerX);
+        minY = Math.min(minY, outerY);
+        maxX = Math.max(maxX, rightEdge);
+        maxY = Math.max(maxY, bottomEdge);
+    });
+
+    if (maxX <= minX || maxY <= minY) return null;
+    return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+}
+
+async function buildBackgroundReferenceImage(baseBackgroundUrl, exclusionBounds = null) {
+    let img = null;
+    let sourceCanvas = null;
+    let collageCanvas = null;
+    try {
+        img = await loadImage(baseBackgroundUrl);
+        if (!img) return null;
+
+        sourceCanvas = document.createElement('canvas');
+        sourceCanvas.width = img.width;
+        sourceCanvas.height = img.height;
+        const sourceCtx = sourceCanvas.getContext('2d');
+        sourceCtx.drawImage(img, 0, 0);
+
+        const patches = [];
+        const patchWidth = Math.max(96, Math.floor(img.width * 0.18));
+        const patchHeight = Math.max(96, Math.floor(img.height * 0.18));
+        const margin = 20;
+        const candidates = [
+            { x: margin, y: margin },
+            { x: Math.max(margin, img.width - patchWidth - margin), y: margin },
+            { x: margin, y: Math.max(margin, img.height - patchHeight - margin) },
+            { x: Math.max(margin, img.width - patchWidth - margin), y: Math.max(margin, img.height - patchHeight - margin) },
+            { x: Math.max(margin, Math.floor((img.width - patchWidth) / 2)), y: margin },
+            { x: Math.max(margin, Math.floor((img.width - patchWidth) / 2)), y: Math.max(margin, img.height - patchHeight - margin) }
+        ];
+
+        const intersects = (a, b) => {
+            if (!a || !b) return false;
+            return !(a.x + a.width <= b.x || b.x + b.width <= a.x || a.y + a.height <= b.y || b.y + b.height <= a.y);
+        };
+
+        candidates.forEach(candidate => {
+            const rect = { ...candidate, width: patchWidth, height: patchHeight };
+            if (exclusionBounds && intersects(rect, exclusionBounds)) return;
+            patches.push(rect);
+        });
+
+        if (!patches.length) {
+            return null;
+        }
+
+        collageCanvas = document.createElement('canvas');
+        collageCanvas.width = patchWidth * Math.min(3, patches.length);
+        collageCanvas.height = patchHeight * Math.ceil(patches.length / 3);
+        const collageCtx = collageCanvas.getContext('2d');
+        collageCtx.fillStyle = '#ffffff';
+        collageCtx.fillRect(0, 0, collageCanvas.width, collageCanvas.height);
+
+        patches.forEach((patch, index) => {
+            const dx = (index % 3) * patchWidth;
+            const dy = Math.floor(index / 3) * patchHeight;
+            collageCtx.drawImage(
+                sourceCanvas,
+                patch.x,
+                patch.y,
+                patch.width,
+                patch.height,
+                dx,
+                dy,
+                patchWidth,
+                patchHeight
+            );
+        });
+
+        const dataUrl = collageCanvas.toDataURL('image/png');
+        return dataUrl;
+    } catch (error) {
+        console.warn('[clean plate] Failed to build background reference image:', error);
+        return null;
+    } finally {
+        releaseCanvasResource(sourceCanvas);
+        releaseCanvasResource(collageCanvas);
+        releaseImageResource(img);
+    }
+}
+
 function shouldUseQwenSemanticCleanPlate(layers) {
-    if (getSelectedCleanPlateModelMode() !== 'qwen-cleanplate' || !USE_EXPERIMENTAL_CLEAN_PLATE_TEST_ROUTER) {
+    if (!isQwenImageFamilyModel(getSelectedCleanPlateModelMode()) || !USE_EXPERIMENTAL_CLEAN_PLATE_TEST_ROUTER) {
         return false;
     }
     const cleanupLayers = Array.isArray(layers) ? layers.filter(Boolean) : [];
@@ -246,7 +401,10 @@ export async function extractLayerAsset(itemId, layerIndex) {
         
         const baseBg = item.cleanPlateDataUrl || item.originalDataUrl || item.dataUrl;
         const cleanupLayer = getCleanupLayerForEditableLayer(item, layer, { preferEditableTextBbox: true });
-        const cleanedBg = await cleanBackground(baseBg, cleanupLayer);
+        const cleanedBg = await cleanBackground(baseBg, {
+            ...cleanupLayer,
+            backgroundHint: getBackgroundSemanticHint(item)
+        });
         
         if (cleanedBg) {
             item.cleanPlateDataUrl = cleanedBg;
@@ -275,6 +433,28 @@ export async function editLayerAsset(itemId, layerIndex, prompt) {
     
     const layer = item.scene.layers[layerIndex];
     if (!layer || layer.interactionLock?.editingDisabled || layer.assetStatus === 'processing') return;
+
+    // If Magic Layers already materialized this semantic layer as a standalone
+    // Workbench asset, edit that asset in place. The legacy full-scene repaint
+    // remains the path for layers that have not been split out yet.
+    const splitChild = [...state.workbenchItems.entries()].find(([, candidate]) => {
+        if (!candidate || candidate.parentId !== itemId) return false;
+        if (!Array.isArray(candidate.originalBbox) || candidate.originalBbox.length !== 4) return false;
+        if (!['layer-explode', 'layer-extract', 'isolated-edit', 'extraction'].includes(String(candidate.type || '').toLowerCase())) return false;
+        if (candidate.layerName && candidate.layerName === layer.name) return true;
+        return Array.isArray(layer.bbox) && candidate.originalBbox.every((value, index) =>
+            Math.abs(Number(value) - Number(layer.bbox[index])) <= 2
+        );
+    });
+    if (splitChild && typeof window.handleIsolatedAssetEdit === 'function') {
+        await window.handleIsolatedAssetEdit(splitChild[0], prompt, {
+            replaceCurrent: true,
+            parentItemId: itemId,
+            parentItem: item,
+            source: 'semantic_layer_edit'
+        });
+        return;
+    }
     
     console.log(`EDITING LAYER: ${layer.name}, status: ${layer.assetStatus}`);
 
@@ -493,6 +673,28 @@ async function loadImage(src) {
     });
 }
 
+function releaseImageResource(image) {
+    if (!image) return;
+    image.onload = null;
+    image.onerror = null;
+    try {
+        image.src = '';
+    } catch (error) {
+        // Temporary decoded images have no durable owner.
+    }
+}
+
+function releaseCanvasResource(canvas) {
+    if (!canvas) return;
+    try {
+        canvas.width = 1;
+        canvas.height = 1;
+        canvas.getContext('2d')?.clearRect(0, 0, 1, 1);
+    } catch (error) {
+        // Releasing a temporary backing store is best effort.
+    }
+}
+
 /**
  * 导出当前场景合成图 (V2.4)
  * 将背景和所有已就绪的图层合成一张图，作为 AI 编辑的底图
@@ -564,14 +766,16 @@ export async function cleanMultipleBackgrounds(baseBackgroundUrl, layers, custom
     }
     const names = layers.map(l => l.name).join('、');
     console.log(`[cleanMultipleBackgrounds] Starting for layers: ${names}`);
+    let img = null;
+    let canvas = null;
     try {
-        const img = await loadImage(baseBackgroundUrl);
+        img = await loadImage(baseBackgroundUrl);
         if (!img) {
             console.error("[cleanMultipleBackgrounds] Failed to load base background image");
             return null;
         }
 
-        const canvas = document.createElement('canvas');
+        canvas = document.createElement('canvas');
         canvas.width = img.width;
         canvas.height = img.height;
         const ctx = canvas.getContext('2d');
@@ -617,6 +821,11 @@ export async function cleanMultipleBackgrounds(baseBackgroundUrl, layers, custom
         }
         
         console.log(`[cleanMultipleBackgrounds] Grouped ${layers.length} layers into ${mergedGroups.length} spatial clusters.`);
+        const useSimpleSceneCleanPlatePrompt = options.useSimpleSceneCleanPlatePrompt === true;
+        const cleanupBounds = buildMergedCleanupBounds(mergedGroups, canvas.width, canvas.height);
+        const backgroundReferenceImage = useSimpleSceneCleanPlatePrompt
+            ? null
+            : (options.backgroundReferenceImage || await buildBackgroundReferenceImage(baseBackgroundUrl, cleanupBounds));
 
         ctx.fillStyle = 'white';
         // Draw the mask based on the combined bounding box of the entire group.
@@ -657,8 +866,18 @@ export async function cleanMultipleBackgrounds(baseBackgroundUrl, layers, custom
 
         const promptHintText = customPromptHint ? `(Hint: ${customPromptHint})` : '';
         const preserveBackgroundOnly = options.preserveBackgroundOnly === true;
+        const shouldUseQwen = shouldUseQwenSemanticCleanPlate(layers);
+        const outputSize = shouldUseQwen ? await getExactCleanPlateOutputSize(baseBackgroundUrl) : null;
+        const nextOptions = {
+            ...options,
+            backgroundReferenceImage
+        };
         const prompt = preserveBackgroundOnly
-            ? buildQwenSemanticCleanPlatePrompt(layers, customPromptHint, { preserveBackgroundOnly: true })
+            ? (shouldUseQwen
+                ? buildQwenSemanticCleanPlatePrompt(layers, customPromptHint, { preserveBackgroundOnly: true })
+                : (useSimpleSceneCleanPlatePrompt
+                    ? buildGptImage2SimpleSceneCleanPlatePrompt()
+                    : buildGptImage2FullCleanPlatePrompt(customPromptHint, nextOptions)))
             : `
                 [TASK: BULK CLEAN PLATE / TEXT AND OBJECT REMOVAL]
                 The provided mask contains ${mergedGroups.length} large solid white blocks covering specific target areas.
@@ -675,29 +894,36 @@ export async function cleanMultipleBackgrounds(baseBackgroundUrl, layers, custom
                 Return the full image with the contents of the masked areas utterly removed and the background perfectly healed (彻底抹去图层内容，无痕修复背景).
             `;
 
-        const shouldUseQwen = shouldUseQwenSemanticCleanPlate(layers);
         const result = shouldUseQwen
             ? await callExperimentalCleanPlateRouter(
                 {
+                    model: getSelectedCleanPlateModelMode(),
                     mode: 'clean_plate_test_edit',
                     prompt: `[CLEAN_MULTIPLE_BACKGROUNDS] ${buildQwenSemanticCleanPlatePrompt(layers, customPromptHint, options)}`,
                     image: baseBackgroundUrl,
                     num_inference_steps: 40,
-                    cfg: 4
+                    cfg: 4,
+                    size: outputSize
                 }
             )
             : await editOrQueryImageWithGemini(
                 `[CLEAN_MULTIPLE_BACKGROUNDS] ${prompt}`,
                 baseBackgroundUrl,
-                [],
+                backgroundReferenceImage ? [backgroundReferenceImage] : [],
                 featheredMaskUrl,
                 null,
-                false // forceMaterialTask = false for removal
+                false, // forceMaterialTask = false for removal
+                { overrideImageModel: getSelectedCleanPlateModelMode() }
             );
 
         if (result && result.success && result.imageData) {
             console.log(`[cleanMultipleBackgrounds] Successfully cleaned background for ${names}`);
-            return `data:${result.mimeType};base64,${result.imageData}`;
+            const cleanedDataUrl = `data:${result.mimeType};base64,${result.imageData}`;
+            if (typeof result === 'object') {
+                result.imageData = null;
+                result.raw = null;
+            }
+            return cleanedDataUrl;
         } else {
             console.error("[cleanMultipleBackgrounds] Gemini Clean Plate Failed:", result);
             return null;
@@ -705,6 +931,9 @@ export async function cleanMultipleBackgrounds(baseBackgroundUrl, layers, custom
     } catch (error) {
         console.error("[cleanMultipleBackgrounds] failed:", error);
         return null;
+    } finally {
+        releaseCanvasResource(canvas);
+        releaseImageResource(img);
     }
 }
 
@@ -772,46 +1001,60 @@ export async function cleanBackground(baseBackgroundUrl, layer) {
         
         const featheredMaskUrl = canvas.toDataURL('image/png');
         console.log(`[cleanBackground] Mask generated for ${layer.name}`);
+        const backgroundReferenceImage = layer.backgroundReferenceImage || await buildBackgroundReferenceImage(baseBackgroundUrl, {
+            x: outerX,
+            y: outerY,
+            width: outerW,
+            height: outerH
+        });
 
         const prompt = `
             [TASK: CLEAN PLATE / OBJECT REMOVAL]
             Target Object to Erase: "${layer.name}" (Hint: ${layer.promptHint || 'None'})
+            ${layer.backgroundHint ? `Recognized background reference: ${layer.backgroundHint}` : ''}
+            ${backgroundReferenceImage ? 'Additional reference image: use the supplied real background sample from the same image as the authoritative texture/pattern reference.' : ''}
             
             CRITICAL CONSTRAINTS:
             1. COMPLETE ANNIHILATION: You MUST completely erase EVERY SINGLE TRACE of the object within the masked area. Leave NO ghosting, reflections, or shadows behind.
             2. SEAMLESS INPAINTING: Fill the erased areas by intelligently extending the surrounding textures, patterns, and lighting flawlessly.
             3. NO NEW OBJECTS: Do NOT introduce any new objects, subjects, or focal points. The erased region must look like a perfectly clean, empty background.
-            4. PRESERVE STRUCTURE: Maintain the integrity of any continuous background structures (e.g., walls, floors, horizons) passing behind the object.
+            4. PRESERVE STRUCTURE: Maintain the integrity of any continuous background structures (e.g., walls, floors, horizons, poster graphics, menu backdrops, 2D design textures) passing behind the object.
             
             Return the full image with the object utterly removed and background perfectly healed.
         `;
 
         const shouldUseQwen = shouldUseQwenSemanticCleanPlate([layer]);
+        const outputSize = shouldUseQwen ? await getExactCleanPlateOutputSize(baseBackgroundUrl) : null;
         const result = shouldUseQwen
             ? await callExperimentalCleanPlateRouter(
                 areAllTextCleanupLayers([layer])
                     ? {
+                        model: getSelectedCleanPlateModelMode(),
                         mode: 'clean_plate_test_edit',
                         prompt: `[CLEAN_BACKGROUND] ${buildQwenSemanticCleanPlatePrompt([layer], layer.promptHint || '')}`,
                         image: baseBackgroundUrl,
                         num_inference_steps: 40,
-                        cfg: 4
+                        cfg: 4,
+                        size: outputSize
                     }
                     : {
+                        model: getSelectedCleanPlateModelMode(),
                         mode: 'clean_plate_test_edit',
                         prompt: `[CLEAN_BACKGROUND] ${buildQwenObjectRemovalPrompt([layer], layer.promptHint || '')}`,
                         image: baseBackgroundUrl,
                         num_inference_steps: 40,
-                        cfg: 4
+                        cfg: 4,
+                        size: outputSize
                     }
             )
             : await editOrQueryImageWithGemini(
                 `[CLEAN_BACKGROUND] ${prompt}`,
                 baseBackgroundUrl,
-                [],
+                backgroundReferenceImage ? [backgroundReferenceImage] : [],
                 featheredMaskUrl,
                 null,
-                false // forceMaterialTask = false for removal
+                false, // forceMaterialTask = false for removal
+                { overrideImageModel: getSelectedCleanPlateModelMode() }
             );
 
         if (result && result.success && result.imageData) {

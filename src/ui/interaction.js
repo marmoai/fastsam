@@ -1,9 +1,11 @@
 import { state } from '../core/state.js';
 import { runtime } from '../runtime/CoreRuntime.js';
-import { SNAP_THRESHOLD, ZOOM_MIN, ZOOM_MAX, ZOOM_STEP, RESIZE_RADIUS, OUTPAINT_RADIUS, CANVAS_CENTER, DEFAULT_ZOOM } from '../core/config.js';
+import { SNAP_THRESHOLD, ZOOM_MIN, ZOOM_MAX, ZOOM_STEP, RESIZE_RADIUS, OUTPAINT_RADIUS, CANVAS_CENTER, DEFAULT_ZOOM, isImageFusionEnabled } from '../core/config.js';
 import { deleteSelectedItems, addImageToWorkbench, addTextNoteToWorkbench, addAtmosphereNode } from './workbench-core.js';
+import { isPureImageWorkbenchAsset } from './workbench/items.js';
 import { restoreShapeToWorkbench } from './workbench/shapes.js';
 import { showCustomConfirm } from './modals.js';
+import { syncWorkspaceContext } from '../services/workspace-context.js';
 
 const { workbenchItems, selectedWorkbenchItems } = state;
 
@@ -692,31 +694,35 @@ function handleWorkbenchDragStart(event) {
             }
         }
 
-        const draggedRect = itemEl.getBoundingClientRect();
-        let maxIntersection = 0;
-        let potentialTarget = null;
-        
-        document.querySelectorAll('.workbench-item').forEach(item => {
-            if (selectedWorkbenchItems.has(item.dataset.itemId)) return;
-            
-            const itemRect = item.getBoundingClientRect();
-            const intersection = typeof window.getIntersectionArea === 'function' ? window.getIntersectionArea(draggedRect, itemRect) : 0;
-            const itemArea = itemRect.width * itemRect.height;
-            
-            if (intersection > itemArea * 0.5) {
-                if (intersection > maxIntersection) {
+        if (isImageFusionEnabled()) {
+            const draggedRect = itemEl.getBoundingClientRect();
+            let maxIntersection = 0;
+            let potentialTarget = null;
+
+            document.querySelectorAll('.workbench-item').forEach(item => {
+                if (selectedWorkbenchItems.has(item.dataset.itemId)) return;
+
+                const itemRect = item.getBoundingClientRect();
+                const intersection = typeof window.getIntersectionArea === 'function' ? window.getIntersectionArea(draggedRect, itemRect) : 0;
+                const itemArea = itemRect.width * itemRect.height;
+
+                if (intersection > itemArea * 0.5 && intersection > maxIntersection) {
                     maxIntersection = intersection;
                     potentialTarget = item;
                 }
+                item.classList.remove('collision-active');
+            });
+
+            if (potentialTarget) {
+                potentialTarget.classList.add('collision-active');
+                state.collisionTargetId = potentialTarget.dataset.itemId;
+                state.injectionSourceId = itemId;
+            } else {
+                state.collisionTargetId = null;
+                state.injectionSourceId = null;
             }
-            item.classList.remove('collision-active');
-        });
-        
-        if (potentialTarget) {
-            potentialTarget.classList.add('collision-active');
-            state.collisionTargetId = potentialTarget.dataset.itemId;
-            state.injectionSourceId = itemId;
         } else {
+            document.querySelectorAll('.collision-active').forEach(item => item.classList.remove('collision-active'));
             state.collisionTargetId = null;
             state.injectionSourceId = null;
         }
@@ -774,7 +780,8 @@ function handleWorkbenchDragStart(event) {
             if (transformsToBatch.length > 0) {
                 workspace.dispatcher.dispatch({
                     type: 'BATCH_UPDATE_TRANSFORMS',
-                    payload: { transforms: transformsToBatch }
+                    payload: { transforms: transformsToBatch },
+                    meta: { skipSnapshot: true, persistWithoutSnapshot: true }
                 });
             }
         }
@@ -782,7 +789,7 @@ function handleWorkbenchDragStart(event) {
         if(vLine) vLine.style.display = 'none';
         if(hLine) hLine.style.display = 'none';
         
-        if (state.collisionTargetId && state.injectionSourceId) {
+        if (isImageFusionEnabled() && state.collisionTargetId && state.injectionSourceId) {
             const targetItem = document.querySelector(`.workbench-item[data-item-id="${state.collisionTargetId}"]`);
             if (targetItem) {
                 const rect = targetItem.getBoundingClientRect();
@@ -860,7 +867,7 @@ function handleWorkbenchDragStart(event) {
             }
         }
         
-        if (window.historyManager) window.historyManager.pushState();
+        if (window.historyManager) window.historyManager.pushTransformState();
     }
 
     document.addEventListener('mousemove', onMouseMove);
@@ -868,13 +875,21 @@ function handleWorkbenchDragStart(event) {
 }
 
 function showWorkbenchToolbox(id) {
-    state.currentActiveWorkbenchItemId = id;
     const item = workbenchItems.get(id);
     if (!item) return;
 
-    if (typeof window.triggerCapsuleAlert === 'function') {
-        window.triggerCapsuleAlert(id);
+    // Standalone images own this toolbar. Semantic/extracted layers and other
+    // workbench objects use their own contextual surfaces.
+    if (!isPureImageWorkbenchAsset(item)) {
+        window.workbenchToolbox.style.display = 'none';
+        return;
     }
+    state.currentActiveWorkbenchItemId = id;
+    syncWorkspaceContext(state, { activeItemId: id });
+
+    window.dispatchEvent(new CustomEvent('marmo:workspace-selection-changed', {
+        detail: { itemId: id, source: 'workbench-toolbox' }
+    }));
 
     window.workbenchToolbox.style.display = 'flex';
     
@@ -918,16 +933,13 @@ function showWorkbenchToolbox(id) {
     const isFusionEditorOpen = floatingEditor !== null && !floatingEditor.hasAttribute('data-collapsing');
 
     if (isFusionEditorOpen) {
-        // If it's already open, sync it so user can still edit colors
-        if (typeof window.showFloatingFusionEditor === 'function') {
-            window.showFloatingFusionEditor(id);
+        // Selecting another object changes context; close the inspiration
+        // drawer instead of reopening it over the new Visual Object panel.
+        if (typeof window.hideFloatingFusionEditor === 'function') {
+            window.hideFloatingFusionEditor();
         }
-        // Hide toolbox to prevent interference
-        window.workbenchToolbox.style.display = 'none';
-    } else {
-        // AI suggestions / editor is CLOSED: Show the standard toolbox for both ordinary assets and layers.
-        window.workbenchToolbox.style.display = 'flex';
     }
+    window.workbenchToolbox.style.display = 'flex';
 }
 
 let isResizing = false;
@@ -1364,6 +1376,11 @@ function setupSelectionBox() {
             document.querySelectorAll('.workbench-item').forEach(el => el.classList.remove('selected'));
             state.selectedWorkbenchItems.clear();
         }
+        state.currentActiveWorkbenchItemId = null;
+        syncWorkspaceContext(state, { activeItemId: null });
+        window.dispatchEvent(new CustomEvent('marmo:workspace-selection-changed', {
+            detail: { itemId: null, source: 'workbench-background' }
+        }));
         
         state.selectionBox = document.createElement('div');
         state.selectionBox.className = 'selection-box';

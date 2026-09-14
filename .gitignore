@@ -9,3 +9,9 @@ dist/
 fastsam-backend/runs/
 fastsam-backend/*.tar
 fastsam-backend/*.pt
+.codex_tmp/
+.playwright-cli/
+output/
+.env
+.env.*
+!.env.example

@@ -8,12 +8,52 @@ import { AssetEntity, AssetVariant } from './AssetRuntime';
 import { DecisionLog } from './DecisionRuntime';
 import { ObjectRelation } from './GraphEngine';
 import localforage from 'localforage';
+import { AgentRuntime } from './AgentRuntime';
+import type {
+    AgentRuntimeHost,
+    AgentCommitResult,
+    AssetSearchCandidate,
+    AgentCommandVerificationCheck,
+    AgentLayerExtractionRequest,
+    AgentLayerExtractionResult,
+    AgentLayerExtractionUndoRequest,
+    AgentLayerExtractionCommitRequest,
+    AgentLayerExtractionReleaseRequest,
+    AgentCapabilityRequest,
+    AgentCapabilityResult,
+    AgentCapabilityUndoRequest,
+    AgentCapabilityCommitRequest,
+    AgentCapabilityReleaseRequest
+} from './AgentRuntime';
+import { assetCatalog } from './AssetCatalog';
 
-export class CoreRuntime {
+export class CoreRuntime implements AgentRuntimeHost {
     private static instance: CoreRuntime;
     
     private currentWorkspace: ProjectWorkspace | null = null;
     private allWorkspaces: Map<string, ProjectWorkspace> = new Map();
+    private saveInFlight: Promise<void> | null = null;
+    private saveRequested = false;
+    private saveTimer: ReturnType<typeof setTimeout> | null = null;
+    private agentRuntime: AgentRuntime | null = null;
+    private agentAssetResolver: ((ref: { projectId: string; assetId: string }) => Promise<AssetEntity | null>) | null = null;
+    private agentVerificationHooks: {
+        verify?: (args: { workspace: ProjectWorkspace; assetIds: string[] }) => Promise<AgentCommandVerificationCheck[]>;
+        repair?: (args: { workspace: ProjectWorkspace; assetIds: string[] }) => Promise<void>;
+    } = {};
+    private agentLayerExtractionHooks: {
+        execute?: (args: AgentLayerExtractionRequest) => Promise<AgentLayerExtractionResult>;
+        undo?: (args: AgentLayerExtractionUndoRequest) => Promise<void>;
+        commit?: (args: AgentLayerExtractionCommitRequest) => Promise<void>;
+        release?: (args: AgentLayerExtractionReleaseRequest) => Promise<void>;
+    } = {};
+    private agentCapabilityHooks: {
+        execute?: (args: AgentCapabilityRequest) => Promise<AgentCapabilityResult>;
+        undo?: (args: AgentCapabilityUndoRequest) => Promise<void>;
+        commit?: (args: AgentCapabilityCommitRequest) => Promise<void>;
+        release?: (args: AgentCapabilityReleaseRequest) => Promise<void>;
+    } = {};
+    private agentCommitPersistence: (() => Promise<void>) | null = null;
 
     private readonly MVR_DB_KEY = "mvr_core_workspace";
 
@@ -44,28 +84,203 @@ export class CoreRuntime {
         return this.currentWorkspace;
     }
 
-    async saveCurrentWorkspace(): Promise<void> {
+    listWorkspaces(): ProjectWorkspace[] {
+        return Array.from(this.allWorkspaces.values());
+    }
+
+    getAgentRuntime(): AgentRuntime {
+        if (!this.agentRuntime) {
+            this.agentRuntime = new AgentRuntime(this);
+        }
+        return this.agentRuntime;
+    }
+
+    setAgentAssetResolver(resolver: ((ref: { projectId: string; assetId: string }) => Promise<AssetEntity | null>) | null): void {
+        this.agentAssetResolver = resolver;
+    }
+
+    setAgentVerificationHooks(hooks: typeof this.agentVerificationHooks = {}): void {
+        this.agentVerificationHooks = hooks;
+    }
+
+    setAgentLayerExtractionHooks(hooks: typeof this.agentLayerExtractionHooks = {}): void {
+        this.agentLayerExtractionHooks = hooks;
+    }
+
+    setAgentCapabilityHooks(hooks: typeof this.agentCapabilityHooks = {}): void {
+        this.agentCapabilityHooks = hooks;
+    }
+
+    setAgentCommitPersistence(persist: (() => Promise<void>) | null): void {
+        this.agentCommitPersistence = persist;
+    }
+
+    async extractAgentLayers(args: AgentLayerExtractionRequest): Promise<AgentLayerExtractionResult> {
+        if (!this.agentLayerExtractionHooks.execute) {
+            throw new Error('Magic Layers Agent adapter is unavailable.');
+        }
+        return this.agentLayerExtractionHooks.execute(args);
+    }
+
+    async undoAgentLayers(args: AgentLayerExtractionUndoRequest): Promise<void> {
+        if (this.agentLayerExtractionHooks.undo) await this.agentLayerExtractionHooks.undo(args);
+    }
+
+    async commitAgentLayers(args: AgentLayerExtractionCommitRequest): Promise<void> {
+        if (this.agentLayerExtractionHooks.commit) await this.agentLayerExtractionHooks.commit(args);
+    }
+
+    async releaseAgentLayers(args: AgentLayerExtractionReleaseRequest): Promise<void> {
+        if (this.agentLayerExtractionHooks.release) await this.agentLayerExtractionHooks.release(args);
+    }
+
+    async executeAgentCapability(args: AgentCapabilityRequest): Promise<AgentCapabilityResult> {
+        if (!this.agentCapabilityHooks.execute) throw new Error('Agent capability adapter is unavailable.');
+        return this.agentCapabilityHooks.execute(args);
+    }
+
+    async undoAgentCapability(args: AgentCapabilityUndoRequest): Promise<void> {
+        if (this.agentCapabilityHooks.undo) await this.agentCapabilityHooks.undo(args);
+    }
+
+    async commitAgentCapabilities(args: AgentCapabilityCommitRequest): Promise<void> {
+        if (this.agentCapabilityHooks.commit) await this.agentCapabilityHooks.commit(args);
+    }
+
+    async releaseAgentCapabilities(args: AgentCapabilityReleaseRequest): Promise<void> {
+        if (this.agentCapabilityHooks.release) await this.agentCapabilityHooks.release(args);
+    }
+
+    async verifyAgentWorkspace(args: { workspace: ProjectWorkspace; assetIds: string[] }): Promise<AgentCommandVerificationCheck[]> {
+        return this.agentVerificationHooks.verify ? this.agentVerificationHooks.verify(args) : [];
+    }
+
+    async repairAgentWorkspace(args: { workspace: ProjectWorkspace; assetIds: string[] }): Promise<void> {
+        if (this.agentVerificationHooks.repair) await this.agentVerificationHooks.repair(args);
+    }
+
+    async listAgentAssets(): Promise<AssetSearchCandidate[]> {
+        const candidates = new Map<string, AssetSearchCandidate>();
+        this.listWorkspaces().forEach(workspace => {
+            workspace.currentState.assetRegistry.getAll().forEach(asset => {
+                candidates.set(`${workspace.projectId}:${asset.uid}`, {
+                    asset,
+                    assetId: asset.uid,
+                    projectId: workspace.projectId,
+                    version: Number(asset.version) || 1,
+                    name: String((asset as any).name || asset.layerName || asset.uid),
+                    type: String(asset.type || 'unknown'),
+                    tags: Array.isArray(asset.metadata?.tags) ? asset.metadata.tags.map(String) : []
+                });
+            });
+        });
+
+        const indexed = await assetCatalog.list();
+        indexed.forEach(entry => {
+            const key = `${entry.projectId}:${entry.assetId}`;
+            if (!candidates.has(key)) {
+                candidates.set(key, {
+                    assetId: entry.assetId,
+                    projectId: entry.projectId,
+                    version: entry.version,
+                    name: entry.name,
+                    type: entry.type,
+                    tags: entry.tags
+                });
+            }
+        });
+        return [...candidates.values()];
+    }
+
+    async resolveAgentAsset(ref: { projectId: string; assetId: string }): Promise<AssetEntity | null> {
+        const loaded = this.allWorkspaces.get(ref.projectId)?.currentState.assetRegistry.get(ref.assetId);
+        if (loaded) return loaded;
+        return this.agentAssetResolver ? this.agentAssetResolver(ref) : null;
+    }
+
+    async commitWorkspace(workspace: ProjectWorkspace, jobId: string): Promise<AgentCommitResult> {
+        if (this.currentWorkspace !== workspace) {
+            throw new Error('Agent Jobs can only commit the current workspace.');
+        }
+        return workspace.commit(jobId, async () => {
+            await this.saveCurrentWorkspace();
+            await assetCatalog.upsertWorkspace(workspace);
+            const persisted = await localforage.getItem<any>(this.MVR_DB_KEY);
+            const persistedAssets = persisted?.currentState?.assets;
+            const expectedIds = workspace.currentState.assetRegistry.getAll().map(asset => asset.uid).sort();
+            const actualIds = Array.isArray(persistedAssets) ? persistedAssets.map(asset => asset.uid).sort() : [];
+            if (JSON.stringify(expectedIds) !== JSON.stringify(actualIds)) {
+                throw new Error('Persisted Workspace verification failed: asset IDs are inconsistent.');
+            }
+            if (this.agentCommitPersistence) await this.agentCommitPersistence();
+        });
+    }
+
+    async saveCurrentWorkspace(options: { defer?: boolean } = {}): Promise<void> {
         if (!this.currentWorkspace) return;
-        
-        try {
-            const data = {
-                projectId: this.currentWorkspace.projectId,
-                name: this.currentWorkspace.name,
-                currentState: {
-                    stateId: this.currentWorkspace.currentState.stateId,
-                    canvasState: this.currentWorkspace.currentState.canvasState,
-                    assets: this.currentWorkspace.currentState.assetRegistry.getAll(),
-                    nodes: Array.from(this.currentWorkspace.currentState.sceneGraph['nodes']),
-                    edges: Array.from(this.currentWorkspace.currentState.sceneGraph['edges'].values())
-                },
-                decisionGraph: this.currentWorkspace.decisionGraph.getHistory()
-            };
-            
-            // 1. 同步保存到本地 IndexedDB
-            await localforage.setItem(this.MVR_DB_KEY, data);
-            console.log("[MVR] Workspace saved to IndexedDB.");
-        } catch (e) {
-            console.error("[MVR] Failed to save workspace:", e);
+
+        this.saveRequested = true;
+        if (options.defer) {
+            if (this.saveTimer) clearTimeout(this.saveTimer);
+            this.saveTimer = setTimeout(() => {
+                this.saveTimer = null;
+                this.startWorkspaceSave();
+            }, 350);
+            return;
+        }
+
+        if (this.saveTimer) {
+            clearTimeout(this.saveTimer);
+            this.saveTimer = null;
+        }
+        await this.startWorkspaceSave();
+    }
+
+    private startWorkspaceSave(): Promise<void> {
+        if (!this.saveInFlight) {
+            this.saveInFlight = this.flushWorkspaceSaves().finally(() => {
+                this.saveInFlight = null;
+                // Do not lose a save requested after the last loop condition
+                // was evaluated while this write was completing.
+                if (this.saveRequested && !this.saveTimer) {
+                    this.startWorkspaceSave();
+                }
+            });
+        }
+        return this.saveInFlight;
+    }
+
+    private async flushWorkspaceSaves(): Promise<void> {
+        while (this.saveRequested) {
+            this.saveRequested = false;
+            const workspace = this.currentWorkspace;
+            if (!workspace) return;
+
+            try {
+                const assets = workspace.currentState.assetRegistry.getAll().map(asset => {
+                    const serializableAsset = { ...asset } as any;
+                    delete serializableAsset.runtimeDisplayUrl;
+                    return serializableAsset;
+                });
+                const data = {
+                    projectId: workspace.projectId,
+                    name: workspace.name,
+                    currentState: {
+                        stateId: workspace.currentState.stateId,
+                        canvasState: workspace.currentState.canvasState,
+                        assets,
+                        nodes: Array.from(workspace.currentState.sceneGraph['nodes']),
+                        edges: Array.from(workspace.currentState.sceneGraph['edges'].values())
+                    },
+                    decisionGraph: workspace.decisionGraph.getHistory()
+                };
+
+                await localforage.setItem(this.MVR_DB_KEY, data);
+                console.log("[MVR] Workspace saved to IndexedDB.");
+                void assetCatalog.upsertWorkspace(workspace);
+            } catch (e) {
+                console.error("[MVR] Failed to save workspace:", e);
+            }
         }
     }
 

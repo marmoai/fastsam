@@ -1,4 +1,4 @@
-import { deleteSelectedItems, addImageToWorkbench, deleteWorkbenchItem, clearWorkbench, handleUploadImage, selectWorkbenchItem } from './workbench/items.js';
+import { deleteSelectedItems, addImageToWorkbench, deleteWorkbenchItem, clearWorkbench, handleUploadImage, selectWorkbenchItem, waitForWorkbenchItemPersistence } from './workbench/items.js';
 import { findNextPosition, autoOrganizeToGrid, calculateSmartPosition } from './workbench/layout.js';
 import { createGroupLabel, restoreGroupLabelToWorkbench, addTextNoteToWorkbench, showTextAdjuster, setTextAlign } from './workbench/notes.js';
 import { addAtmosphereNode } from './workbench/atmosphere.js';
@@ -44,6 +44,7 @@ export {
     findNextPosition,
     calculateSmartPosition,
     addImageToWorkbench,
+    waitForWorkbenchItemPersistence,
     selectWorkbenchItem,
     autoOrganizeToGrid,
     createGroupLabel,

@@ -19,7 +19,8 @@ import {
 import { 
     addImageToWorkbench, 
     selectWorkbenchItem, 
-    calculateSmartPosition 
+    calculateSmartPosition,
+    waitForWorkbenchItemPersistence
 } from './workbench-core.js';
 import { renderLayerList, getLayerState, updateLayerState, showLayerManagerModal, updateFusionUI } from './modals.js';
 
@@ -29,18 +30,741 @@ import { dilateAlphaChannel } from '../graphics/mask-utils.js';
 import { cleanBackground, cleanMultipleBackgrounds } from './workbench/layer-assets.js';
 import { globalMatteTaskSystem } from '../graphics/matte-task-system.js';
 import { StrategyDispatcher } from '../ai-services/strategy-dispatcher.js';
-import { buildSemanticLayerViews, applySemanticLayerViewsToItem, getCleanupLayerForEditableLayer, updateLayerExtractionMetadata } from '../services/semantic-layer-views.js';
+import { buildSemanticLayerViews, applySemanticLayerViewsToItem, getBackgroundSemanticHint, getCleanupLayerForEditableLayer, updateLayerExtractionMetadata, validateCompletionCandidatesWithMasks } from '../services/semantic-layer-views.js';
+import { executeObjectCompletion } from '../services/object-completion-executor.js';
 import { segmentLayers, segmentSingleLayer } from '../services/segmentation-service.js';
 import { buildExtractedTextState } from './text-style-utils.js';
 import { filterTextLinesToBbox, getCachedTextExtraction, normalizeOcrTextLines } from '../services/text-extraction-cache.js';
+import { recordWorkspaceAction } from '../services/workspace-context.js';
+import { uploadImageToOSS } from '../services/ossService.js';
 import { prepareTextContainerCandidates, restoreTextContainerShapes } from './text-container-restore.js';
 import { ensureLayerPanelFooter } from './modals.js';
+import { beginDiagnosticTask, updateDiagnosticTask, finishDiagnosticTask, recordDiagnosticBreadcrumb } from '../core/crash-diagnostics.js';
+import { isAgentRuntimeFeatureEnabled } from '../core/config.js';
+import { startLayerExtractionJob } from './agent-task-controller.js';
+import { expandEntityLayerIds } from '../services/completion-contract.js';
+import { isCanonicalEvidenceAccepted } from '../services/completion-evidence.js';
 
 const DISABLE_NON_SEMANTIC_GEMINI_FOR_FASTSAM_TEST = true;
+// Agent extraction stages Magic Layers as one transaction. Normal UI calls
+// keep their existing persistence/history behavior.
+let activeAgentLayerExtraction = 0;
+const agentLayerExtractionOperations = new Map();
+const agentCapabilityOperations = new Map();
+
+function captureAgentLayerRuntimeMetadata(asset) {
+    if (!asset) return null;
+    return {
+        layers: asset.layers,
+        scene: asset.scene,
+        semanticViews: asset.semanticViews,
+        hasFullSemanticAnalysis: asset.hasFullSemanticAnalysis,
+        originalDataUrl: asset.originalDataUrl,
+        cleanPlateDataUrl: asset.cleanPlateDataUrl,
+        cleanPlateStatus: asset.cleanPlateStatus
+    };
+}
+
+function captureAgentLayerLegacyMetadata(item) {
+    return {
+        dataUrl: item?.dataUrl,
+        originalDataUrl: item?.originalDataUrl,
+        cleanPlateDataUrl: item?.cleanPlateDataUrl,
+        cleanPlateStatus: item?.cleanPlateStatus
+    };
+}
 
 function cloneSerializable(value) {
     if (value == null) return value;
     return JSON.parse(JSON.stringify(value));
+}
+
+function yieldToBrowser() {
+    return new Promise(resolve => {
+        if (typeof requestIdleCallback === 'function') {
+            requestIdleCallback(() => resolve(), { timeout: 100 });
+        } else {
+            setTimeout(resolve, 0);
+        }
+    });
+}
+
+// Image extraction creates several decoded canvases and can briefly hold both
+// the source and generated PNG in memory. Keep only one fallback extraction
+// alive at a time so a large Magic Layers batch cannot exhaust the renderer.
+async function runLimitedExtractionJobs(jobs, concurrency = 1) {
+    const results = new Array(jobs.length);
+    let nextIndex = 0;
+    const worker = async () => {
+        while (nextIndex < jobs.length) {
+            const index = nextIndex++;
+            results[index] = await jobs[index]();
+            await yieldToBrowser();
+        }
+    };
+    const workerCount = Math.min(Math.max(1, concurrency), jobs.length);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    return results;
+}
+
+function loadImageForFusion(source) {
+    return new Promise((resolve, reject) => {
+        const image = new Image();
+        image.crossOrigin = 'anonymous';
+        image.onload = () => resolve(image);
+        image.onerror = () => reject(new Error('融合图片加载失败'));
+        image.src = source;
+    });
+}
+
+// Keep the source scene immutable and accept generated pixels only inside the
+// target mask. This also restores the exact source canvas dimensions.
+async function compositeMaskedFusionResult(baseDataUrl, generatedDataUrl, maskDataUrl) {
+    const [baseImage, generatedImage, maskImage] = await Promise.all([
+        loadImageForFusion(baseDataUrl),
+        loadImageForFusion(generatedDataUrl),
+        loadImageForFusion(maskDataUrl)
+    ]);
+
+    const canvas = document.createElement('canvas');
+    canvas.width = baseImage.naturalWidth;
+    canvas.height = baseImage.naturalHeight;
+    const ctx = canvas.getContext('2d');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(baseImage, 0, 0, canvas.width, canvas.height);
+
+    const generatedLayer = document.createElement('canvas');
+    generatedLayer.width = canvas.width;
+    generatedLayer.height = canvas.height;
+    const generatedCtx = generatedLayer.getContext('2d');
+    generatedCtx.imageSmoothingEnabled = true;
+    generatedCtx.imageSmoothingQuality = 'high';
+    generatedCtx.drawImage(generatedImage, 0, 0, canvas.width, canvas.height);
+    generatedCtx.globalCompositeOperation = 'destination-in';
+    generatedCtx.drawImage(maskImage, 0, 0, canvas.width, canvas.height);
+
+    ctx.drawImage(generatedLayer, 0, 0);
+    return canvas.toDataURL('image/png');
+}
+
+function getItemSceneLayers(item) {
+    return item?.scene?.layers || item?.layers || [];
+}
+
+function createMagicLayersSceneLock(item, sourceImage, sourceUrl) {
+    const width = Math.max(1, sourceImage.naturalWidth || sourceImage.width);
+    const height = Math.max(1, sourceImage.naturalHeight || sourceImage.height);
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    canvas.getContext('2d').drawImage(sourceImage, 0, 0, width, height);
+    const sceneLock = {
+        id: `magic-layers-scene-${Date.now()}`,
+        dataUrl: canvas.toDataURL('image/png'),
+        width,
+        height,
+        sourceUrl,
+        createdAt: Date.now()
+    };
+    // This bitmap is deliberately process-local. Persisting it would duplicate
+    // an entire original scene into every session JSON snapshot.
+    Object.defineProperty(item, '__magicLayersSceneLock', {
+        value: sceneLock,
+        configurable: true,
+        writable: true,
+        enumerable: false
+    });
+    console.info('[Magic Layers] locked scene source', {
+        taskLockId: sceneLock.id,
+        dimensions: `${width}x${height}`,
+        source: item.originalDataUrl ? 'originalDataUrl' : 'dataUrl'
+    });
+    return sceneLock;
+}
+
+function createLockedSceneSegmentationItem(item, sceneLock) {
+    return {
+        ...item,
+        // Initial SAM must not silently prefer a stale clean plate over the
+        // scene captured for this Magic Layers transaction.
+        cleanPlateDataUrl: null,
+        segmentationSourceUrl: sceneLock.dataUrl,
+        originalDataUrl: sceneLock.dataUrl,
+        dataUrl: sceneLock.dataUrl
+    };
+}
+
+function releaseMagicLayersSceneLock(item, parentImage = null) {
+    const sceneLock = item?.__magicLayersSceneLock;
+    if (sceneLock) {
+        // The lock is transaction-local. Keep the durable originalDataUrl, but
+        // release the duplicate encoded scene and its decoded image reference.
+        sceneLock.dataUrl = null;
+        delete item.__magicLayersSceneLock;
+    }
+    if (parentImage) parentImage.src = '';
+}
+
+function getDeferredCompletionTargetIds(item, selectedLayers = []) {
+    const graph = item?.semanticViews?.layerGraph;
+    if (!graph?.completionTasks?.length) return new Set();
+    const selectedById = new Map(selectedLayers.map(layer => [layer.id, layer]));
+    const selectedEntityLayerIds = new Set(expandEntityLayerIds(
+        graph.layers || [],
+        selectedLayers.map(layer => layer.id)
+    ));
+    const deferred = graph.completionTasks
+        .filter(task => {
+            if (task?.eligibility !== 'auto' || !selectedById.has(task.targetLayerId)) return false;
+            // Deferred scene completion is only for an actual occluded region.
+            // Bbox near-contact can describe a legitimate layout adjacency
+            // (for example wall art above a console), not missing geometry.
+            if (!Array.isArray(task.missingRegionBbox) || task.missingRegionBbox.length !== 4) return false;
+            // A semantic graph can include decor or an unselected sibling as a
+            // possible occluder. Do not force a defective target extraction
+            // merely because one such relation has no mask. One verified,
+            // selected foreground hard entity is sufficient to defer it.
+            return Array.isArray(task.occluderLayerIds) && task.occluderLayerIds.some(layerId => {
+                const occluder = selectedById.get(layerId) || graph.layers?.find(layer => layer.layerId === layerId);
+                return selectedEntityLayerIds.has(String(layerId)) &&
+                    occluder && isRasterSegmentationRuntimeLayer(occluder);
+            });
+        })
+        .map(task => task.targetLayerId);
+    return new Set(deferred);
+}
+
+const GENERATIVE_BACKDROPS = [
+    { name: 'pure, solid green', hex: '#00FF00', rgb: [0, 255, 0], rule: 'Use pure green (#00FF00) ONLY.' },
+    { name: 'pure, solid magenta', hex: '#FF00FF', rgb: [255, 0, 255], rule: 'Use pure magenta (#FF00FF) ONLY.' },
+    { name: 'pure, solid blue', hex: '#0000FF', rgb: [0, 0, 255], rule: 'Use pure blue (#0000FF) ONLY.' },
+    { name: 'pure, solid red', hex: '#FF0000', rgb: [255, 0, 0], rule: 'Use pure red (#FF0000) ONLY.' }
+];
+
+function selectAdaptiveBackdrop(imageData, layerName = '') {
+    const { width, height, data } = imageData || {};
+    const visibleColors = [];
+    if (width && height && data) {
+        for (let index = 0; index < data.length; index += 16) {
+            if (data[index + 3] >= 32) {
+                visibleColors.push([data[index], data[index + 1], data[index + 2]]);
+            }
+        }
+    }
+
+    const withSampleCount = (backdrop) => ({
+        ...backdrop,
+        sampleCount: visibleColors.length
+    });
+
+    if (visibleColors.length === 0) {
+        const name = String(layerName).toLowerCase();
+        if (/绿|green|草|叶|树/.test(name)) return withSampleCount(GENERATIVE_BACKDROPS[1]);
+        if (/蓝|blue|天空|海/.test(name)) return withSampleCount(GENERATIVE_BACKDROPS[3]);
+        if (/红|red|橙|orange/.test(name)) return withSampleCount(GENERATIVE_BACKDROPS[2]);
+        return withSampleCount(GENERATIVE_BACKDROPS[0]);
+    }
+
+    const scored = GENERATIVE_BACKDROPS.map(backdrop => {
+        let distanceSum = 0;
+        let conflictCount = 0;
+        visibleColors.forEach(([r, g, b]) => {
+            const distance = Math.sqrt(
+                (r - backdrop.rgb[0]) ** 2 +
+                (g - backdrop.rgb[1]) ** 2 +
+                (b - backdrop.rgb[2]) ** 2
+            );
+            distanceSum += distance;
+            if (distance < 100) conflictCount += 1;
+        });
+        return {
+            backdrop,
+            score: distanceSum / visibleColors.length - (conflictCount / visibleColors.length) * 180
+        };
+    });
+
+    scored.sort((left, right) => right.score - left.score);
+    return withSampleCount(scored[0].backdrop);
+}
+
+function sampleGeneratedBackdrop(imageData, fallbackRgb) {
+    const { width, height, data } = imageData || {};
+    const fallback = Array.isArray(fallbackRgb) ? fallbackRgb.map(value => Number(value) || 0) : [0, 255, 0];
+    if (!width || !height || !data) {
+        return { rgb: fallback, sampledRgb: fallback, stable: false, sampleCount: 0, spread: 0, source: 'requested' };
+    }
+
+    const samples = [];
+    const border = Math.max(2, Math.round(Math.min(width, height) * 0.04));
+    const step = Math.max(1, Math.floor(Math.min(width, height) / 256));
+    for (let y = 0; y < height; y += step) {
+        for (let x = 0; x < width; x += step) {
+            if (x >= border && x < width - border && y >= border && y < height - border) continue;
+            const index = (y * width + x) * 4;
+            if (data[index + 3] < 220) continue;
+            samples.push([data[index], data[index + 1], data[index + 2]]);
+        }
+    }
+
+    if (samples.length < 12) {
+        return { rgb: fallback, sampledRgb: fallback, stable: false, sampleCount: samples.length, spread: 0, source: 'requested' };
+    }
+
+    const median = channel => {
+        const values = samples.map(sample => sample[channel]).sort((a, b) => a - b);
+        return values[Math.floor(values.length / 2)];
+    };
+    const sampledRgb = [median(0), median(1), median(2)];
+    const percentile = (channel, ratio) => {
+        const values = samples.map(sample => sample[channel]).sort((a, b) => a - b);
+        return values[Math.min(values.length - 1, Math.floor(values.length * ratio))];
+    };
+    const spread = Math.max(
+        percentile(0, 0.9) - percentile(0, 0.1),
+        percentile(1, 0.9) - percentile(1, 0.1),
+        percentile(2, 0.9) - percentile(2, 0.1)
+    );
+    const stable = spread <= 90;
+
+    return {
+        rgb: stable ? sampledRgb : fallback,
+        sampledRgb,
+        stable,
+        sampleCount: samples.length,
+        spread,
+        source: stable ? 'generated_border' : 'requested_unstable_border'
+    };
+}
+
+function isSplitLayerAsset(item) {
+    return !!(
+        item &&
+        item.parentId &&
+        Array.isArray(item.originalBbox) &&
+        item.originalBbox.length === 4 &&
+        ['layer-explode', 'layer-extract', 'isolated-edit', 'extraction'].includes(String(item.type || '').toLowerCase())
+    );
+}
+
+function hasSplitLayerPlacement(item) {
+    return !!(
+        item &&
+        item.parentId &&
+        Array.isArray(item.originalBbox) &&
+        item.originalBbox.length === 4
+    );
+}
+
+function resolveParentLayerForAsset(parentItem, childItem) {
+    const layers = getItemSceneLayers(parentItem);
+    if (!Array.isArray(layers) || layers.length === 0) return null;
+
+    const childLayerId = childItem.sourceLayerId || childItem.layerId || null;
+    if (childLayerId) {
+        const byId = layers.find(layer => layer?.id === childLayerId);
+        if (byId) return byId;
+    }
+
+    const childName = String(childItem.layerName || '').trim();
+    if (childName) {
+        const byName = layers.find(layer => String(layer?.name || '').trim() === childName);
+        if (byName) return byName;
+    }
+
+    const childBbox = childItem.originalBbox;
+    return layers.find(layer => Array.isArray(layer?.bbox) &&
+        layer.bbox.length === 4 &&
+        layer.bbox.every((value, index) => Math.abs(Number(value) - Number(childBbox[index])) <= 2)
+    ) || null;
+}
+
+function drawImageCoveringTarget(ctx, image, targetWidth, targetHeight) {
+    const sourceWidth = image.naturalWidth || image.width;
+    const sourceHeight = image.naturalHeight || image.height;
+    if (!sourceWidth || !sourceHeight) return;
+
+    // Cover the target without changing the source aspect ratio. Negative
+    // offsets crop only the excess canvas/transparent margins.
+    const scale = Math.max(targetWidth / sourceWidth, targetHeight / sourceHeight);
+    const drawWidth = sourceWidth * scale;
+    const drawHeight = sourceHeight * scale;
+    const offsetX = (targetWidth - drawWidth) / 2;
+    const offsetY = (targetHeight - drawHeight) / 2;
+    ctx.drawImage(image, offsetX, offsetY, drawWidth, drawHeight);
+}
+
+async function fitAssetToCanvas(dataUrl, width, height) {
+    const image = await loadImageForFusion(dataUrl);
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(width));
+    canvas.height = Math.max(1, Math.round(height));
+    const ctx = canvas.getContext('2d');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    drawImageCoveringTarget(ctx, image, canvas.width, canvas.height);
+    return canvas.toDataURL('image/png');
+}
+
+function getAlphaBottom(image, width, height) {
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(width));
+    canvas.height = Math.max(1, Math.round(height));
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+    const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+    for (let y = canvas.height - 1; y >= 0; y -= 1) {
+        for (let x = 0; x < canvas.width; x += 1) {
+            if (pixels[(y * canvas.width + x) * 4 + 3] > 16) return y + 1;
+        }
+    }
+    return 0;
+}
+
+async function alignAssetBottomToSource(dataUrl, sourceImage, width, height) {
+    const editedImage = await loadImageForFusion(dataUrl);
+    const targetWidth = Math.max(1, Math.round(width));
+    const targetHeight = Math.max(1, Math.round(height));
+    const sourceBottom = getAlphaBottom(sourceImage, targetWidth, targetHeight);
+    const editedBottom = getAlphaBottom(editedImage, targetWidth, targetHeight);
+    if (!sourceBottom || !editedBottom || sourceBottom === editedBottom) return dataUrl;
+
+    const deltaY = sourceBottom - editedBottom;
+    const canvas = document.createElement('canvas');
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+    const ctx = canvas.getContext('2d');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(editedImage, 0, deltaY, targetWidth, targetHeight);
+    return canvas.toDataURL('image/png');
+}
+
+async function inspectAssetAlpha(dataUrl) {
+    const image = await loadImageForFusion(dataUrl);
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, image.naturalWidth);
+    canvas.height = Math.max(1, image.naturalHeight);
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+    const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+    let transparentPixels = 0;
+    let visiblePixels = 0;
+    let partialAlphaPixels = 0;
+    let edgeTransitionPixels = 0;
+    let borderPixels = 0;
+    let transparentBorderPixels = 0;
+    const borderWidth = Math.max(1, Math.round(Math.min(canvas.width, canvas.height) * 0.03));
+    for (let index = 3; index < pixels.length; index += 4) {
+        const alpha = pixels[index];
+        if (alpha <= 8) transparentPixels += 1;
+        if (alpha >= 32) visiblePixels += 1;
+        if (alpha > 8 && alpha < 245) partialAlphaPixels += 1;
+
+        const pixelIndex = Math.floor((index - 3) / 4);
+        const x = pixelIndex % canvas.width;
+        const y = Math.floor(pixelIndex / canvas.width);
+        const isBorder = x < borderWidth || y < borderWidth ||
+            x >= canvas.width - borderWidth || y >= canvas.height - borderWidth;
+        if (isBorder) {
+            borderPixels += 1;
+            if (alpha <= 8) transparentBorderPixels += 1;
+        }
+
+        const state = alpha < 32 ? 0 : 1;
+        const neighbors = [];
+        if (x > 0) neighbors.push(pixels[index - 4]);
+        if (x + 1 < canvas.width) neighbors.push(pixels[index + 4]);
+        if (y > 0) neighbors.push(pixels[index - canvas.width * 4]);
+        if (y + 1 < canvas.height) neighbors.push(pixels[index + canvas.width * 4]);
+        if (neighbors.some(neighborAlpha => (neighborAlpha < 32 ? 0 : 1) !== state)) {
+            edgeTransitionPixels += 1;
+        }
+    }
+
+    const totalPixels = canvas.width * canvas.height;
+    const transparentRatio = totalPixels ? transparentPixels / totalPixels : 0;
+    const visibleRatio = totalPixels ? visiblePixels / totalPixels : 0;
+    const partialAlphaRatio = totalPixels ? partialAlphaPixels / totalPixels : 0;
+    const edgeTransitionRatio = totalPixels ? edgeTransitionPixels / totalPixels : 0;
+    const transparentBorderRatio = borderPixels ? transparentBorderPixels / borderPixels : 0;
+    const hasTransparency = transparentRatio >= 0.01 || transparentBorderRatio >= 0.04;
+    const hasForeground = visibleRatio >= 0.05;
+    const hasUsableEdge = partialAlphaRatio >= 0.0005 || edgeTransitionRatio >= 0.001;
+    const isNearlyOpaque = transparentRatio < 0.005 && partialAlphaRatio < 0.002;
+
+    return {
+        width: canvas.width,
+        height: canvas.height,
+        transparentRatio,
+        visibleRatio,
+        partialAlphaRatio,
+        edgeTransitionRatio,
+        transparentBorderRatio,
+        hasReliableAlpha: hasTransparency && hasForeground && hasUsableEdge && !isNearlyOpaque
+    };
+}
+
+function despillMatteImageData(imageData, backgroundRgb) {
+    const { width, height, data } = imageData;
+    const [bgR, bgG, bgB] = backgroundRgb || [0, 255, 0];
+    let edgePixels = 0;
+    let correctedPixels = 0;
+    let spillStrength = 0;
+    let unmixedPixels = 0;
+    let unmixStrengthSum = 0;
+
+    const alphaAt = (x, y) => {
+        if (x < 0 || y < 0 || x >= width || y >= height) return 0;
+        return data[(y * width + x) * 4 + 3];
+    };
+
+    for (let y = 0; y < height; y += 1) {
+        for (let x = 0; x < width; x += 1) {
+            const index = (y * width + x) * 4;
+            const alpha = data[index + 3];
+            if (alpha < 8) continue;
+
+            const edge = alpha < 245 ||
+                alphaAt(x - 1, y) < 32 || alphaAt(x + 1, y) < 32 ||
+                alphaAt(x, y - 1) < 32 || alphaAt(x, y + 1) < 32;
+            if (!edge) continue;
+            edgePixels += 1;
+
+            const r = data[index];
+            const g = data[index + 1];
+            const b = data[index + 2];
+            const edgeFactor = Math.max(0.15, Math.min(1, (255 - alpha) / 180));
+            let contamination = 0;
+            let channels = [];
+
+            if (bgG > 180 && bgG > bgR + 80 && bgG > bgB + 80 && g > Math.max(r, b) + 6) {
+                contamination = g - Math.max(r, b);
+                channels = [1];
+            } else if (bgR > 180 && bgB > 180 && bgG < 100 && r > g + 6 && b > g + 6) {
+                contamination = Math.min(r, b) - g;
+                channels = [0, 2];
+            } else if (bgB > 180 && bgB > bgR + 80 && bgB > bgG + 80 && b > Math.max(r, g) + 6) {
+                contamination = b - Math.max(r, g);
+                channels = [2];
+            } else if (bgR > 180 && bgR > bgG + 80 && bgR > bgB + 80 && r > Math.max(g, b) + 6) {
+                contamination = r - Math.max(g, b);
+                channels = [0];
+            }
+
+            if (channels.length > 0 && contamination > 0) {
+                const correction = Math.min(contamination, contamination * edgeFactor * 0.9);
+                channels.forEach(channel => {
+                    data[index + channel] = Math.max(0, Math.round(data[index + channel] - correction));
+                });
+                correctedPixels += 1;
+                spillStrength += contamination;
+            }
+
+            // Recover the foreground contribution from semi-transparent edge
+            // pixels instead of only subtracting the dominant key channel.
+            // Limit the solve to pixels close to the measured background so
+            // saturated foreground colors are not globally recolored.
+            const alphaNorm = alpha / 255;
+            if (alphaNorm > 0.12 && alphaNorm < 0.96) {
+                const bgDistance = Math.sqrt(
+                    (r - bgR) ** 2 +
+                    (g - bgG) ** 2 +
+                    (b - bgB) ** 2
+                );
+                const blendConfidence = Math.max(0.15, Math.min(1, 1 - bgDistance / 320));
+                const solveAlpha = Math.max(0.28, alphaNorm);
+                const solveStrength = Math.max(0.08, Math.min(0.82, (1 - alphaNorm) * 1.35)) * blendConfidence;
+                const current = [data[index], data[index + 1], data[index + 2]];
+                const background = [bgR, bgG, bgB];
+                let changed = false;
+
+                for (let channel = 0; channel < 3; channel += 1) {
+                    const estimate = Math.max(0, Math.min(255,
+                        (current[channel] - background[channel] * (1 - alphaNorm)) / solveAlpha
+                    ));
+                    const fromBackground = current[channel] - background[channel];
+                    const towardForeground = estimate - current[channel];
+                    if (fromBackground * towardForeground <= 0) continue;
+                    const value = current[channel] + towardForeground * solveStrength;
+                    data[index + channel] = Math.max(0, Math.min(255, Math.round(value)));
+                    changed = true;
+                }
+
+                if (changed) {
+                    unmixedPixels += 1;
+                    unmixStrengthSum += solveStrength;
+                }
+            }
+        }
+    }
+
+    return {
+        edgePixels,
+        correctedPixels,
+        averageSpill: correctedPixels ? spillStrength / correctedPixels : 0,
+        unmixedPixels,
+        averageUnmixStrength: unmixedPixels ? unmixStrengthSum / unmixedPixels : 0
+    };
+}
+
+async function tryRefineEditedAssetWithSam(dataUrl, childItem, width, height, tempMsg) {
+    try {
+        const alphaInfo = await inspectAssetAlpha(dataUrl);
+        if (alphaInfo.hasReliableAlpha) {
+            console.info('[Layer Asset Edit] skipping SAM refinement: generated asset already has alpha', {
+                childId: childItem.id || null,
+                width: alphaInfo.width,
+                height: alphaInfo.height,
+                transparentRatio: Number(alphaInfo.transparentRatio.toFixed(4)),
+                visibleRatio: Number(alphaInfo.visibleRatio.toFixed(4)),
+                partialAlphaRatio: Number(alphaInfo.partialAlphaRatio.toFixed(4)),
+                edgeTransitionRatio: Number(alphaInfo.edgeTransitionRatio.toFixed(4)),
+                transparentBorderRatio: Number(alphaInfo.transparentBorderRatio.toFixed(4))
+            });
+            return await fitAssetToCanvas(dataUrl, width, height);
+        }
+
+        console.info('[Layer Asset Edit] SAM refinement required: generated asset has no reliable alpha', {
+            childId: childItem.id || null,
+            width: alphaInfo.width,
+            height: alphaInfo.height,
+            transparentRatio: Number(alphaInfo.transparentRatio.toFixed(4)),
+            visibleRatio: Number(alphaInfo.visibleRatio.toFixed(4)),
+            partialAlphaRatio: Number(alphaInfo.partialAlphaRatio.toFixed(4)),
+            edgeTransitionRatio: Number(alphaInfo.edgeTransitionRatio.toFixed(4)),
+            transparentBorderRatio: Number(alphaInfo.transparentBorderRatio.toFixed(4))
+        });
+        tempMsg?.update?.('🧩 **正在恢复透明边界**: 用 SAM 检查新资产轮廓...');
+        const segmentation = await segmentSingleLayer({
+            item: {
+                dataUrl,
+                originalDataUrl: dataUrl,
+                segmentationSourceUrl: dataUrl
+            },
+                layer: {
+                    id: `asset-edit-${childItem.id || Date.now()}`,
+                    name: childItem.layerName || 'edited asset',
+                    semanticType: childItem.semanticType || childItem.category || 'standalone_asset',
+                    extractionProfile: childItem.extractionProfile || '',
+                    bbox: [0, 0, alphaInfo.width, alphaInfo.height]
+                },
+            onProgress: (message) => tempMsg?.update?.(message),
+            qualityProfile: 'completion_review'
+        });
+
+        if (!segmentation?.dataUrl) return null;
+        if (segmentation.quality?.runtimeAction === 'hold' || segmentation.quality?.shouldGenerateRuntimeLayer === false) {
+            console.warn('[Layer Asset Edit] SAM quality gate held the generated asset; keeping matte result.');
+            return null;
+        }
+        return await fitAssetToCanvas(segmentation.dataUrl, width, height);
+    } catch (error) {
+        // SAM is a refinement step, not a reason to lose a successful edit.
+        console.warn('[Layer Asset Edit] SAM refinement unavailable; keeping matte result:', error);
+        return null;
+    }
+}
+
+async function replaceExistingLayerAsset(childId, childItem, parentItemId, parentItem, dataUrl, prompt, options = {}) {
+    const parentLayer = resolveParentLayerForAsset(parentItem, childItem);
+    if (!parentLayer) {
+        throw new Error(`未找到“${childItem.layerName || '当前图层'}”对应的父图层`);
+    }
+
+    const assetFile = await dataURLToFile(dataUrl, `layer-version-${Date.now()}.png`);
+    let storedUrl = dataUrl;
+    try {
+        storedUrl = await uploadImageToOSS(assetFile);
+    } catch (error) {
+        console.warn('[Layer Asset Edit] OSS upload failed; keeping local asset:', error);
+    }
+
+    if (!Array.isArray(parentLayer.versions)) parentLayer.versions = [];
+    if (parentLayer.versions.length === 0) {
+        parentLayer.versions.push({
+            id: 'base',
+            cutoutUrl: parentLayer.cutoutUrl || childItem.dataUrl || null,
+            maskUrl: parentLayer.maskUrl || null,
+            previewUrl: parentLayer.previewUrl || parentLayer.cutoutUrl || childItem.dataUrl || null,
+            prompt: '原始提取',
+            createdAt: Date.now(),
+            source: 'extraction'
+        });
+    }
+
+    const versionId = `v${Date.now()}`;
+    const version = {
+        id: versionId,
+        cutoutUrl: storedUrl,
+        maskUrl: null,
+        previewUrl: storedUrl,
+        prompt,
+        createdAt: Date.now(),
+        source: 'asset_sync_edit',
+        sourceChildId: childId || null
+    };
+    parentLayer.versions.push(version);
+    parentLayer.activeVersionId = versionId;
+    parentLayer.cutoutUrl = storedUrl;
+    parentLayer.previewUrl = storedUrl;
+    parentLayer.assetStatus = 'ready';
+
+    // The visible Workbench child is the rendered instance of this semantic layer.
+    // Update it in place so its position, size, rotation, and z-index stay intact.
+    childItem.dataUrl = storedUrl;
+    childItem.originalDataUrl = storedUrl;
+    childItem.previewUrl = storedUrl;
+    childItem.file = assetFile;
+    childItem.assetStatus = 'ready';
+    childItem.activeVersionId = versionId;
+    childItem.versions = parentLayer.versions;
+    if (childItem.el) {
+        const imageElement = childItem.el.querySelector('.crop-container > img') || childItem.el.querySelector('img');
+        if (imageElement) imageElement.src = dataUrl;
+    }
+
+    const workspace = window.mvrRuntime ? window.mvrRuntime.getCurrentWorkspace() : null;
+    const childAsset = workspace?.currentState.assetRegistry.get(childId);
+    if (workspace && childAsset) {
+        workspace.dispatcher.dispatch({
+            type: 'UPDATE_ASSET_METADATA',
+            // Metadata persistence is already followed by an explicit session
+            // save. Do not create a full undo snapshot containing every PNG.
+            meta: { silent: true },
+            payload: {
+                uid: childId,
+                sourceImage: storedUrl,
+                originalDataUrl: storedUrl,
+                version: versionId
+            }
+        });
+    }
+
+    const parentLayers = getItemSceneLayers(parentItem);
+    const parentLayerIndex = parentLayers.indexOf(parentLayer);
+    if (parentLayerIndex >= 0) {
+        renderLayerList(parentLayers, parentItemId);
+    }
+    renderCanvasLayers(parentItemId);
+    if (options.persist !== false) {
+        await persistLayerStateToRuntime(parentItemId, parentItem);
+    }
+    if (options.recordHistory !== false && window.historyManager) window.historyManager.pushState();
+
+    if (options.recordHistory !== false) {
+        recordWorkspaceAction(state, {
+            actionName: 'layer_asset_version_replaced',
+            itemId: parentItemId,
+            layerId: parentLayer.id || null,
+            layerName: parentLayer.name || childItem.layerName || null,
+            status: 'completed',
+            hasResult: true,
+            metadata: { versionId, sourceChildId: childId || null, prompt }
+        });
+    }
+
+    return { storedUrl, versionId, parentLayer };
 }
 
 function isTextRuntimeLayer(layer) {
@@ -73,9 +797,13 @@ function isFlatDesignRuntimeLayer(layer) {
     const renderMode = String(layer.renderMode || '').toLowerCase();
     const designRole = String(layer.designRole || '').toLowerCase();
     const name = String(layer.name || '').toLowerCase();
+    const isComplexRasterDecoration =
+        /柠檬|水果|果片|糖果|棒棒糖|贴纸|吉祥物|角色|人物|女子|主视觉|插画|邮戳|印章|邮票|lemon|fruit|candy|sticker|mascot|character|woman|hero|illustration|stamp|seal/i.test(name);
+    if (isComplexRasterDecoration) return false;
     return (
         ['vector_shape', 'background_plate', 'deferred'].includes(renderMode) ||
-        ['base_background', 'local_panel', 'price_badge', 'decor_shape'].includes(designRole) ||
+        ['base_background', 'local_panel', 'price_badge'].includes(designRole) ||
+        (designRole === 'decor_shape' && renderMode !== 'raster_cutout') ||
         ['shape_panel', 'price_badge', 'ad_background', 'flat_ad_layout', 'cta_button', 'logo_mark'].includes(semanticType) ||
         name.includes('背景') ||
         name.includes('色块') ||
@@ -383,6 +1111,12 @@ function isRasterSegmentationRuntimeLayer(layer) {
     return isSegmentationRuntimeLayer(layer) && !isFlatDesignRuntimeLayer(layer);
 }
 
+function shouldForceRuntimeAssetForHeldSegmentation(layer, result = null) {
+    if (!layer || !result?.dataUrl) return false;
+    if (result?.isText || result?.isFlatDesignLayer) return false;
+    return isRasterSegmentationRuntimeLayer(layer);
+}
+
 function bboxToWorkbenchRect(bbox, baseX, baseY, itemWidth, itemHeight, minWidth = 1, minHeight = 1) {
     const safeBbox = Array.isArray(bbox) && bbox.length === 4 ? bbox : [0, 0, 1000, 1000];
     const [ymin, xmin, ymax, xmax] = safeBbox.map(value => Number(value));
@@ -399,13 +1133,23 @@ function getExtractedLayerZIndex(parentItem, layer, fallbackOrder = 0) {
     return parentZ + (Number.isFinite(semanticZ) ? semanticZ : fallbackOrder + 1) + 1;
 }
 
-async function persistLayerStateToRuntime(itemId, item) {
+async function persistLayerStateToRuntime(itemId, item, options = {}) {
+    if (activeAgentLayerExtraction > 0) return;
+    recordDiagnosticBreadcrumb('runtime:persist_start', {
+        itemId,
+        hasRuntime: Boolean(window.mvrRuntime),
+        hasCleanPlate: Boolean(item?.cleanPlateDataUrl),
+        layerCount: getItemSceneLayers(item).length
+    });
     const workspace = window.mvrRuntime ? window.mvrRuntime.getCurrentWorkspace() : null;
     const asset = workspace ? workspace.currentState.assetRegistry.get(itemId) : null;
 
     if (workspace && asset) {
         workspace.dispatcher.dispatch({
             type: 'UPDATE_ASSET_METADATA',
+            // This synchronization is persisted explicitly below; avoid
+            // cloning the whole image registry into an undo snapshot.
+            meta: { silent: true },
             payload: {
                 uid: itemId,
                 layers: cloneSerializable(item.layers) || [],
@@ -418,12 +1162,546 @@ async function persistLayerStateToRuntime(itemId, item) {
         });
     }
 
-    if (state.currentSessionId && window.dbHelper?.saveSession) {
+    if (options.persistSession !== false && state.currentSessionId && window.dbHelper?.saveSession) {
         const currentSession = state.sessions.find(s => s.id === state.currentSessionId);
         if (currentSession) {
             await window.dbHelper.saveSession(currentSession);
         }
     }
+    recordDiagnosticBreadcrumb('runtime:persist_done', { itemId });
+}
+
+function findSplitChildForSemanticLayer(itemId, layer) {
+    if (!layer) return null;
+    return findSplitChildrenForSemanticLayer(itemId, layer)[0] || null;
+}
+
+function getWorkbenchItemId(item) {
+    if (!item) return null;
+    if (item.id && workbenchItems.get(item.id) === item) return item.id;
+    for (const [id, candidate] of workbenchItems.entries()) {
+        if (candidate === item) return id;
+    }
+    return null;
+}
+
+function normalizeSplitLayerName(value) {
+    return String(value || '')
+        .trim()
+        .toLowerCase()
+        .replace(/^(拆解|提取|补全|完成|同步更新|独立编辑)[:：\-\s]*/u, '')
+        .replace(/[\s_\-:：]/g, '');
+}
+
+function getSplitLayerIdentity(layer) {
+    if (!layer) return null;
+    const sourceLayerId = String(layer.sourceLayerId || '').trim();
+    if (sourceLayerId) return sourceLayerId;
+    const layerId = String(layer.layerId || '').trim();
+    return layerId || null;
+}
+
+function bboxOverlapRatio(first, second) {
+    if (!Array.isArray(first) || !Array.isArray(second) || first.length !== 4 || second.length !== 4) return 0;
+    const top = Math.max(Number(first[0]), Number(second[0]));
+    const left = Math.max(Number(first[1]), Number(second[1]));
+    const bottom = Math.min(Number(first[2]), Number(second[2]));
+    const right = Math.min(Number(first[3]), Number(second[3]));
+    const overlap = Math.max(0, bottom - top) * Math.max(0, right - left);
+    const firstArea = Math.max(0, Number(first[2]) - Number(first[0])) * Math.max(0, Number(first[3]) - Number(first[1]));
+    const secondArea = Math.max(0, Number(second[2]) - Number(second[0])) * Math.max(0, Number(second[3]) - Number(second[1]));
+    return overlap / Math.max(1, Math.min(firstArea, secondArea));
+}
+
+function findSplitChildrenForSemanticLayer(itemId, layer) {
+    if (!layer) return [];
+    const children = [...workbenchItems.values()].filter(candidate => candidate?.parentId === itemId);
+    const targetName = normalizeSplitLayerName(layer.name);
+    const targetIdentity = getSplitLayerIdentity(layer) || (layer.id ? String(layer.id) : null);
+    const matches = children.filter(candidate => {
+        const candidateIdentity = getSplitLayerIdentity(candidate);
+        const exactId = Boolean(targetIdentity && candidateIdentity && candidateIdentity === targetIdentity);
+        // An explicit identity is authoritative. A bbox can contain another
+        // layer entirely (for example a lemon inside a person's bbox), so it
+        // must never reassign an identified child during completion replace.
+        if (candidateIdentity && targetIdentity && candidateIdentity !== targetIdentity) return false;
+        const sameName = targetName && normalizeSplitLayerName(candidate.layerName) === targetName;
+        const sameBbox = bboxOverlapRatio(candidate.originalBbox, layer.bbox) >= 0.82;
+        return exactId || sameName || (!candidateIdentity && sameBbox);
+    });
+    return matches.sort((left, right) => {
+        const leftExact = getSplitLayerIdentity(left) === targetIdentity;
+        const rightExact = getSplitLayerIdentity(right) === targetIdentity;
+        return Number(rightExact) - Number(leftExact);
+    });
+}
+
+function getCompletionPlacementBbox(asset, targetLayer, child) {
+    // The split child's original bbox is the stable scene projection. Never
+    // resize it from a generative model's silhouette, which is not geometry.
+    return asset?.canonicalAsset?.placementBbox ||
+        asset?.canonicalAsset?.observedPlacementBbox ||
+        asset?.preflight?.geometry?.cropBbox ||
+        asset?.preflight?.geometry?.targetCompletionBbox ||
+        targetLayer?.bbox ||
+        targetLayer?.extractedBbox ||
+        child?.extractionBbox || child?.originalBbox ||
+        asset?.observedCutout?.bbox ||
+        [0, 0, 1000, 1000];
+}
+
+function validateCanonicalReplacement(asset, targetLayer, canonicalUrl) {
+    const canonical = asset?.canonicalAsset;
+    if (!targetLayer || !canonical || canonical.status !== 'ready' || !canonicalUrl) {
+        throw new Error('completion_canonical_asset_not_ready');
+    }
+    const placementBbox = getCompletionPlacementBbox(asset, targetLayer, null);
+    if (!Array.isArray(placementBbox) || placementBbox.length !== 4 ||
+        placementBbox.some(value => !Number.isFinite(Number(value)))) {
+        throw new Error('completion_canonical_placement_invalid');
+    }
+    const [ymin, xmin, ymax, xmax] = placementBbox.map(Number);
+    if (ymax <= ymin || xmax <= xmin || ymin < 0 || xmin < 0 || ymax > 1000 || xmax > 1000) {
+        throw new Error('completion_canonical_placement_out_of_bounds');
+    }
+    const quality = canonical.quality || {};
+    const canonicalEvidence = quality.canonicalEvidence || null;
+    const evidenceAccepted = isCanonicalEvidenceAccepted(canonicalEvidence);
+    const qualityHeld = quality.status === 'failed' ||
+        quality.runtimeAction === 'hold' ||
+        quality.shouldGenerateRuntimeLayer === false;
+    if (qualityHeld && !evidenceAccepted) {
+        throw new Error('completion_canonical_quality_hold');
+    }
+    if (qualityHeld && evidenceAccepted) {
+        console.info('[Completion] canonical replacement released by final evidence', {
+            targetLayerId: targetLayer.id,
+            observedRecall: canonicalEvidence.observedRecall,
+            hiddenKeptPixels: canonicalEvidence.hiddenKeptPixels,
+            hiddenCoverage: canonicalEvidence.hiddenCoverage
+        });
+    }
+    return { placementBbox: placementBbox.map(value => Number(value)) };
+}
+
+async function replaceSplitChildWithCanonicalAsset(itemId, item, asset, canonicalFile = null, options = {}) {
+    const targetLayer = item?.scene?.layers?.find(layer => layer.id === asset.targetLayerId) ||
+        item?.layers?.find(layer => layer.id === asset.targetLayerId);
+    const canonicalUrl = asset?.canonicalAsset?.cutoutUrl;
+    if (!targetLayer || !canonicalUrl) throw new Error('completion_target_or_canonical_asset_missing');
+    const replacementPreflight = validateCanonicalReplacement(asset, targetLayer, canonicalUrl);
+    const observedTargetBbox = cloneSerializable(
+        targetLayer.observedBbox || targetLayer.originalBbox || targetLayer.bbox || null
+    );
+
+    const matchingChildren = findSplitChildrenForSemanticLayer(itemId, targetLayer);
+    const targetIdentity = getSplitLayerIdentity(targetLayer) || (targetLayer.id ? String(targetLayer.id) : null);
+    const completionAssetChildren = [...workbenchItems.values()].filter(candidate => {
+        if (candidate?.parentId !== itemId || candidate.completionAssetId !== asset.id) return false;
+        const candidateIdentity = getSplitLayerIdentity(candidate);
+        return !candidateIdentity || !targetIdentity || candidateIdentity === targetIdentity;
+    });
+    const allMatchingChildren = [...new Map(
+        [...matchingChildren, ...completionAssetChildren]
+            .map(candidate => [getWorkbenchItemId(candidate), candidate])
+            .filter(([childId]) => Boolean(childId))
+    ).values()];
+    let child = allMatchingChildren[0] || findSplitChildForSemanticLayer(itemId, targetLayer);
+    let childId = getWorkbenchItemId(child);
+    console.info('[Completion] replacement representations resolved', {
+        itemId,
+        targetLayerId: targetLayer.id,
+        targetLayerName: targetLayer.name,
+        matchingChildIds: allMatchingChildren.map(candidate => getWorkbenchItemId(candidate)).filter(Boolean),
+        childId,
+        parentHasCleanPlate: Boolean(item.cleanPlateDataUrl),
+        parentDataIsCleanPlate: item.dataUrl === item.cleanPlateDataUrl,
+        parentLayerVisibleBeforeReplace: targetLayer.visible !== false
+    });
+    if (!child || !childId) {
+        // Deferred targets intentionally have no defective initial cutout.
+        // Create their first and only workbench representation from the
+        // scene-resegmented canonical asset.
+        const placementBbox = replacementPreflight.placementBbox;
+        const baseX = parseFloat(item.el?.style?.left) || 0;
+        const baseY = parseFloat(item.el?.style?.top) || 0;
+        const itemWidth = parseFloat(item.el?.style?.width) || item.el?.offsetWidth || 300;
+        const itemHeight = parseFloat(item.el?.style?.height) || item.el?.offsetHeight || 300;
+        const placement = bboxToWorkbenchRect(placementBbox, baseX, baseY, itemWidth, itemHeight, 1, 1);
+        const file = canonicalFile || await dataURLToFile(canonicalUrl, `canonical-${targetLayer.id}-${Date.now()}.png`);
+        childId = await addImageToWorkbench(file, `拆解-${targetLayer.name}`, {
+            x: placement.left,
+            y: placement.top,
+            initialWidth: placement.width,
+            initialHeight: placement.height,
+            parentId: itemId,
+            sourceLayerId: targetLayer.id,
+            originalBbox: cloneSerializable(placementBbox),
+            extractionBbox: cloneSerializable(placementBbox),
+            canonicalBbox: cloneSerializable(placementBbox),
+            completionAssetId: asset.id,
+            layerName: targetLayer.name,
+            type: 'layer-explode',
+            zIndex: getExtractedLayerZIndex(item, targetLayer, 0),
+            extractEngine: 'scene_inpaint_sam',
+            quality: asset.canonicalAsset?.quality || null,
+            // Do not open the fusion drawer while the completion transaction
+            // is still handing off a large image. The child remains fully
+            // interactive and can be opened manually after the batch.
+            autoOpenDecisionPanel: false,
+            // The completion batch emits one runtime notification after all
+            // canonical replacements are applied.
+            skipBackgroundUpload: true,
+            skipRuntimeSnapshot: true,
+            skipRuntimeNotify: true
+        });
+        child = workbenchItems.get(childId);
+        if (!child) throw new Error(`completion_deferred_split_child_create_failed:${targetLayer.name || targetLayer.id}`);
+        console.info('[Completion] created deferred split child from canonical asset', {
+            itemId,
+            targetLayerId: targetLayer.id,
+            childId,
+            placementBbox
+        });
+    }
+
+    // There must be exactly one workbench representation for a semantic layer.
+    // Clean up duplicates left by earlier completion runs before replacing the
+    // surviving child, otherwise the old cutout remains visibly overlapped.
+    const duplicateChildren = allMatchingChildren.filter(candidate => getWorkbenchItemId(candidate) !== childId);
+    const workspace = window.mvrRuntime?.getCurrentWorkspace?.();
+    for (const duplicate of duplicateChildren) {
+        const duplicateId = getWorkbenchItemId(duplicate);
+        if (!duplicateId) continue;
+        duplicate.el?.remove();
+        workbenchItems.delete(duplicateId);
+        state.selectedWorkbenchItems.delete(duplicateId);
+        if (workspace?.currentState?.assetRegistry?.get(duplicateId)) {
+            workspace.dispatcher.dispatch({
+                type: 'REMOVE_ASSET',
+                payload: { uid: duplicateId }
+            });
+        }
+        console.warn('[Completion] Removed duplicate split child before replacement', {
+            duplicateId,
+            targetLayerId: targetLayer.id
+        });
+    }
+
+    const placementBbox = replacementPreflight.placementBbox;
+    const baseX = parseFloat(item.el?.style?.left) || 0;
+    const baseY = parseFloat(item.el?.style?.top) || 0;
+    const itemWidth = parseFloat(item.el?.style?.width) || item.el?.offsetWidth || 300;
+    const itemHeight = parseFloat(item.el?.style?.height) || item.el?.offsetHeight || 300;
+    const placement = bboxToWorkbenchRect(placementBbox, baseX, baseY, itemWidth, itemHeight, 1, 1);
+    console.info('[Completion] replacing split child in place', {
+        itemId,
+        targetLayerId: targetLayer.id,
+        childId,
+        placementBbox,
+        placement,
+        zIndex: child.el?.style?.zIndex || child.zIndex || null,
+        canonicalUrl: canonicalUrl.slice(0, 80)
+    });
+    const originalZIndex = child.el?.style?.zIndex || child.zIndex || getExtractedLayerZIndex(item, targetLayer, 0);
+
+    // Keep the durable OSS URL separate from the page-local preview. Upload
+    // can succeed while the OSS image domain still times out in the browser.
+    const displayUrl = canonicalFile ? URL.createObjectURL(canonicalFile) : canonicalUrl;
+    if (child.runtimeDisplayUrl?.startsWith('blob:') && child.runtimeDisplayUrl !== displayUrl) {
+        try {
+            URL.revokeObjectURL(child.runtimeDisplayUrl);
+        } catch (error) {
+            console.warn('[Completion] Failed to revoke stale preview URL:', error);
+        }
+    }
+
+    // Replace the existing split child in place. Keep stacking order and
+    // rotation; only source pixels and the completion footprint change.
+    child.dataUrl = displayUrl;
+    child.originalDataUrl = canonicalUrl;
+    child.previewUrl = canonicalUrl;
+    child.runtimeDisplayUrl = displayUrl;
+    // Use the generated File from this completion attempt. Do not fetch the
+    // uploaded OSS URL again: an image can be publicly displayable while a
+    // programmatic cross-origin fetch is still rejected by the browser.
+    child.file = canonicalFile || null;
+    // Keep the first extraction geometry immutable. A generated silhouette
+    // must never redefine the scene placement used by later replacements.
+    child.extractionBbox = cloneSerializable(child.extractionBbox || placementBbox);
+    child.originalBbox = cloneSerializable(child.extractionBbox);
+    child.canonicalBbox = cloneSerializable(placementBbox);
+    child.completionAssetId = asset.id;
+    child.assetStatus = 'ready';
+    child.left = placement.left;
+    child.top = placement.top;
+    child.width = placement.width;
+    child.height = placement.height;
+    if (child.el) {
+        child.el.style.left = `${placement.left}px`;
+        child.el.style.top = `${placement.top}px`;
+        child.el.style.width = `${placement.width}px`;
+        child.el.style.height = `${placement.height}px`;
+        child.el.style.zIndex = `${originalZIndex}`;
+        const image = child.el.querySelector('.crop-container > img') || child.el.querySelector('img');
+        if (image) {
+            image.style.visibility = 'visible';
+            image.onerror = () => {
+                if (image.src === displayUrl && canonicalUrl !== displayUrl) {
+                    image.src = canonicalUrl;
+                    return;
+                }
+                image.style.visibility = 'hidden';
+                console.warn('[Completion] Preview image unavailable:', childId);
+            };
+            image.src = displayUrl;
+        }
+    }
+
+    const runtimeAsset = workspace?.currentState?.assetRegistry?.get(childId);
+    if (runtimeAsset) {
+        workspace.dispatcher.dispatch({
+            type: 'UPDATE_ASSET_METADATA',
+            // Canonical replacement is persisted below; avoid another full
+            // workspace snapshot while replacing a large PNG asset.
+            meta: { silent: true },
+            payload: {
+                uid: childId,
+                sourceImage: canonicalUrl,
+                originalDataUrl: canonicalUrl,
+                runtimeDisplayUrl: displayUrl,
+                completionAssetId: asset.id,
+                originalBbox: cloneSerializable(child.extractionBbox),
+                extractionBbox: cloneSerializable(child.extractionBbox)
+            }
+        });
+        workspace.currentState.assetRegistry.updateAssetTransform(childId, {
+            x: placement.left,
+            y: placement.top,
+            width: placement.width,
+            height: placement.height,
+            zIndex: Number(originalZIndex)
+        });
+    }
+
+    // Keep the defective observed cutout as provenance only. The active layer
+    // and its publishable version are now the canonical completed asset.
+    targetLayer.cutoutUrl = canonicalUrl;
+    targetLayer.previewUrl = canonicalUrl;
+    // Keep the visible semantic geometry immutable. Generated geometry belongs
+    // to the canonical representation and must not become the next task's
+    // identity/occlusion anchor.
+    targetLayer.observedBbox = observedTargetBbox;
+    targetLayer.extractedBbox = observedTargetBbox || cloneSerializable(targetLayer.extractedBbox);
+    targetLayer.canonicalBbox = cloneSerializable(placementBbox);
+    targetLayer.completionAssetId = asset.id;
+    targetLayer.assetStatus = 'ready';
+    targetLayer.completionState = 'canonical';
+    targetLayer.visible = false;
+    const parentLayers = getItemSceneLayers(item);
+    const targetLayerIndex = parentLayers.indexOf(targetLayer);
+    if (targetLayerIndex >= 0) {
+        updateLayerState(itemId, targetLayerIndex, { visible: false, selected: false });
+    }
+    const versionId = `completion-${Date.now()}`;
+    targetLayer.versions = [{
+        id: versionId,
+        cutoutUrl: canonicalUrl,
+        previewUrl: canonicalUrl,
+        prompt: 'Magic Layers 自动补全遮挡物',
+        createdAt: Date.now(),
+        source: 'occlusion_completion',
+        publishable: true
+    }];
+    targetLayer.activeVersionId = versionId;
+
+    asset.status = 'canonical_ready';
+    if (asset.preflight?.contract) asset.preflight.contract.state = 'replaced';
+    asset.composition = {
+        ...(asset.composition || {}),
+        activeRepresentation: 'canonical_asset',
+        preserveOriginalOcclusion: true,
+        sourceLayerVisibility: 'replaced',
+        originalZIndex: Number(originalZIndex),
+        placementBbox: cloneSerializable(placementBbox),
+        placementPolicy: 'replace_split_child_preserve_z_index'
+    };
+    asset.updatedAt = Date.now();
+    // The completed child uses a transient blob preview in this page, but its
+    // registry source is the durable OSS URL. Batch callers persist only after
+    // every replacement has been applied, so large image references are not
+    // serialized once per target during the completion handoff.
+    if (options.persist !== false) {
+        await persistLayerStateToRuntime(itemId, item);
+    }
+    console.info('[Completion] replacement committed', {
+        itemId,
+        targetLayerId: targetLayer.id,
+        childId,
+        removedDuplicateCount: duplicateChildren.length,
+        remainingMatchingChildren: [...new Set([
+            ...findSplitChildrenForSemanticLayer(itemId, targetLayer),
+            ...[...workbenchItems.values()].filter(candidate => candidate?.completionAssetId === asset.id)
+        ].map(candidate => getWorkbenchItemId(candidate)).filter(Boolean))],
+        parentLayerVisible: targetLayer.visible,
+        parentHasCleanPlate: Boolean(item.cleanPlateDataUrl)
+    });
+    return { child, targetLayer, placementBbox };
+}
+
+async function autoCompleteVerifiedOccludedAssets(itemId, item, progressMessage, options = {}) {
+    const targetLayerIds = options.targetLayerIds instanceof Set ? options.targetLayerIds : null;
+    const assets = Array.isArray(item?.semanticViews?.completionAssets)
+        ? item.semanticViews.completionAssets.filter(asset =>
+            asset.status === 'ready_for_completion' &&
+            (!targetLayerIds || targetLayerIds.has(asset.targetLayerId))
+        )
+        : [];
+    if (!assets.length) return { completed: 0, skipped: 0, completedTargetLayerIds: [], skippedTargetLayerIds: [] };
+
+    let completed = 0;
+    let skipped = 0;
+    const completedTargetLayerIds = [];
+    const skippedTargetLayerIds = [];
+    for (const asset of assets) {
+        try {
+            progressMessage?.(`正在自动补全被遮挡物体: ${asset.targetLayerId}...`);
+            const result = await executeObjectCompletion(item, asset.id, {
+                onProgress: message => progressMessage?.(message)
+            });
+            if (!result?.success) {
+                skipped += 1;
+                skippedTargetLayerIds.push(asset.targetLayerId);
+                continue;
+            }
+            await replaceSplitChildWithCanonicalAsset(itemId, item, asset, result.canonicalFile, {
+                persist: false
+            });
+            completed += 1;
+            completedTargetLayerIds.push(asset.targetLayerId);
+            console.info(`[Completion] Replaced incomplete split layer: ${asset.targetLayerId}`);
+        } catch (error) {
+            skipped += 1;
+            skippedTargetLayerIds.push(asset.targetLayerId);
+            asset.status = 'manual_review';
+            asset.generation = {
+                ...(asset.generation || {}),
+                state: 'failed',
+                lastError: error?.message || 'automatic_completion_failed'
+            };
+            console.warn('[Completion] automatic completion state trace', {
+                targetLayerId: asset.targetLayerId,
+                assetStatus: asset.status,
+                generationState: asset.generation?.state,
+                canonicalStatus: asset.canonicalAsset?.status || null,
+                canonicalRuntimeAction: asset.canonicalAsset?.quality?.runtimeAction || null,
+                canonicalShouldGenerate: asset.canonicalAsset?.quality?.shouldGenerateRuntimeLayer,
+                canonicalEvidence: asset.canonicalAsset?.quality?.canonicalEvidence || null,
+                error: error?.message || 'automatic_completion_failed'
+            });
+            console.warn(`[Completion] Automatic completion skipped for ${asset.targetLayerId}:`, error);
+        }
+    }
+
+    if (completed > 0) {
+        // Let the browser commit the final image-source changes before the
+        // single full render and durable save for this completion batch.
+        await yieldToBrowser();
+        renderLayerList(item.scene?.layers || item.layers || [], itemId);
+        renderCanvasLayers(itemId);
+        const workspace = window.mvrRuntime?.getCurrentWorkspace?.();
+        // Notify the runtime exactly once for the completed batch. Individual
+        // child creation/replacement above is intentionally notification-free.
+        workspace?.currentState?.notify?.();
+        await yieldToBrowser();
+        await persistLayerStateToRuntime(itemId, item);
+    }
+    return { completed, skipped, completedTargetLayerIds, skippedTargetLayerIds };
+}
+
+// Both full Magic Layers and a single layer extraction enter here. A target is
+// completed only after its own mask and every required foreground mask exist.
+export async function runAutomaticCompletionForItem(itemId, options = {}) {
+    const item = workbenchItems.get(itemId);
+    if (!item) {
+        console.warn('[Completion] coordinator skipped: workbench item not found', { itemId });
+        return { completed: 0, skipped: 0, eligible: 0, reason: 'item_not_found' };
+    }
+
+    const progressMessage = typeof options.onProgress === 'function' ? options.onProgress : null;
+    console.info('[Completion] coordinator entered', {
+        itemId,
+        semanticLayerCount: item.semanticViews?.layerGraph?.layers?.length || 0,
+        prescreenTaskCount: item.semanticViews?.layerGraph?.completionTasks?.length || 0,
+        extractedLayers: (item.semanticViews?.editableSceneLayers || []).map(layer => ({
+            id: layer.id,
+            name: layer.name,
+            bbox: layer.extractedBbox || layer.bbox || null,
+            zIndex: layer.zIndex,
+            hasCutout: Boolean(layer.cutoutUrl),
+            semanticType: layer.semanticType
+        }))
+    });
+    const graph = await validateCompletionCandidatesWithMasks(item, {
+        allowDeferredTarget: options.allowDeferredTarget === true
+    });
+    if (!graph) {
+        console.warn('[Completion] coordinator skipped: semantic graph unavailable', { itemId });
+        return { completed: 0, skipped: 0, eligible: 0, reason: 'graph_unavailable' };
+    }
+
+    const eligible = graph.stats?.autoCompletionCandidateCount || 0;
+    console.info(
+        `[Completion Candidates] validated auto=${eligible} ` +
+        `manual=${graph.stats?.manualCompletionReviewCount || 0} ` +
+        `rejected=${graph.stats?.rejectedCompletionCandidateCount || 0}`
+    );
+    graph.completionTasks?.forEach(task => {
+        const detail = {
+            targetLayerId: task.targetLayerId,
+            occluderLayerIds: task.occluderLayerIds,
+            targetZIndex: graph.layers?.find(layer => layer.layerId === task.targetLayerId)?.zIndex ?? null,
+            eligibility: task.eligibility,
+            status: task.status,
+            reason: task.reason,
+            nearContactRelations: task.nearContactRelations || [],
+            maskValidation: task.maskValidation,
+            targetHasMask: Boolean(graph.layers?.find(layer => layer.layerId === task.targetLayerId)?.mask?.cutoutUrl),
+            occluderMaskAvailability: task.occluderLayerIds.map(occluderLayerId => {
+                const layer = graph.layers?.find(candidate => candidate.layerId === occluderLayerId);
+                return {
+                    id: occluderLayerId,
+                    name: layer?.name || null,
+                    zIndex: layer?.zIndex ?? null,
+                    hasMask: Boolean(layer?.mask?.cutoutUrl)
+                };
+            })
+        };
+        console.info('[Completion Candidate Detail]', JSON.stringify(detail));
+    });
+    if (!graph.completionTasks?.length) {
+        console.warn('[Completion] no occlusion candidates after bbox prescreen', {
+            itemId,
+            layers: graph.layers?.map(layer => ({
+                id: layer.layerId,
+                name: layer.name,
+                bbox: layer.bbox,
+                zIndex: layer.zIndex,
+                semanticGroup: layer.semanticGroup
+            })) || []
+        });
+    }
+    const targetLayerIds = Array.isArray(options.targetLayerIds)
+        ? new Set(options.targetLayerIds)
+        : null;
+    if (targetLayerIds) {
+        console.info('[Completion] scoped automatic completion batch', {
+            itemId,
+            targetLayerIds: [...targetLayerIds]
+        });
+    }
+    const result = await autoCompleteVerifiedOccludedAssets(itemId, item, progressMessage, { targetLayerIds });
+    return { ...result, eligible };
 }
 
 function trimTransparentCanvas(canvas) {
@@ -504,21 +1782,28 @@ const { workbenchItems } = state;
 /**
  * 核心修改：基于语义图层的物理拆解
  */
-export async function triggerLayerExplosion(itemId) {
+export async function triggerLayerExplosion(itemId, options = {}) {
     console.log(`[Explosion] Triggered for item: ${itemId}`);
     const item = workbenchItems.get(itemId);
     if (!item) {
         alert("找不到图片对象");
         return;
     }
+    beginDiagnosticTask('magic_layers', { itemId, mode: 'layer_explosion' });
 
     // 1. 如果还没有图层数据，先自动分析
     const layersToUse = item.scene && item.scene.layers ? item.scene.layers : item.layers;
+    const requestedLayerIds = new Set(Array.isArray(options.layerIds) ? options.layerIds.filter(Boolean) : []);
 
     if (!layersToUse || layersToUse.length === 0) {
-        addMessage({ sender: 'bot', type: 'text', content: '🔍 正在分析图层结构以进行拆解...' });
+        addMessage({ sender: 'bot', type: 'text', visibility: 'progress', persist: false, content: '🔍 正在分析图层结构以进行拆解...' });
         try {
+            updateDiagnosticTask('semantic_analysis_start', { itemId });
             const analysisResult = await analyzeImageLayers(item.file || item.dataUrl);
+            updateDiagnosticTask('semantic_analysis_done', {
+                itemId,
+                layerCount: analysisResult?.rawLayers?.length || analysisResult?.scene?.layers?.length || 0
+            });
             item.scene = analysisResult.scene;
             const semanticViews = await buildSemanticLayerViews(
                 item.cleanPlateDataUrl || item.originalDataUrl || item.dataUrl,
@@ -533,6 +1818,7 @@ export async function triggerLayerExplosion(itemId) {
             renderLayerList(item.scene.layers, itemId);
             renderCanvasLayers(itemId);
         } catch (e) {
+            finishDiagnosticTask('failed', { itemId, stage: 'semantic_analysis', message: e?.message || String(e) });
             addMessage({ sender: 'bot', type: 'text', content: '❌ 无法识别图层，拆解中止。' });
             return;
         }
@@ -540,17 +1826,21 @@ export async function triggerLayerExplosion(itemId) {
 
     // 2. 准备拆解任务
     const executeLayerExplosion = async (customPrompt) => {
+        const pipelineStartedAt = Date.now();
         const allLayers = item.scene && item.scene.layers ? item.scene.layers : item.layers;
         const currentLayers = [];
         
         allLayers.forEach((layer, index) => {
             const state = getLayerState(itemId, index);
-            if (state.selected && !state.locked) {
+            const isRequested = requestedLayerIds.size > 0 && requestedLayerIds.has(layer.id);
+            const isAutoSelected = options.selectAll === true && isMagicLayersAutoSelectable(layer) && state.visible !== false;
+            if (!state.locked && (isRequested || (requestedLayerIds.size === 0 && (state.selected || isAutoSelected)))) {
                 currentLayers.push(layer);
             }
         });
 
         if (currentLayers.length === 0) {
+            finishDiagnosticTask('aborted', { itemId, stage: 'selection', reason: 'no_selected_layers' });
             addMessage({ sender: 'bot', type: 'text', content: '❌ 拆解中止：未能找到被勾选且未锁定的图层。' });
             return;
         }
@@ -560,27 +1850,165 @@ export async function triggerLayerExplosion(itemId) {
         const tempMsg = addMessage({ 
             sender: 'bot', 
             type: 'text', 
+            visibility: 'progress',
+            persist: false,
             content: `💣 **启动语义拆解模式**\n正在批量提取 **${layerNames.length}** 个独立图层：[${layerNames.join(', ')}]...` 
         });
 
         try {
+            console.log(`[Explosion] Stage: prepare image (${itemId})`);
+            updateDiagnosticTask('prepare_image_start', { itemId });
             const parentImg = new Image();
             parentImg.crossOrigin = "anonymous";
-            const itemSrc = getProxiedUrl(item.dataUrl);
+            const lockedSourceUrl = item.originalDataUrl || item.dataUrl;
+            const itemSrc = getProxiedUrl(lockedSourceUrl);
             if (!itemSrc) {
                 throw new Error('无效的原图地址，无法执行图层拆解');
             }
             parentImg.src = itemSrc;
             await new Promise(r => parentImg.onload = r);
+            const sceneLock = createMagicLayersSceneLock(item, parentImg, lockedSourceUrl);
+            const lockedSegmentationItem = createLockedSceneSegmentationItem(item, sceneLock);
+            updateDiagnosticTask('prepare_image_done', {
+                itemId,
+                taskLockId: sceneLock.id,
+                sceneSize: `${sceneLock.width}x${sceneLock.height}`
+            });
 
             let fastSamResults = new Map();
             const objectLayers = currentLayers.filter(layer => isRasterSegmentationRuntimeLayer(layer));
-            if (objectLayers.length > 0) {
+            const segmentationSkippedLayers = currentLayers
+                .filter(layer => !objectLayers.includes(layer))
+                .map(layer => {
+                    const reason = isTextRuntimeLayer(layer)
+                        ? 'text_runtime_layer'
+                        : layer?.runtimeType === 'semantic_group' || layer?.compositeRole === 'composite_group'
+                            ? 'semantic_group'
+                            : isFlatDesignRuntimeLayer(layer)
+                                ? `flat_design:${layer.renderMode || layer.designRole || layer.semanticType || 'unknown'}`
+                                : 'not_raster_segmentable';
+                    return {
+                        id: layer.id,
+                        name: layer.name,
+                        semanticType: layer.semanticType || null,
+                        designRole: layer.designRole || null,
+                        renderMode: layer.renderMode || null,
+                        reason
+                    };
+                });
+            console.info('[Explosion] SAM routing', {
+                selectedLayerCount: currentLayers.length,
+                submittedLayerCount: objectLayers.length,
+                submittedLayers: objectLayers.map(layer => ({
+                    id: layer.id,
+                    name: layer.name,
+                    semanticType: layer.semanticType || null,
+                    renderMode: layer.renderMode || null,
+                    forcedRasterDecoration: /柠檬|水果|果片|糖果|棒棒糖|贴纸|吉祥物|角色|人物|女子|主视觉|插画|邮戳|印章|邮票|lemon|fruit|candy|sticker|mascot|character|woman|hero|illustration|stamp|seal/i.test(String(layer.name || '').toLowerCase())
+                })),
+                skippedLayers: segmentationSkippedLayers
+            });
+            recordDiagnosticBreadcrumb('sam:routing', {
+                itemId,
+                selectedLayerCount: currentLayers.length,
+                submittedLayerCount: objectLayers.length,
+                submittedLayerIds: objectLayers.map(layer => layer.id),
+                skippedLayers: segmentationSkippedLayers,
+                selectedLayers: currentLayers.map(layer => ({
+                    index: allLayers.findIndex(candidate => candidate === layer || candidate?.id === layer?.id),
+                    id: layer.id,
+                    name: layer.name,
+                    selected: getLayerState(itemId, allLayers.findIndex(candidate => candidate === layer || candidate?.id === layer?.id)).selected,
+                    locked: getLayerState(itemId, allLayers.findIndex(candidate => candidate === layer || candidate?.id === layer?.id)).locked,
+                    visible: getLayerState(itemId, allLayers.findIndex(candidate => candidate === layer || candidate?.id === layer?.id)).visible,
+                    semanticType: layer.semanticType || null,
+                    renderMode: layer.renderMode || null,
+                    runtimeType: layer.runtimeType || null,
+                    designRole: layer.designRole || null,
+                    isFlatDesign: isFlatDesignRuntimeLayer(layer),
+                    isText: isTextRuntimeLayer(layer)
+                }))
+            });
+            const deferredCompletionTargetIds = getDeferredCompletionTargetIds(item, objectLayers);
+            // Deferred targets still receive an original-scene SAM pass. Its
+            // cutout is observation-only: it anchors the visible silhouette
+            // for the post-inpaint quality gate and is never published as a
+            // Workbench asset or included in the first clean plate request.
+            // Foreground masks are destructive input to scene inpainting. Mark
+            // only the selected hard occluders for an independent B/L review;
+            // this is request-local and never changes the semantic layer.
+            const completionOccluderLayerIds = new Set(
+                (item.semanticViews?.layerGraph?.completionTasks || [])
+                    .filter(task => (
+                        task?.eligibility === 'auto' &&
+                        deferredCompletionTargetIds.has(task.targetLayerId)
+                    ))
+                    .flatMap(task => expandEntityLayerIds(
+                        item.semanticViews?.layerGraph?.layers || [],
+                        task.occluderLayerIds || []
+                    ))
+            );
+            const initialSegmentationLayers = objectLayers.map(layer => (
+                completionOccluderLayerIds.has(layer.id)
+                    ? { ...layer, completionOccluder: true }
+                    : layer
+            ));
+            console.info('[Explosion] completion deferral decision', {
+                itemId,
+                taskLockId: sceneLock.id,
+                lockedSceneSize: `${sceneLock.width}x${sceneLock.height}`,
+                completionTasks: (item.semanticViews?.layerGraph?.completionTasks || []).map(task => ({
+                    targetLayerId: task.targetLayerId,
+                    occluderLayerIds: task.occluderLayerIds,
+                    eligibility: task.eligibility,
+                    deferred: deferredCompletionTargetIds.has(task.targetLayerId),
+                    targetZIndex: item.semanticViews?.layerGraph?.layers?.find(layer => layer.layerId === task.targetLayerId)?.zIndex ?? null,
+                    occluders: (task.occluderLayerIds || []).map(occluderId => {
+                        const layer = item.semanticViews?.layerGraph?.layers?.find(candidate => candidate.layerId === occluderId);
+                        return { id: occluderId, zIndex: layer?.zIndex ?? null };
+                    })
+                })),
+                deferredTargetLayerIds: [...deferredCompletionTargetIds]
+            });
+            if (deferredCompletionTargetIds.size > 0) {
+                console.info('[Explosion] deferring occluded targets until foreground masks are ready', {
+                    itemId,
+                    targetLayerIds: [...deferredCompletionTargetIds],
+                    initialSegmentationLayerIds: initialSegmentationLayers.map(layer => layer.id),
+                    observationOnlyLayerIds: [...deferredCompletionTargetIds]
+                });
+            }
+            if (initialSegmentationLayers.length > 0) {
                 try {
-                    fastSamResults = await segmentLayers({
-                        item,
-                        layers: objectLayers,
-                        onProgress: (message) => tempMsg.update(message)
+                    console.log(`[Explosion] Stage: segmentation start (${itemId}) objects=${initialSegmentationLayers.length}`);
+                    updateDiagnosticTask('sam_start', {
+                        itemId,
+                        count: initialSegmentationLayers.length,
+                        layerIds: initialSegmentationLayers.map(layer => layer.id)
+                    });
+                    const segmentationStartedAt = Date.now();
+                    const requestedSamResults = await segmentLayers({
+                        item: lockedSegmentationItem,
+                        layers: initialSegmentationLayers,
+                        onProgress: (message) => tempMsg.update(message),
+                        qualityProfile: 'completion'
+                    });
+                    // segmentLayers keys its result Map by request object.
+                    // Completion-occluder requests are shallow clones so the
+                    // marker stays transaction-local; remap them back to the
+                    // canonical layer objects used by all later stages.
+                    const sourceLayersById = new Map(objectLayers.map(layer => [layer.id, layer]));
+                    fastSamResults = new Map(
+                        [...requestedSamResults].map(([requestLayer, result]) => [
+                            sourceLayersById.get(requestLayer.id) || requestLayer,
+                            result
+                        ])
+                    );
+                    console.log(`[Explosion] Stage: segmentation done (${itemId}) duration=${Date.now() - segmentationStartedAt}ms`);
+                    updateDiagnosticTask('sam_done', {
+                        itemId,
+                        durationMs: Date.now() - segmentationStartedAt,
+                        resultCount: fastSamResults.size
                     });
                 } catch (error) {
                     if (DISABLE_NON_SEMANTIC_GEMINI_FOR_FASTSAM_TEST) {
@@ -590,9 +2018,13 @@ export async function triggerLayerExplosion(itemId) {
                 }
             }
 
-            // 3. 批量生成 Promise (并行提取每个物体)
+            // 3. Prepare extraction jobs. The jobs are executed through a
+            // bounded queue below so decoded canvases do not accumulate.
             const originalTextSource = item.originalDataUrl || item.file || item.dataUrl;
-            const promises = currentLayers.map(async (layer, index) => {
+            console.log(`[Explosion] Stage: extraction start (${itemId}) layers=${currentLayers.length}`);
+            updateDiagnosticTask('extraction_start', { itemId, count: currentLayers.length });
+            const extractionStartedAt = Date.now();
+            const extractionJobs = currentLayers.map((layer, index) => () => (async () => {
                 const isTextLayer = isTextRuntimeLayer(layer);
                 
                 if (isTextLayer) {
@@ -643,8 +2075,66 @@ export async function triggerLayerExplosion(itemId) {
                     };
                 }
 
+                if (deferredCompletionTargetIds.has(layer.id)) {
+                    const observed = fastSamResults.get(layer);
+                    if (observed?.dataUrl) {
+                        updateLayerExtractionMetadata(item, {
+                            id: layer.id,
+                            name: layer.name,
+                            cleanPlateLayerId: layer.cleanPlateLayerId,
+                            sourceTextLayerId: layer.sourceTextLayerId
+                        }, {
+                            extractEngine: observed.extractEngine || 'sam_observed_reference',
+                            quality: observed.quality || null,
+                            bbox: observed.bbox || layer.bbox,
+                            cutoutUrl: observed.dataUrl,
+                            previewUrl: observed.dataUrl
+                        });
+                        console.info('[Explosion] captured deferred target observation mask', {
+                            itemId,
+                            layerId: layer.id,
+                            name: layer.name,
+                            bbox: observed.bbox || layer.bbox,
+                            quality: observed.quality || null,
+                            policy: 'reference_only_not_runtime_asset'
+                        });
+                    } else {
+                        console.warn('[Explosion] deferred target observation mask unavailable', {
+                            itemId,
+                            layerId: layer.id,
+                            name: layer.name
+                        });
+                    }
+                    return {
+                        status: 'fulfilled',
+                        value: {
+                            success: true,
+                            completionDeferred: true,
+                            layerBbox: layer.bbox,
+                            extractEngine: observed?.extractEngine || 'scene_inpaint_sam_pending',
+                            observedReferenceReady: Boolean(observed?.dataUrl),
+                            observedReferenceBbox: observed?.bbox || layer.bbox
+                        },
+                        layerName: layer.name
+                    };
+                }
+
                 const segmented = fastSamResults.get(layer);
                 if (segmented?.dataUrl) {
+                    const quality = segmented.quality || null;
+                    const runtimeAction = segmented.runtimeAction || quality?.runtimeAction || 'accept';
+                    const shouldGenerateRuntimeLayer = segmented.shouldGenerateRuntimeLayer !== false;
+                    const forceRuntimeChild = shouldForceRuntimeAssetForHeldSegmentation(layer, {
+                        dataUrl: segmented.dataUrl,
+                        isText: false,
+                        isFlatDesignLayer: false
+                    });
+                    console.log(
+                        `[Explosion] Segmentation result (${itemId}) layer="${layer.name}" ` +
+                        `hasDataUrl=${!!segmented.dataUrl} runtimeAction=${runtimeAction} ` +
+                        `shouldGenerateRuntimeLayer=${shouldGenerateRuntimeLayer} forceRuntimeChild=${forceRuntimeChild} ` +
+                        `quality=${quality?.status || 'unknown'}`
+                    );
                     return {
                         status: 'fulfilled',
                         value: {
@@ -654,9 +2144,9 @@ export async function triggerLayerExplosion(itemId) {
                             height: segmented.height,
                             segmentedBbox: segmented.bbox || layer.bbox,
                             extractEngine: segmented.extractEngine || 'fastsam',
-                            quality: segmented.quality || null,
-                            shouldGenerateRuntimeLayer: segmented.shouldGenerateRuntimeLayer !== false,
-                            runtimeAction: segmented.runtimeAction || segmented.quality?.runtimeAction || 'accept'
+                            quality,
+                            shouldGenerateRuntimeLayer,
+                            runtimeAction
                         },
                         layerName: layer.name
                     };
@@ -893,10 +2383,17 @@ ${bgColorRule}`;
                 } catch (err) {
                     return { status: 'rejected', reason: err, layerName: layer.name };
                 }
-            });
+            })());
 
             // 4. 等待所有提取完成
-            const results = await Promise.all(promises);
+            const results = await runLimitedExtractionJobs(extractionJobs, 1);
+            console.log(`[Explosion] Stage: extraction done (${itemId}) duration=${Date.now() - extractionStartedAt}ms`);
+            updateDiagnosticTask('extraction_done', {
+                itemId,
+                durationMs: Date.now() - extractionStartedAt,
+                fulfilled: results.filter(result => result.status === 'fulfilled').length,
+                rejected: results.filter(result => result.status === 'rejected').length
+            });
             
             // Collect layers for clean plate, passing the whole layer bounding box for text layers for stable mask generation
             const cleanupLayers = [];
@@ -925,7 +2422,7 @@ ${bgColorRule}`;
                                 isText: true
                             });
                         }
-                    } else if (res.value.isFlatDesignLayer || res.value.shouldGenerateRuntimeLayer === false || res.value.runtimeAction === 'hold') {
+                    } else if (res.value.completionDeferred || res.value.isFlatDesignLayer || res.value.shouldGenerateRuntimeLayer === false || res.value.runtimeAction === 'hold') {
                         continue;
                     } else {
                         cleanupLayers.push(getCleanupLayerForEditableLayer(item, currentLayers[i], { preferEditableTextBbox: false }));
@@ -946,22 +2443,61 @@ ${bgColorRule}`;
             }
             
             // 5. 执行背景净化 (Clean Plate)
-            if (cleanupLayers.length > 0) {
-                addMessage({ sender: 'bot', type: 'text', content: `🧹 正在净化底板，联合抹除已提取的 ${cleanupLayers.length} 个元素...` });
-                const baseBg = item.cleanPlateDataUrl || item.originalDataUrl || item.dataUrl;
+            if (cleanupLayers.length > 0 && deferredCompletionTargetIds.size === 0) {
+                tempMsg?.update?.(`🧹 **正在净化底板**：联合抹除已提取的 ${cleanupLayers.length} 个元素...`);
+                const baseBg = item.originalDataUrl || item.dataUrl;
+                const backgroundHint = getBackgroundSemanticHint(item);
                 
-                const customPrompt = hasTextLayers ? "Remove all the specified objects, including any text, letters, logomarks, or typography enclosed within the masked white areas. Inpaint and fill the background seamlessly matching the surrounding texture." : undefined;
+                const customPrompt = undefined;
+                console.log(`[Explosion] Stage: clean plate start (${itemId}) cleanupLayers=${cleanupLayers.length} backgroundHint="${backgroundHint}"`);
+                updateDiagnosticTask('clean_plate_start', { itemId, count: cleanupLayers.length });
+                const cleanPlateStartedAt = Date.now();
                 const cleanedBg = await cleanMultipleBackgrounds(baseBg, cleanupLayers, customPrompt, {
-                    preserveBackgroundOnly: true
+                    preserveBackgroundOnly: true,
+                    backgroundHint,
+                    useSimpleSceneCleanPlatePrompt: true
+                });
+                console.log(`[Explosion] Stage: clean plate done (${itemId}) duration=${Date.now() - cleanPlateStartedAt}ms`);
+                updateDiagnosticTask('clean_plate_done', {
+                    itemId,
+                    durationMs: Date.now() - cleanPlateStartedAt,
+                    hasResult: Boolean(cleanedBg)
                 });
                 
                 if (cleanedBg) {
                     item.cleanPlateDataUrl = cleanedBg;
                     item.dataUrl = cleanedBg;
                     item.cleanPlateStatus = 'ready';
+                    recordWorkspaceAction(state, {
+                        actionName: 'clean_plate_completed',
+                        itemId,
+                        status: 'completed',
+                        hasResult: true
+                    });
                     
-                    // Hide extracted layers (both image and text) in the list since they are now separate objects
-                    currentLayers.forEach(layerObj => {
+                    // Hide only layers that actually produced standalone runtime assets.
+                    // Low-quality/hold candidates must stay visible so motion can still use semantic fallback.
+                    currentLayers.forEach((layerObj, index) => {
+                        const res = results[index];
+                        const shouldHideSemanticLayer = !!(
+                            res?.status === 'fulfilled' &&
+                            res?.value?.success &&
+                            (
+                                res.value.isText ||
+                                (
+                                    res.value.dataUrl &&
+                                    (
+                                        (
+                                            res.value.shouldGenerateRuntimeLayer !== false &&
+                                            res.value.runtimeAction !== 'hold'
+                                        ) ||
+                                        shouldForceRuntimeAssetForHeldSegmentation(layerObj, res.value)
+                                    ) &&
+                                    !res.value.isFlatDesignLayer
+                                )
+                            )
+                        );
+                        if (!shouldHideSemanticLayer) return;
                         const layerIndex = allLayers.findIndex(l => (l.name || l) === layerObj.name);
                         if (layerIndex >= 0) {
                             updateLayerState(itemId, layerIndex, { visible: false, selected: false });
@@ -970,7 +2506,7 @@ ${bgColorRule}`;
                     renderLayerList(allLayers, itemId);
                     renderCanvasLayers(itemId);
                     await persistLayerStateToRuntime(itemId, item);
-                    if (window.historyManager) window.historyManager.pushState();
+                    if (window.historyManager && activeAgentLayerExtraction === 0) window.historyManager.pushState();
 
                     // Update the base image element in place
                     if (item.el) {
@@ -981,10 +2517,28 @@ ${bgColorRule}`;
                     }
                 } else {
                     console.warn("[Background Purification] Could not clean the backgrounds. Using original plate.");
+                    item.cleanPlateStatus = 'failed';
+                    recordWorkspaceAction(state, {
+                        actionName: 'clean_plate_completed',
+                        itemId,
+                        status: 'failed',
+                        hasResult: false
+                    });
+                    addMessage({
+                        sender: 'bot',
+                        type: 'text',
+                        content: '⚠️ 底板净化失败，原图未被修改；已提取的透明图层仍可继续使用。'
+                    });
                 }
+            } else if (deferredCompletionTargetIds.size > 0) {
+                console.info('[Explosion] clean plate deferred until scene-completed targets are extracted', {
+                    itemId,
+                    deferredTargetLayerIds: [...deferredCompletionTargetIds]
+                });
             } else {
                 console.warn("[Background Purification] No successfully extracted layers to clean up.");
             }
+            console.log(`[Explosion] Pipeline complete (${itemId}) duration=${Date.now() - pipelineStartedAt}ms`);
             
             // 6. 将结果添加到工作台
             const baseX = parseFloat(item.el.style.left) || 0;
@@ -994,6 +2548,7 @@ ${bgColorRule}`;
             
             let successCount = 0;
             let heldCount = 0;
+            updateDiagnosticTask('runtime_render_start', { itemId, successCount, heldCount });
 
             const { addTextNoteToWorkbench } = await import('./workbench/notes.js');
             const allExtractedTextLines = results
@@ -1058,7 +2613,8 @@ ${bgColorRule}`;
                         });
                         continue;
                     } else if (res.value.dataUrl) {
-                    if (res.value.shouldGenerateRuntimeLayer === false || res.value.runtimeAction === 'hold') {
+                    const isHeld = res.value.shouldGenerateRuntimeLayer === false || res.value.runtimeAction === 'hold';
+                    if (isHeld) {
                         heldCount++;
                         updateLayerExtractionMetadata(item, {
                             id: layerObj.id,
@@ -1072,8 +2628,37 @@ ${bgColorRule}`;
                                 runtimeAction: 'hold',
                                 reason: 'quality_gate_hold'
                             },
-                            bbox: res.value.segmentedBbox || layerObj.bbox
+                            bbox: res.value.segmentedBbox || layerObj.bbox,
+                            cutoutUrl: res.value.dataUrl || null,
+                            previewUrl: res.value.dataUrl || null
                         });
+
+                        if (shouldForceRuntimeAssetForHeldSegmentation(layerObj, res.value)) {
+                            const f = await dataURLToFile(res.value.dataUrl, `explode-${res.layerName}-${Date.now()}.png`);
+                            const originalBbox = res.value.segmentedBbox || layerObj.bbox;
+                            const layerRect = bboxToWorkbenchRect(originalBbox, baseX, baseY, itemWidth, itemHeight, 1, 1);
+
+                            await addImageToWorkbench(f, `拆解-${res.layerName}`, {
+                                x: layerRect.left,
+                                y: layerRect.top,
+                                initialWidth: layerRect.width,
+                                initialHeight: layerRect.height,
+                                parentId: itemId,
+                                sourceLayerId: layerObj.id,
+                                originalBbox,
+                                layerName: res.layerName,
+                                type: 'layer-explode',
+                                zIndex: getExtractedLayerZIndex(item, layerObj, i),
+                                extractEngine: res.value.extractEngine || 'fastsam',
+                                quality: res.value.quality || null,
+                                skipRuntimeSnapshot: true,
+                                autoOpenDecisionPanel: true,
+                                autoOpenDecisionPanelBatchToken: batchAutoOpenToken,
+                                autoOpenDecisionPanelBatchFinal: i === currentLayers.length - 1
+                            });
+                            successCount++;
+                            console.log(`[Explosion] Forced runtime child created for held raster layer: ${res.layerName}`);
+                        }
                         continue;
                     }
 
@@ -1087,12 +2672,14 @@ ${bgColorRule}`;
                         initialWidth: layerRect.width,
                         initialHeight: layerRect.height,
                         parentId: itemId,
+                        sourceLayerId: layerObj.id,
                         originalBbox,
                         layerName: res.layerName,
                         type: 'layer-explode',
                         zIndex: getExtractedLayerZIndex(item, layerObj, i),
                         extractEngine: res.value.extractEngine || 'fastsam',
                         quality: res.value.quality || null,
+                        skipRuntimeSnapshot: true,
                         autoOpenDecisionPanel: true,
                         autoOpenDecisionPanelBatchToken: batchAutoOpenToken,
                         autoOpenDecisionPanelBatchFinal: i === currentLayers.length - 1
@@ -1110,7 +2697,9 @@ ${bgColorRule}`;
                             score: null,
                             reason: 'fastsam_batch_extracted'
                         },
-                        bbox: res.value.segmentedBbox || layerObj.bbox
+                        bbox: res.value.segmentedBbox || layerObj.bbox,
+                        cutoutUrl: res.value.dataUrl,
+                        previewUrl: res.value.dataUrl
                     });
                     
                     successCount++;
@@ -1120,28 +2709,548 @@ ${bgColorRule}`;
             }
             }
 
+            // Completion is fully automatic for verified hard-object occlusions.
+            // The replacement keeps the original child z-index, so foreground
+            // occluders remain in front of the completed asset.
+            let completionResult = { completed: 0, skipped: 0 };
+            try {
+                updateDiagnosticTask('completion_start', { itemId, targetCount: deferredCompletionTargetIds.size });
+                completionResult = await runAutomaticCompletionForItem(itemId, {
+                    onProgress: message => tempMsg?.update?.(`✨ **自动补全**：${message}`),
+                    allowDeferredTarget: deferredCompletionTargetIds.size > 0,
+                    targetLayerIds: [...deferredCompletionTargetIds]
+                });
+                updateDiagnosticTask('completion_done', { itemId, ...completionResult });
+            } catch (error) {
+                recordDiagnosticBreadcrumb('completion:error', { itemId, message: error?.message || String(error) });
+                console.warn('[Automatic Completion] validation or execution skipped:', error);
+            }
+
+            if (deferredCompletionTargetIds.size > 0 && (completionResult.completed > 0 || cleanupLayers.length > 0)) {
+                updateDiagnosticTask('final_clean_plate_start', { itemId });
+                const completedTargetLayerIds = new Set(completionResult.completedTargetLayerIds || []);
+                const completedTargetLayers = currentLayers.filter(layer => completedTargetLayerIds.has(layer.id));
+                const finalCleanupLayers = [...cleanupLayers];
+                completedTargetLayers.forEach(layer => {
+                    const cleanupLayer = getCleanupLayerForEditableLayer(item, layer, { preferEditableTextBbox: false });
+                    if (cleanupLayer?.bbox) finalCleanupLayers.push(cleanupLayer);
+                });
+                const dedupedCleanupLayers = finalCleanupLayers.filter((layer, index, layers) => {
+                    const key = Array.isArray(layer?.bbox) ? layer.bbox.map(value => Math.round(value)).join(',') : '';
+                    return key && layers.findIndex(candidate =>
+                        Array.isArray(candidate?.bbox) && candidate.bbox.map(value => Math.round(value)).join(',') === key
+                    ) === index;
+                });
+
+                if (dedupedCleanupLayers.length > 0) {
+                    tempMsg?.update?.(`🧹 **正在净化底板**：联合抹除 ${dedupedCleanupLayers.length} 个完整实体...`);
+                    const backgroundHint = getBackgroundSemanticHint(item);
+                    console.info('[Explosion] final clean plate after deferred completion', {
+                        itemId,
+                        partial: completionResult.completed < deferredCompletionTargetIds.size,
+                        completedTargetLayerIds: [...completedTargetLayerIds],
+                        skippedTargetLayerIds: completionResult.skippedTargetLayerIds || [],
+                        cleanupLayerIds: dedupedCleanupLayers.map(layer => layer.id || layer.name)
+                    });
+                    const cleanedBg = await cleanMultipleBackgrounds(item.originalDataUrl || item.dataUrl, dedupedCleanupLayers, undefined, {
+                        preserveBackgroundOnly: true,
+                        backgroundHint,
+                        useSimpleSceneCleanPlatePrompt: true
+                    });
+                    if (cleanedBg) {
+                        item.cleanPlateDataUrl = cleanedBg;
+                        item.dataUrl = cleanedBg;
+                        item.cleanPlateStatus = 'ready';
+                        currentLayers.forEach((layerObj, index) => {
+                            const included = dedupedCleanupLayers.some(candidate => candidate.id === layerObj.id);
+                            if (included) updateLayerState(itemId, index, { visible: false, selected: false });
+                        });
+                        if (item.el) {
+                            const image = item.el.querySelector('.crop-container > img');
+                            if (image) image.src = cleanedBg;
+                        }
+                        recordWorkspaceAction(state, {
+                            actionName: 'clean_plate_completed',
+                            itemId,
+                            status: 'completed',
+                            hasResult: true
+                        });
+                        renderLayerList(allLayers, itemId);
+                        renderCanvasLayers(itemId);
+                        await persistLayerStateToRuntime(itemId, item);
+                        updateDiagnosticTask('final_clean_plate_done', { itemId, hasResult: true });
+                    } else {
+                        item.cleanPlateStatus = 'failed';
+                        console.warn('[Explosion] final clean plate failed after deferred completion', { itemId });
+                    }
+                }
+            } else if (deferredCompletionTargetIds.size > 0) {
+                console.warn('[Explosion] final clean plate skipped because deferred completion did not fully succeed', {
+                    itemId,
+                    expected: deferredCompletionTargetIds.size,
+                    completed: completionResult.completed,
+                    skipped: completionResult.skipped
+                });
+            }
+
             if (tempMsg) tempMsg.remove();
+            updateDiagnosticTask('runtime_render_done', { itemId, successCount, heldCount });
             if (successCount > 0) {
                 const heldText = heldCount > 0 ? `，${heldCount} 个低质量候选已保留为待高精度处理` : '';
+                const completionText = completionResult.completed > 0
+                    ? `，已自动补全 ${completionResult.completed} 个被遮挡实体`
+                    : '';
                 if (window.addWorkbenchActionToChat) {
-                    await window.addWorkbenchActionToChat('语义拆解', `拆解了 ${successCount}/${layerNames.length} 个图层${heldText}: ${layerNames.join(', ')}`, item.dataUrl || item.file, executeLayerExplosion);
+                    await window.addWorkbenchActionToChat('语义拆解', `拆解了 ${successCount}/${layerNames.length} 个图层${heldText}${completionText}: ${layerNames.join(', ')}`, item.dataUrl || item.file, executeLayerExplosion);
                 } else {
-                    addMessage({ sender: 'bot', type: 'text', content: `✅ **拆解完成**！成功提取并还原了 ${successCount}/${layerNames.length} 个完整图层${heldText}。` });
+                    addMessage({ sender: 'bot', type: 'text', content: `✅ **拆解完成**！成功提取并还原了 ${successCount}/${layerNames.length} 个完整图层${heldText}${completionText}。` });
                 }
             } else if (heldCount > 0) {
                 addMessage({ sender: 'bot', type: 'text', content: `⚠️ **拆解已暂停生成图层**：${heldCount} 个候选质量不足，已标记为需要高精度模型处理。` });
             } else {
                 addMessage({ sender: 'bot', type: 'text', content: `❌ 拆解失败，未能提取任何图层。` });
             }
+            releaseMagicLayersSceneLock(item, parentImg);
+            finishDiagnosticTask('completed', { itemId, successCount, heldCount, completion: completionResult });
+            return {
+                success: successCount > 0,
+                sourceAssetId: itemId,
+                extractedLayerIds: currentLayers
+                    .filter((layer, index) => results[index]?.status === 'fulfilled' && results[index]?.value?.dataUrl)
+                    .map(layer => layer.id)
+                    .filter(Boolean),
+                successCount,
+                heldCount
+            };
 
         } catch (e) {
             console.error("[Explosion] Fatal error:", e);
+            releaseMagicLayersSceneLock(item);
+            finishDiagnosticTask('failed', { itemId, message: e?.message || String(e) });
+            recordDiagnosticBreadcrumb('magic_layers:fatal_error', { itemId, message: e?.message || String(e), stack: e?.stack || '' });
             if (tempMsg) tempMsg.remove();
             addMessage({ sender: 'bot', type: 'text', content: `❌ 拆解过程出错: ${e.message}` });
+            return {
+                success: false,
+                sourceAssetId: itemId,
+                extractedLayerIds: [],
+                successCount: 0,
+                heldCount: 0,
+                error: e?.message || String(e)
+            };
         }
     };
 
-    await executeLayerExplosion();
+    return executeLayerExplosion();
+}
+
+/**
+ * Runtime adapter for the existing Magic Layers implementation. Commands
+ * receive only IDs and result references; the pixel pipeline remains here.
+ */
+export async function executeAgentLayerExtraction({ workspace, jobId, assetId, layerIds = [] }) {
+    if (!workspace || workspace !== window.mvrRuntime?.getCurrentWorkspace?.()) {
+        throw new Error('Magic Layers extraction requires the current workspace.');
+    }
+    const item = workbenchItems.get(assetId);
+    if (!item) throw new Error(`Workbench source asset ${assetId} is unavailable.`);
+    if (!workspace.currentState.assetRegistry.get(assetId)) {
+        throw new Error(`Runtime source asset ${assetId} is unavailable.`);
+    }
+
+    const beforeIds = new Set(workbenchItems.keys());
+    const beforeLayerStates = item.layerStates instanceof Map
+        ? new Map([...item.layerStates.entries()].map(([index, value]) => [index, { ...value }]))
+        : null;
+    const beforeLegacyMetadata = captureAgentLayerLegacyMetadata(item);
+    const operationId = `magic_layers_${jobId}_${Date.now()}`;
+    const beforeRuntimeMetadata = captureAgentLayerRuntimeMetadata(workspace.currentState.assetRegistry.get(assetId));
+    activeAgentLayerExtraction += 1;
+    let result;
+    try {
+        result = await triggerLayerExplosion(assetId, {
+            layerIds,
+            selectAll: layerIds.length === 0
+        });
+    } catch (error) {
+        agentLayerExtractionOperations.set(operationId, {
+            operationId,
+            jobId,
+            sourceAssetId: assetId,
+            extractedAssetIds: [...workbenchItems.keys()].filter(id => !beforeIds.has(id)),
+            item,
+            beforeLayerStates,
+            beforeRuntimeMetadata,
+            beforeLegacyMetadata
+        });
+        await undoAgentLayerExtraction({ workspace, operationId });
+        throw error;
+    } finally {
+        activeAgentLayerExtraction = Math.max(0, activeAgentLayerExtraction - 1);
+    }
+
+    if (!result?.success) {
+        agentLayerExtractionOperations.set(operationId, {
+            operationId,
+            jobId,
+            sourceAssetId: assetId,
+            extractedAssetIds: [...workbenchItems.keys()].filter(id => !beforeIds.has(id)),
+            item,
+            beforeLayerStates,
+            beforeRuntimeMetadata,
+            beforeLegacyMetadata
+        });
+        await undoAgentLayerExtraction({ workspace, operationId });
+        throw new Error(result?.error || 'Magic Layers produced no standalone asset.');
+    }
+
+    const extractedAssetIds = [...workbenchItems.keys()].filter(id => !beforeIds.has(id));
+    agentLayerExtractionOperations.set(operationId, {
+        operationId,
+        jobId,
+        sourceAssetId: assetId,
+        extractedAssetIds,
+        item,
+        beforeLayerStates,
+        beforeRuntimeMetadata,
+        beforeLegacyMetadata
+    });
+
+    return {
+        operationId,
+        sourceAssetId: assetId,
+        extractedAssetIds,
+        extractedLayerIds: result.extractedLayerIds || [],
+        extractedCount: extractedAssetIds.length,
+        heldCount: result.heldCount || 0
+    };
+}
+
+export async function commitAgentLayerExtraction({ workspace, operationIds = [] }) {
+    for (const operationId of operationIds) {
+        const operation = agentLayerExtractionOperations.get(operationId);
+        if (!operation) continue;
+        const item = workbenchItems.get(operation.sourceAssetId) || operation.item;
+        if (!item) throw new Error(`Magic Layers source asset ${operation.sourceAssetId} is unavailable at commit.`);
+
+        await Promise.all(operation.extractedAssetIds.map(assetId => waitForWorkbenchItemPersistence(assetId)));
+        const extractedAssets = operation.extractedAssetIds
+            .map(assetId => workspace?.currentState?.assetRegistry?.get(assetId))
+            .filter(Boolean);
+        if (extractedAssets.some(asset => /^(data:|blob:)/i.test(String(asset.sourceImage || '')))) {
+            throw new Error('Magic Layers extracted asset has no durable OSS image reference.');
+        }
+
+        if (typeof item.cleanPlateDataUrl === 'string' && item.cleanPlateDataUrl.startsWith('data:')) {
+            const cleanPlateFile = await dataURLToFile(item.cleanPlateDataUrl, `agent-clean-plate-${operation.sourceAssetId}.png`);
+            const durableCleanPlateUrl = await uploadImageToOSS(cleanPlateFile);
+            item.cleanPlateDataUrl = durableCleanPlateUrl;
+            item.dataUrl = durableCleanPlateUrl;
+        }
+        await persistLayerStateToRuntime(operation.sourceAssetId, item, { persistSession: false });
+    }
+}
+
+export async function releaseAgentLayerExtraction({ operationIds = [] }) {
+    operationIds.forEach(operationId => agentLayerExtractionOperations.delete(operationId));
+}
+
+export async function undoAgentLayerExtraction({ workspace, operationId }) {
+    const operation = agentLayerExtractionOperations.get(operationId);
+    if (!operation) return;
+    const previousAgentFlag = window.__marmoAgentLayerExtractionActive;
+    window.__marmoAgentLayerExtractionActive = true;
+    try {
+        for (const assetId of [...operation.extractedAssetIds].reverse()) {
+            if (typeof window.deleteWorkbenchItem === 'function') {
+                await window.deleteWorkbenchItem(assetId, true, true);
+            }
+        }
+
+        // The adapter deliberately withheld parent persistence. Restore the
+        // in-memory legacy item from the untouched Runtime metadata.
+        const parentItem = workbenchItems.get(operation.sourceAssetId);
+        const parentAsset = workspace.currentState.assetRegistry.get(operation.sourceAssetId);
+        if (parentItem && parentAsset) {
+            Object.assign(parentItem, {
+                layers: parentAsset.layers,
+                scene: parentAsset.scene,
+                semanticViews: parentAsset.semanticViews,
+                hasFullSemanticAnalysis: parentAsset.hasFullSemanticAnalysis,
+                originalDataUrl: parentAsset.originalDataUrl,
+                cleanPlateDataUrl: parentAsset.cleanPlateDataUrl,
+                cleanPlateStatus: parentAsset.cleanPlateStatus,
+                ...(operation.beforeLegacyMetadata || {}),
+                layerStates: operation.beforeLayerStates
+                    ? new Map([...operation.beforeLayerStates.entries()].map(([index, value]) => [index, { ...value }]))
+                    : undefined
+            });
+            if (operation.beforeRuntimeMetadata) {
+                workspace.dispatcher.dispatch({
+                    type: 'UPDATE_ASSET_METADATA',
+                    meta: { silent: true, skipSnapshot: true, skipNotify: true },
+                    payload: {
+                        uid: operation.sourceAssetId,
+                        ...operation.beforeRuntimeMetadata
+                    }
+                });
+            }
+            renderLayerList(getItemSceneLayers(parentItem), operation.sourceAssetId);
+            renderCanvasLayers(operation.sourceAssetId);
+            const parentImage = parentItem.el?.querySelector('.crop-container > img');
+            if (parentImage) parentImage.src = parentItem.cleanPlateDataUrl || parentItem.dataUrl || '';
+        }
+        if (typeof window.reconcileAllAssets === 'function') window.reconcileAllAssets();
+    } finally {
+        window.__marmoAgentLayerExtractionActive = previousAgentFlag;
+        agentLayerExtractionOperations.delete(operationId);
+    }
+}
+
+function captureAgentCapabilitySnapshot({ workspace, itemId, childId }) {
+    const item = itemId ? workbenchItems.get(itemId) : null;
+    const child = childId ? workbenchItems.get(childId) : null;
+    const assetIds = [...new Set([itemId, childId].filter(Boolean))];
+    return {
+        itemId,
+        childId,
+        item,
+        child,
+        beforeWorkbenchIds: new Set(workbenchItems.keys()),
+        itemSnapshot: item ? {
+            dataUrl: item.dataUrl,
+            originalDataUrl: item.originalDataUrl,
+            cleanPlateDataUrl: item.cleanPlateDataUrl,
+            cleanPlateStatus: item.cleanPlateStatus,
+            layers: cloneSerializable(item.layers),
+            scene: cloneSerializable(item.scene),
+            semanticViews: cloneSerializable(item.semanticViews),
+            hasFullSemanticAnalysis: item.hasFullSemanticAnalysis
+        } : null,
+        childSnapshot: child ? cloneSerializable({
+            dataUrl: child.dataUrl,
+            originalDataUrl: child.originalDataUrl,
+            previewUrl: child.previewUrl,
+            runtimeDisplayUrl: child.runtimeDisplayUrl,
+            file: null,
+            assetStatus: child.assetStatus,
+            activeVersionId: child.activeVersionId,
+            versions: child.versions,
+            left: child.left,
+            top: child.top,
+            width: child.width,
+            height: child.height,
+            zIndex: child.zIndex,
+            originalBbox: child.originalBbox,
+            extractionBbox: child.extractionBbox,
+            canonicalBbox: child.canonicalBbox,
+            completionAssetId: child.completionAssetId
+        }) : null,
+        runtimeAssets: new Map(assetIds
+            .map(uid => [uid, workspace.currentState.assetRegistry.get(uid)])
+            .filter(([, asset]) => Boolean(asset))
+            .map(([uid, asset]) => [uid, cloneSerializable(asset)]))
+    };
+}
+
+function summarizeCapabilityQuality(quality) {
+    if (!quality) return null;
+    return {
+        status: quality.status || null,
+        runtimeAction: quality.runtimeAction || null,
+        score: Number.isFinite(Number(quality.score)) ? Number(quality.score) : null,
+        reason: quality.reason || null,
+        issues: Array.isArray(quality.issues) ? quality.issues.slice(0, 8).map(String) : []
+    };
+}
+
+function restoreAgentCapabilitySnapshot(operation, workspace) {
+    const currentIds = [...workbenchItems.keys()];
+    for (const assetId of currentIds) {
+        if (!operation.beforeWorkbenchIds.has(assetId)) {
+            const item = workbenchItems.get(assetId);
+            item?.el?.remove();
+            workbenchItems.delete(assetId);
+            state.selectedWorkbenchItems.delete(assetId);
+            if (workspace.currentState.assetRegistry.get(assetId)) {
+                workspace.dispatcher.dispatch({
+                    type: 'REMOVE_ASSET',
+                    meta: { silent: true, skipSnapshot: true, skipNotify: true },
+                    payload: { uid: assetId }
+                });
+            }
+        }
+    }
+
+    if (operation.item && operation.itemSnapshot) {
+        Object.assign(operation.item, operation.itemSnapshot);
+        const image = operation.item.el?.querySelector('.crop-container > img');
+        if (image) image.src = operation.item.cleanPlateDataUrl || operation.item.dataUrl || '';
+    }
+    if (operation.child && operation.childSnapshot && workbenchItems.has(operation.childId)) {
+        Object.assign(operation.child, operation.childSnapshot);
+        const image = operation.child.el?.querySelector('.crop-container > img') || operation.child.el?.querySelector('img');
+        if (image) image.src = operation.child.runtimeDisplayUrl || operation.child.dataUrl || '';
+    }
+
+    operation.runtimeAssets.forEach((asset, uid) => {
+        if (!workspace.currentState.assetRegistry.get(uid)) return;
+        workspace.dispatcher.dispatch({
+            type: 'UPDATE_ASSET_METADATA',
+            meta: { silent: true, skipSnapshot: true, skipNotify: true },
+            payload: asset
+        });
+    });
+    if (operation.itemId && operation.item) {
+        renderLayerList(getItemSceneLayers(operation.item), operation.itemId);
+        renderCanvasLayers(operation.itemId);
+    }
+}
+
+/**
+ * Runtime adapter for AI capabilities. Existing completion/edit algorithms
+ * remain the source of truth; this adapter only provides transaction staging,
+ * verification references, and one commit boundary.
+ */
+export async function executeAgentCapability({ workspace, jobId, capabilityType, targetAssetIds = [], params = {} }) {
+    if (!workspace || workspace !== window.mvrRuntime?.getCurrentWorkspace?.()) {
+        throw new Error('Agent capability requires the current workspace.');
+    }
+
+    const itemId = params.itemId || params.parentItemId || workbenchItems.get(params.childId)?.parentId;
+    const childId = params.childId;
+    const item = itemId ? workbenchItems.get(itemId) : null;
+    if (!item && capabilityType === 'object_completion') throw new Error(`Completion source asset ${itemId} is unavailable.`);
+    if (capabilityType === 'replace_material' && !childId) throw new Error('Material replacement requires a child asset.');
+
+    const operationId = `capability_${jobId}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const operation = captureAgentCapabilitySnapshot({ workspace, itemId, childId });
+    operation.operationId = operationId;
+    operation.jobId = jobId;
+    operation.capabilityType = capabilityType;
+
+    try {
+        if (capabilityType === 'object_completion') {
+            const completionAssetId = params.completionAssetId;
+            if (!completionAssetId) throw new Error('Object completion requires a completion asset.');
+            const completion = await executeObjectCompletion(item, completionAssetId, {
+                onProgress: message => console.info('[Agent capability]', message)
+            });
+            if (!completion?.success || !completion.canonicalFile) {
+                throw new Error('Object completion did not produce a canonical asset.');
+            }
+            const replacement = await replaceSplitChildWithCanonicalAsset(
+                itemId,
+                item,
+                completion.asset,
+                completion.canonicalFile,
+                { persist: false }
+            );
+            const resultChildId = replacement?.childId || getWorkbenchItemId(replacement?.child);
+            if (!resultChildId) throw new Error('Object completion produced no Workspace asset.');
+            operation.targetAssetIds = [resultChildId];
+            agentCapabilityOperations.set(operationId, operation);
+            return {
+                operationId,
+                targetAssetIds: [resultChildId],
+                outputRefs: {
+                    capabilityType,
+                    sourceAssetId: itemId,
+                    completionAssetId,
+                    childAssetId: resultChildId,
+                    parentLayerId: replacement.targetLayer?.id || null,
+                    versionId: replacement.targetLayer?.activeVersionId || null,
+                    quality: summarizeCapabilityQuality(completion.quality)
+                }
+            };
+        }
+
+        if (capabilityType === 'replace_material') {
+            const result = await handleIsolatedAssetEdit(childId, params.prompt, {
+                replaceCurrent: true,
+                persist: false,
+                recordHistory: false,
+                suppressMessages: true,
+                throwOnError: true,
+                source: 'agent_capability'
+            });
+            if (!result?.success) throw new Error(result?.error || 'Material replacement produced no result.');
+            operation.targetAssetIds = [childId];
+            agentCapabilityOperations.set(operationId, operation);
+            return {
+                operationId,
+                targetAssetIds: [childId],
+                outputRefs: {
+                    capabilityType,
+                    childAssetId: childId,
+                    parentLayerId: result.parentLayerId || null,
+                    versionId: result.versionId || null
+                }
+            };
+        }
+
+        if (capabilityType === 'edit_asset') {
+            const editItemId = params.itemId || targetAssetIds[0];
+            const editItem = editItemId ? workbenchItems.get(editItemId) : null;
+            if (!editItem) throw new Error('Object editing requires a Workspace asset.');
+            const mode = params.mode === 'current_layer' ? 'current_layer' : 'variant';
+            if (mode === 'current_layer' && (!editItem.parentId || !hasSplitLayerPlacement(editItem) || !resolveParentLayerForAsset(workbenchItems.get(editItem.parentId), editItem))) {
+                throw new Error('当前对象没有可回写的父图层，只能生成新版本。');
+            }
+            const result = await handleIsolatedAssetEdit(editItemId, params.prompt, {
+                replaceCurrent: mode === 'current_layer',
+                persist: false,
+                recordHistory: false,
+                suppressMessages: true,
+                throwOnError: true,
+                source: 'agent_object_editor'
+            });
+            if (!result?.success) throw new Error(result?.error || '对象编辑没有生成有效结果。');
+            const resultAssetId = result.assetId || result.childId || editItemId;
+            operation.targetAssetIds = [resultAssetId];
+            agentCapabilityOperations.set(operationId, operation);
+            return {
+                operationId,
+                targetAssetIds: [resultAssetId],
+                outputRefs: {
+                    capabilityType,
+                    mode,
+                    sourceAssetId: editItemId,
+                    assetId: resultAssetId,
+                    parentLayerId: result.parentLayerId || null,
+                    versionId: result.versionId || null
+                }
+            };
+        }
+        throw new Error(`Unsupported Agent capability: ${capabilityType}`);
+    } catch (error) {
+        restoreAgentCapabilitySnapshot(operation, workspace);
+        throw error;
+    }
+}
+
+export async function undoAgentCapability({ workspace, operationId }) {
+    const operation = agentCapabilityOperations.get(operationId);
+    if (!operation) return;
+    restoreAgentCapabilitySnapshot(operation, workspace);
+    agentCapabilityOperations.delete(operationId);
+}
+
+export async function commitAgentCapabilities({ workspace, operationIds = [] }) {
+    for (const operationId of operationIds) {
+        const operation = agentCapabilityOperations.get(operationId);
+        if (!operation) continue;
+        const ids = [...new Set([operation.itemId, ...(operation.targetAssetIds || [])].filter(Boolean))];
+        for (const itemId of ids) {
+            const item = workbenchItems.get(itemId);
+            if (item) await persistLayerStateToRuntime(itemId, item, { persistSession: false });
+        }
+        if (ids.length === 0) throw new Error(`Capability source ${operation.itemId} is unavailable at commit.`);
+    }
+}
+
+export async function releaseAgentCapabilities({ operationIds = [] }) {
+    operationIds.forEach(operationId => agentCapabilityOperations.delete(operationId));
 }
 
 export async function triggerMagicLayers(itemId) {
@@ -1159,7 +3268,7 @@ export async function triggerMagicLayers(itemId) {
     const hasAutoDetectedLayers = Array.isArray(existingLayers) && existingLayers.some(l => l.layerType || (l.id && !l.id.startsWith('box-layer-')));
     if (!item.hasFullSemanticAnalysis && !hasAutoDetectedLayers) {
         overlay?.update({ progress: 8 });
-        addMessage({ sender: 'bot', type: 'text', content: '🔍 Magic Layers 正在先执行全图语义分析...' });
+        addMessage({ sender: 'bot', type: 'text', visibility: 'progress', persist: false, content: '🔍 Magic Layers 正在先执行全图语义分析...' });
         try {
             const analysisResult = await analyzeImageLayers(item.file || item.dataUrl);
             overlay?.update({ progress: 22 });
@@ -1237,8 +3346,25 @@ export async function triggerMagicLayers(itemId) {
     addMessage({
         sender: 'bot',
         type: 'text',
+        visibility: 'progress',
+        persist: false,
         content: `✨ **Magic Layers 启动**\n已自动选中 ${selectedIndices.length} 个非背景图层，开始语义提取与一次性背景净化。`
     });
+
+    if (isAgentRuntimeFeatureEnabled('magicLayersCommand')) {
+        const layerIds = selectedIndices
+            .map(index => layers[index]?.id)
+            .filter(Boolean);
+        await startLayerExtractionJob({
+            runtime: window.mvrRuntime,
+            itemId,
+            layerIds,
+            goal: `提取当前图片的 ${layerIds.length} 个可编辑图层`
+        });
+        await showLayerManagerModal(itemId, false);
+        ensureLayerPanelFooter(itemId);
+        return;
+    }
 
     try {
         overlay?.update({ progress: 55 });
@@ -1255,14 +3381,72 @@ export async function triggerMagicLayers(itemId) {
  * 执行快捷融合逻辑
  * 逻辑：根据子图的 Bbox 在原图上生成蒙版并进行局部重绘
  */
-export async function handleQuickFusionSync(childId, promptText) {
+export async function handleQuickFusionSync(childId, promptText, options = {}) {
     const childItem = workbenchItems.get(childId);
-    const parentItem = workbenchItems.get(childItem.parentId);
-    if (!childItem || !parentItem) return;
+    const parentItem = childItem ? workbenchItems.get(childItem.parentId) : null;
+    // Only an explicit sync request may replace an existing decomposed layer.
+    // Legacy callers without this flag retain the old full-scene sync behavior.
+    const requestedReplace = options.replaceCurrent === true;
+    const linkedToSplitLayer = hasSplitLayerPlacement(childItem);
+    const parentLayer = parentItem && linkedToSplitLayer
+        ? resolveParentLayerForAsset(parentItem, childItem)
+        : null;
+
+    console.info('[Layer Asset Sync] route check', {
+        childId,
+        operationMode: options.operationMode || 'fusion',
+        requestedReplace,
+        childFound: !!childItem,
+        childType: childItem?.type || null,
+        parentId: childItem?.parentId || null,
+        parentFound: !!parentItem,
+        hasOriginalBbox: Array.isArray(childItem?.originalBbox),
+        splitTypeRecognized: isSplitLayerAsset(childItem),
+        parentLayerMatched: !!parentLayer
+    });
+
+    if (!childItem) {
+        const message = '同步失败：找不到当前图层';
+        console.error('[Layer Asset Sync]', message, { childId });
+        addMessage({ sender: 'bot', type: 'text', content: `❌ ${message}` });
+        return null;
+    }
+
+    // A decomposed layer is already an isolated asset. Do not send the whole
+    // scene back to the image model: edit the asset and append a layer version.
+    if (requestedReplace && linkedToSplitLayer) {
+        if (!parentItem) {
+            const message = `同步失败：图层“${childItem.layerName || childId}”的父图已不存在`;
+            console.error('[Layer Asset Sync]', message, { childId });
+            addMessage({ sender: 'bot', type: 'text', content: `❌ ${message}` });
+            return null;
+        }
+        if (!parentLayer) {
+            const message = `同步失败：无法将“${childItem.layerName || childId}”匹配到原 Magic Layers 图层`;
+            console.error('[Layer Asset Sync]', message, { childId, parentId: childItem.parentId });
+            addMessage({ sender: 'bot', type: 'text', content: `❌ ${message}` });
+            return null;
+        }
+        console.log(`[Layer Asset Edit] routing sync to in-place version replacement: child=${childId}`);
+        return handleIsolatedAssetEdit(childId, promptText, {
+            replaceCurrent: true,
+            parentItemId: childItem.parentId,
+            parentItem,
+            source: 'sync_to_current_layer'
+        });
+    }
+
+    if (requestedReplace) {
+        const message = '同步到当前图层仅支持 Magic Layers 拆分后的独立图层';
+        console.error('[Layer Asset Sync]', message, { childId, childType: childItem.type || null });
+        addMessage({ sender: 'bot', type: 'text', content: `❌ ${message}` });
+        return null;
+    }
+    if (!parentItem) return;
 
     const executeQuickFusionSync = async (customPrompt) => {
         const promptToUse = customPrompt || promptText;
-        const tempMsg = addMessage({ sender: 'bot', type: 'text', content: `🔄 **正在同步至原图**\n正在将针对“${childItem.layerName || '子图'}”的修改（${promptToUse}）同步回主场景中...` });
+        const tempMsg = addMessage({ sender: 'bot', type: 'text', visibility: 'progress', persist: false, content: `🔄 **正在同步至原图**\n正在将针对“${childItem.layerName || '子图'}”的修改（${promptToUse}）同步回主场景中...` });
 
         try {
             // 1. 利用子图自带的 originalBbox 生成精确蒙版
@@ -1331,30 +3515,49 @@ export async function handleQuickFusionSync(childId, promptText) {
                 rotation = parseFloat(match[1]) * Math.PI / 180;
             }
 
+            // Prefer the extracted layer's alpha silhouette over a solid bbox.
+            // Fall back to the bbox only when the child has no usable cutout.
+            let childMaskImage = null;
+            const childMaskSource = childItem.dataUrl || childItem.cutoutUrl || null;
+            if (childMaskSource) {
+                try {
+                    childMaskImage = await loadImageForFusion(getProxiedUrl(childMaskSource));
+                } catch (error) {
+                    console.warn('[Fusion Sync] child alpha mask unavailable; using bbox mask:', error);
+                }
+            }
+
             ctx.save();
             ctx.translate(drawX + drawW / 2, drawY + drawH / 2);
-            if (rotation !== 0) {
-                ctx.rotate(rotation);
-            }
+            if (rotation !== 0) ctx.rotate(rotation);
             ctx.fillRect(-drawW / 2, -drawH / 2, drawW, drawH);
+            if (childMaskImage) {
+                ctx.globalCompositeOperation = 'destination-in';
+                ctx.drawImage(childMaskImage, -drawW / 2, -drawH / 2, drawW, drawH);
+            }
             ctx.restore();
             
             const preciseMask = maskCanvas.toDataURL('image/png');
 
-            // 1.5. 准备底图：使用渲染器获取当前工作台的视觉状态
-            const baseCanvas = await renderSceneToCanvas(parentItem.id);
-            if (!baseCanvas) throw new Error("无法渲染场景");
+            // 1.5. Prepare the scene at source resolution. The mask above is
+            // built in source pixels, so CSS-sized rendering would misalign it.
+            const renderScale = parentImg.naturalWidth / Math.max(1, parentEl.offsetWidth || parentImg.naturalWidth);
+            const baseCanvas = await renderSceneToCanvas(parentItem.id, renderScale);
+            if (!baseCanvas) throw new Error("无法按原图分辨率渲染场景");
 
             const baseDataUrl = baseCanvas.toDataURL('image/png');
             const baseFile = await dataURLToFile(baseDataUrl, `base-${Date.now()}.png`);
 
-            // 2. 调用 Gemini 进行融合重绘
-            const syncPrompt = `${promptToUse}. Change only the visual look of the object within the masked area. Keep the background and perspective of the rest of the scene perfect.`;
+            // Preserve the source framing instead of forcing this edit to 1:1.
+            const sourceAspectRatio = getClosestSupportedAspectRatio(parentImg.naturalWidth, parentImg.naturalHeight);
+            console.log('[Fusion Sync] source=', `${parentImg.naturalWidth}x${parentImg.naturalHeight}`, 'rendered=', `${baseCanvas.width}x${baseCanvas.height}`, 'aspect=', sourceAspectRatio, 'mask=', `${maskCanvas.width}x${maskCanvas.height}`);
+            const syncPrompt = `${promptToUse}. Return one single final scene, not a collage, grid, panel, or duplicated image. Keep the exact original framing and aspect ratio. Change only the object inside the masked area, keep its original position, scale, floor contact, and perspective, and preserve every pixel outside the masked area.`;
             
-            let result = await editOrQueryImageWithGemini(syncPrompt, baseFile, [], preciseMask);
+            let result = await editOrQueryImageWithGemini(syncPrompt, baseFile, [], preciseMask, sourceAspectRatio);
 
             if (result && result.success && result.imageData) {
-                const imgSrc = `data:${result.mimeType};base64,${result.imageData}`;
+                const generatedDataUrl = `data:${result.mimeType};base64,${result.imageData}`;
+                const imgSrc = await compositeMaskedFusionResult(baseDataUrl, generatedDataUrl, preciseMask);
                 const newParentFile = await dataURLToFile(imgSrc, `synced-parent-${Date.now()}.png`);
                 
                 // 3. 将新的原图添加到工作台（放在原图位置附近）
@@ -1402,13 +3605,33 @@ export async function handleQuickFusionSync(childId, promptText) {
  * 独立资产编辑逻辑 (Isolated Asset Edit)
  * 逻辑：给透明图层垫底色 -> Gemini 修改 -> 再次抠图 -> 生成新透明图层
  */
-export async function handleIsolatedAssetEdit(childId, promptText) {
+export async function handleIsolatedAssetEdit(childId, promptText, options = {}) {
     const childItem = workbenchItems.get(childId);
     if (!childItem) return;
+    const parentItem = options.parentItem || workbenchItems.get(childItem.parentId);
+
+    console.info('[Layer Asset Edit] start', {
+        childId,
+        childType: childItem.type || null,
+        parentId: childItem.parentId || null,
+        replaceCurrent: options.replaceCurrent === true,
+        source: options.source || 'isolated_asset'
+    });
+    if (options.replaceCurrent && (!parentItem || !hasSplitLayerPlacement(childItem) || !resolveParentLayerForAsset(parentItem, childItem))) {
+        const message = '原位替换失败：当前资产缺少可回写的父图层';
+        console.error('[Layer Asset Edit]', message, {
+            childId,
+            parentId: childItem.parentId || null,
+            childType: childItem.type || null,
+            originalBbox: childItem.originalBbox || null
+        });
+        addMessage({ sender: 'bot', type: 'text', content: `❌ ${message}` });
+        return;
+    }
 
     const executeIsolatedEdit = async (customPrompt) => {
         const promptToUse = customPrompt || promptText;
-        const tempMsg = addMessage({ sender: 'bot', type: 'text', content: `🎨 **独立资产编辑中**\n正在对“${childItem.layerName || '子图'}”进行独立修改（${promptToUse}）...` });
+        const tempMsg = addMessage({ sender: 'bot', type: 'text', visibility: 'progress', persist: false, content: `🎨 **独立资产编辑中**\n正在对“${childItem.layerName || '子图'}”进行独立修改（${promptToUse}）...` });
 
         try {
             // 1. 获取当前透明图层
@@ -1420,6 +3643,33 @@ export async function handleIsolatedAssetEdit(childId, promptText) {
             }
             childImg.src = childSrc;
             await new Promise(r => childImg.onload = r);
+
+            // Keep the generated asset visually comparable to its source item
+            // when it is pushed beside the source in the Workbench. The file
+            // itself still keeps the source asset's natural pixel dimensions.
+            const sourceDisplayWidth = Math.max(
+                1,
+                parseFloat(childItem.el?.style?.width) || childItem.el?.offsetWidth || childImg.naturalWidth
+            );
+            const sourceDisplayHeight = Math.max(
+                1,
+                parseFloat(childItem.el?.style?.height) || childItem.el?.offsetHeight || childImg.naturalHeight
+            );
+            const sourceRuntimeAsset = window.mvrRuntime?.getCurrentWorkspace?.()?.currentState?.assetRegistry?.get(childId);
+            const runtimeZIndex = Number(sourceRuntimeAsset?.transform?.zIndex);
+            const domZIndex = Number.parseInt(childItem.el?.style?.zIndex || '', 10);
+            const sourceZIndex = Number.isFinite(runtimeZIndex)
+                ? runtimeZIndex
+                : Number.isFinite(domZIndex)
+                    ? domZIndex
+                    : 0;
+            const sourceLayerId = childItem.sourceLayerId || childItem.layerId || null;
+            console.info('[Layer Asset Edit] source stacking captured', {
+                childId,
+                sourceLayerId,
+                sourceZIndex,
+                sourceDisplaySize: `${sourceDisplayWidth}x${sourceDisplayHeight}`
+            });
 
             // --- 专属逻辑：独立资产的前端秒改（仅限换色） ---
             function detectFastColorChange(prompt) {
@@ -1454,7 +3704,7 @@ export async function handleIsolatedAssetEdit(childId, promptText) {
             const targetRgbColor = detectFastColorChange(promptToUse);
             if (targetRgbColor) {
                 if (tempMsg && tempMsg.parentNode) tempMsg.remove();
-                addMessage({ sender: 'bot', type: 'text', content: `⚡ **前端增强秒改触发**\n检测到纯颜色编辑指令，启动针对半透明材质(如头纱)的高光保护与渐变映射渲染算法...` });
+                addMessage({ sender: 'bot', type: 'text', visibility: 'progress', persist: false, content: `⚡ **前端增强秒改触发**\n检测到纯颜色编辑指令，启动针对半透明材质(如头纱)的高光保护与渐变映射渲染算法...` });
                 
                 const fastCanvas = document.createElement('canvas');
                 fastCanvas.width = childImg.naturalWidth;
@@ -1515,12 +3765,42 @@ export async function handleIsolatedAssetEdit(childId, promptText) {
                 fastCtx.putImageData(imgData, 0, 0);
 
                 const finalAssetDataUrl = fastCanvas.toDataURL('image/png');
+
+                if (options.replaceCurrent) {
+                    const refinedAssetDataUrl = await tryRefineEditedAssetWithSam(
+                        finalAssetDataUrl,
+                        childItem,
+                        childImg.naturalWidth,
+                        childImg.naturalHeight,
+                        tempMsg
+                    );
+                    const replacementDataUrl = await alignAssetBottomToSource(
+                        refinedAssetDataUrl || finalAssetDataUrl,
+                        childImg,
+                        childImg.naturalWidth,
+                        childImg.naturalHeight
+                    );
+                    const replacement = await replaceExistingLayerAsset(childId, childItem, childItem.parentId, parentItem, replacementDataUrl, promptToUse, {
+                        persist: options.persist !== false,
+                        recordHistory: options.recordHistory !== false
+                    });
+                    if (tempMsg && tempMsg.parentNode) tempMsg.remove();
+                    if (!options.suppressMessages) addMessage({ sender: 'bot', type: 'text', content: `✅ **图层版本已替换**！“${childItem.layerName || '当前图层'}”已更新，位置、比例和透视保持不变。` });
+                    return { success: true, childId, versionId: replacement.versionId, parentLayerId: replacement.parentLayer?.id || null };
+                }
+
                 const finalAssetFile = await dataURLToFile(finalAssetDataUrl, `colorized-asset-${Date.now()}.png`);
 
-                const smartPos = calculateSmartPosition(childItem.el, 2); 
+                const smartPos = calculateSmartPosition(childItem.el, 1); // 生成资产放在当前图层右侧
                 const newAssetId = await addImageToWorkbench(finalAssetFile, `颜色秒改: ${childItem.layerName || '子图'}`, {
                     x: smartPos.x,
                     y: smartPos.y,
+                    initialWidth: sourceDisplayWidth,
+                    initialHeight: sourceDisplayHeight,
+                    zIndex: sourceZIndex,
+                    sourceZIndex,
+                    sourceChildId: childId,
+                    sourceLayerId,
                     parentId: childItem.parentId, 
                     layerName: childItem.layerName,
                     type: 'isolated-edit',
@@ -1540,12 +3820,12 @@ export async function handleIsolatedAssetEdit(childId, promptText) {
                     }
                 }, 100);
 
-                if (window.addWorkbenchActionToChat) {
+                if (window.addWorkbenchActionToChat && options.source !== 'agent_object_editor') {
                     await window.addWorkbenchActionToChat(`独立编辑 [${childItem.layerName || '子图'}]`, promptToUse, finalAssetDataUrl, executeIsolatedEdit);
-                } else {
+                } else if (options.source !== 'agent_object_editor') {
                     addMessage({ sender: 'bot', type: 'text', content: `✅ **秒改完成**！已为您生成新的调整目标图。`});
                 }
-                return; // 直接拦截后续 AI 生成流程
+                return { success: true, assetId: newAssetId, childId: newAssetId };
             }
             // --- 快速通道结束 ---
 
@@ -1568,34 +3848,14 @@ export async function handleIsolatedAssetEdit(childId, promptText) {
             const isFineDetail = ((childItem.layerName || '').includes('发') && !(childItem.layerName || '').includes('沙发')) || (childItem.layerName || '').includes('毛') || (childItem.layerName || '').includes('羽') || (childItem.layerName || '').includes('树') || (childItem.layerName || '').includes('草') || (childItem.layerName || '').includes('叶') || (childItem.layerName || '').includes('线') || (childItem.layerName || '').includes('网');
             const useMaskFormat = isCloudOrSmoke || isFineDetail;
 
-            const avgR = strategy.metrics?.bgMean?.r || 127;
-            const avgG = strategy.metrics?.bgMean?.g || 127;
-            const fgChroma = strategy.metrics?.fgChroma || { r: 0, g: 0, b: 0, m: 0 };
-
-            const backdrops = [
-                { name: 'pure, solid green', hex: '#00FF00', rgb: [0, 255, 0], rule: 'Use pure green (#00FF00) ONLY.', conflict: fgChroma.g },
-                { name: 'pure, solid magenta', hex: '#FF00FF', rgb: [255, 0, 255], rule: 'Use pure magenta (#FF00FF) ONLY.', conflict: fgChroma.m },
-                { name: 'pure, solid blue', hex: '#0000FF', rgb: [0, 0, 255], rule: 'Use pure blue (#0000FF) ONLY.', conflict: fgChroma.b },
-                { name: 'pure, solid red', hex: '#FF0000', rgb: [255, 0, 0], rule: 'Use pure red (#FF0000) ONLY.', conflict: fgChroma.r }
-            ];
-
-            let bestBackdrop = backdrops[0];
-            let minConflict = Infinity;
-            for (const bd of backdrops) {
-                if (bd.conflict < minConflict) {
-                    minConflict = bd.conflict;
-                    bestBackdrop = bd;
-                }
-            }
-
-            // Hardcode logic for specific name hints just in case
-            if ((childItem.layerName || '').includes('云') || (childItem.layerName || '').includes('雾') || (childItem.layerName || '').includes('光')) {
-                bestBackdrop = backdrops[1]; // Black / Magenta in original V5 fallback
-            } else if ((childItem.layerName || '').includes('皮') || (childItem.layerName || '').includes('木') || (childItem.layerName || '').includes('人')) {
-                bestBackdrop = backdrops[2]; // Green
-            } else if ((childItem.layerName || '').includes('树') || (childItem.layerName || '').includes('草') || (childItem.layerName || '').includes('叶')) {
-                bestBackdrop = backdrops[3]; // Magenta
-            }
+            const bestBackdrop = selectAdaptiveBackdrop(imgDataObj, childItem.layerName || 'Asset');
+            console.info('[Layer Asset Edit] adaptive backdrop selected', {
+                layerName: childItem.layerName || 'Asset',
+                backdrop: bestBackdrop.name,
+                rgb: bestBackdrop.rgb,
+                strategyPath: strategy.path,
+                visibleSampleCount: bestBackdrop.sampleCount || 0
+            });
 
             const bgColorHex = bestBackdrop.hex;
             const bgColorName = bestBackdrop.name;
@@ -1622,6 +3882,15 @@ export async function handleIsolatedAssetEdit(childId, promptText) {
             
             const paddedDataUrl = bgCanvas.toDataURL('image/png');
             const paddedFile = await dataURLToFile(paddedDataUrl, `padded-${Date.now()}.png`);
+            const assetAspectRatio = getClosestSupportedAspectRatio(
+                childImg.naturalWidth,
+                childImg.naturalHeight
+            );
+            console.info('[Layer Asset Edit] generation aspect selected', {
+                sourceSize: `${childImg.naturalWidth}x${childImg.naturalHeight}`,
+                aspectRatio: assetAspectRatio,
+                outputPolicy: 'restore_original_asset_pixels'
+            });
 
             // 3. 调用 Gemini 进行独立资产重绘材质与造型
             // FORCE standard generation in edit mode. Overrides useMaskFormat.
@@ -1631,10 +3900,17 @@ Your task is to modify the object "${childItem.layerName || 'object'}" in the im
 CRITICAL REQUIREMENTS:
 1. ZERO HALLUCINATION: You MUST NOT redraw or alter the bounding box shape of the object unless instructed.
 2. BACKGROUND RULE: Your ONLY task regarding the background is to keep it a perfectly solid, uniform ${bgColorName} color (${bgColorHex}). ${bgColorRule} Do not add shadows, gradients, or environment.
-3. OBJECT ISOLATION: Only modify the object itself based on the instruction. Maintain its original scale and general position.
-4. HIGH QUALITY: Ensure the modified object has realistic textures and lighting.`;
+3. OBJECT ISOLATION: Only modify the object itself based on the instruction. Keep it inside the original object's canvas footprint.
+4. PLACEMENT: Preserve the original viewing angle, plane orientation, center position, visual scale, and contact direction. Do not zoom, recenter, rotate, or expand the object to fill the canvas.
+5. HIGH QUALITY: Ensure the modified object has realistic textures and lighting.`;
 
-            let result = await editOrQueryImageWithGemini(isolatedPrompt, paddedFile);
+            let result = await editOrQueryImageWithGemini(
+                isolatedPrompt,
+                paddedFile,
+                [],
+                null,
+                assetAspectRatio
+            );
 
             if (!result || !result.success || !result.imageData) {
                 throw new Error("Gemini 资产编辑失败");
@@ -1661,15 +3937,27 @@ CRITICAL REQUIREMENTS:
             const tempCtx = tempWorkspaceCanvas.getContext('2d');
             tempCtx.imageSmoothingEnabled = true;
             tempCtx.imageSmoothingQuality = 'high';
-            // 强制将 Gemini 吐回来的任意尺寸图片，重新拉伸/缩放贴合我们的物理画布
-            tempCtx.drawImage(reconstructedImg, 0, 0, bgCanvas.width, bgCanvas.height);
+            // 将模型结果等比铺满原始带 padding 的画布，裁掉多余画布，避免
+            // 标准输出比例被强行拉伸或因 contain 造成对象整体缩小。
+            drawImageCoveringTarget(tempCtx, reconstructedImg, bgCanvas.width, bgCanvas.height);
 
             const generatedImageDataObj = tempCtx.getImageData(0, 0, tempWorkspaceCanvas.width, tempWorkspaceCanvas.height);
+            const sampledBackdrop = sampleGeneratedBackdrop(generatedImageDataObj, bestBackdrop.rgb);
+            const matteBackgroundRgb = sampledBackdrop.rgb;
+            console.info('[Layer Asset Edit] generated backdrop sampled', {
+                requested: bestBackdrop.rgb,
+                sampled: sampledBackdrop.sampledRgb,
+                used: matteBackgroundRgb,
+                source: sampledBackdrop.source,
+                stable: sampledBackdrop.stable,
+                sampleCount: sampledBackdrop.sampleCount,
+                spread: Number(sampledBackdrop.spread.toFixed(2))
+            });
             const taskId = `iso_asset_${Date.now()}`;
 
             // 针对实体服装等需要走严格固体抠图算法的，传指定 bgColor 避免依赖边缘猜色。
             // 针对云雾则留空，让其内部降级为 channel matting
-            const extractionConfig = useMaskFormat ? {} : { type: 'solid', bgColor: bestBackdrop.rgb };
+            const extractionConfig = useMaskFormat ? {} : { type: 'solid', bgColor: matteBackgroundRgb };
 
             let processedAlphaData = await globalMatteTaskSystem.enqueueProcess(
                 taskId, 
@@ -1683,6 +3971,18 @@ CRITICAL REQUIREMENTS:
             const extractedImageData = new ImageData(processedAlphaData, tempWorkspaceCanvas.width, tempWorkspaceCanvas.height);
             tempCtx.putImageData(extractedImageData, 0, 0);
 
+            const matteImageData = tempCtx.getImageData(0, 0, tempWorkspaceCanvas.width, tempWorkspaceCanvas.height);
+            const despillStats = despillMatteImageData(matteImageData, matteBackgroundRgb);
+            tempCtx.putImageData(matteImageData, 0, 0);
+            console.info('[Layer Asset Edit] matte edge cleanup', {
+                background: matteBackgroundRgb,
+                edgePixels: despillStats.edgePixels,
+                correctedPixels: despillStats.correctedPixels,
+                averageSpill: Number(despillStats.averageSpill.toFixed(2)),
+                unmixedPixels: despillStats.unmixedPixels,
+                averageUnmixStrength: Number(despillStats.averageUnmixStrength.toFixed(3))
+            });
+
             // 裁切回原始尺寸 (Crop padding back)
             const finalCanvas = document.createElement('canvas');
             finalCanvas.width = childImg.naturalWidth;
@@ -1691,13 +3991,43 @@ CRITICAL REQUIREMENTS:
             finalCtx.drawImage(tempWorkspaceCanvas, padX, padY, childImg.naturalWidth, childImg.naturalHeight, 0, 0, childImg.naturalWidth, childImg.naturalHeight);
 
             const finalAssetDataUrl = finalCanvas.toDataURL('image/png');
+
+            if (options.replaceCurrent) {
+                const refinedAssetDataUrl = await tryRefineEditedAssetWithSam(
+                    finalAssetDataUrl,
+                    childItem,
+                    childImg.naturalWidth,
+                    childImg.naturalHeight,
+                    tempMsg
+                );
+                const replacementDataUrl = await alignAssetBottomToSource(
+                    refinedAssetDataUrl || finalAssetDataUrl,
+                    childImg,
+                    childImg.naturalWidth,
+                    childImg.naturalHeight
+                );
+                const replacement = await replaceExistingLayerAsset(childId, childItem, childItem.parentId, parentItem, replacementDataUrl, promptToUse, {
+                    persist: options.persist !== false,
+                    recordHistory: options.recordHistory !== false
+                });
+                if (tempMsg && tempMsg.parentNode) tempMsg.remove();
+                if (!options.suppressMessages) addMessage({ sender: 'bot', type: 'text', content: `✅ **图层版本已替换**！“${childItem.layerName || '当前图层'}”已更新，位置、比例和透视保持不变。` });
+                return { success: true, childId, versionId: replacement.versionId, parentLayerId: replacement.parentLayer?.id || null };
+            }
+
             const finalAssetFile = await dataURLToFile(finalAssetDataUrl, `edited-asset-${Date.now()}.png`);
 
             // 6. 将新的透明资产添加到工作台
-            const smartPos = calculateSmartPosition(childItem.el, 2); // 2=下方
+            const smartPos = calculateSmartPosition(childItem.el, 1); // 生成资产放在当前图层右侧
             const newAssetId = await addImageToWorkbench(finalAssetFile, `独立编辑: ${childItem.layerName || '子图'}`, {
                 x: smartPos.x,
                 y: smartPos.y,
+                initialWidth: sourceDisplayWidth,
+                initialHeight: sourceDisplayHeight,
+                zIndex: sourceZIndex,
+                sourceZIndex,
+                sourceChildId: childId,
+                sourceLayerId,
                 parentId: childItem.parentId, // 保持族谱关联
                 layerName: childItem.layerName,
                 type: 'isolated-edit',
@@ -1719,19 +4049,22 @@ CRITICAL REQUIREMENTS:
             }, 100);
 
             if (tempMsg && tempMsg.parentNode) tempMsg.remove();
-            if (window.addWorkbenchActionToChat) {
+            if (window.addWorkbenchActionToChat && options.source !== 'agent_object_editor') {
                 await window.addWorkbenchActionToChat(`独立编辑 [${childItem.layerName || '子图'}]`, promptToUse, finalAssetDataUrl, executeIsolatedEdit);
-            } else {
+            } else if (options.source !== 'agent_object_editor') {
                 addMessage({ sender: 'bot', type: 'text', content: `✅ **独立编辑完成**！已为您生成新的透明资产：${promptToUse}` });
             }
+            return { success: true, assetId: newAssetId, childId: newAssetId };
         } catch (e) {
             console.error("Isolated Edit Failed:", e);
             if (tempMsg && tempMsg.parentNode) tempMsg.remove();
-            addMessage({ sender: 'bot', type: 'text', content: `❌ 独立编辑失败: ${e.message}` });
+            if (!options.suppressMessages) addMessage({ sender: 'bot', type: 'text', content: `❌ 独立编辑失败: ${e.message}` });
+            if (options.throwOnError) throw e;
+            return { success: false, error: e?.message || String(e), childId };
         }
     };
 
-    await executeIsolatedEdit();
+    return executeIsolatedEdit();
 }
 
 /**
@@ -1757,6 +4090,8 @@ export async function performPreciseEdit(itemId, box, promptText) {
         const tempMsg = addMessage({ 
             sender: 'bot', 
             type: 'text', 
+            visibility: 'progress',
+            persist: false,
             content: `${taskConfig.icon} **正在调用：${taskConfig.label}专业技能**\n${taskConfig.status}` 
         });
 
@@ -2033,36 +4368,11 @@ export async function extractSingleBoxLayer(itemId, layerName, bbox, dataUrl) {
         const segmented = await segmentSingleLayer({
             item,
             layer: layerDefinition,
-            onProgress: (message) => console.log(`[FastSAM Box ${layerName}] ${message}`)
+            onProgress: (message) => console.log(`[FastSAM Box ${layerName}] ${message}`),
+            qualityProfile: 'completion'
         });
 
         if (segmented?.dataUrl) {
-            if (segmented.shouldGenerateRuntimeLayer === false || segmented.runtimeAction === 'hold') {
-                layerDefinition.assetStatus = 'quality_hold';
-                layerDefinition.extractEngine = segmented.extractEngine || 'fastsam';
-                layerDefinition.quality = segmented.quality || {
-                    status: 'low_quality',
-                    runtimeAction: 'hold',
-                    reason: 'quality_gate_hold'
-                };
-                updateLayerExtractionMetadata(item, {
-                    id: layerDefinition.id,
-                    name: layerDefinition.name
-                }, {
-                    extractEngine: layerDefinition.extractEngine,
-                    quality: layerDefinition.quality,
-                    bbox: segmented.bbox || bbox
-                });
-                state.workbenchItems.set(itemId, item);
-                await persistLayerStateToRuntime(itemId, item);
-                addMessage({ sender: 'bot', type: 'text', content: `⚠️ 图层 **${layerName}** 的 FastSAM 结果质量不足，已标记为需要高精度模型处理。`});
-                if(document.getElementById('workbenchLayerListModal') && document.getElementById('workbenchLayerListModal').style.display !== 'none') {
-                    renderLayerList(currentLayers, itemId);
-                }
-                renderCanvasLayers(itemId);
-                return;
-            }
-
             layerDefinition.cutoutUrl = segmented.dataUrl;
             layerDefinition.assetStatus = 'ready';
             layerDefinition.activeVersionId = 'base';
@@ -2303,6 +4613,7 @@ ${bgColorRule}`;
 // Expose to window for legacy support
 window.triggerLayerExplosion = triggerLayerExplosion;
 window.triggerMagicLayers = triggerMagicLayers;
+window.runAutomaticCompletionForItem = runAutomaticCompletionForItem;
 window.handleQuickFusionSync = handleQuickFusionSync;
 window.handleIsolatedAssetEdit = handleIsolatedAssetEdit;
 window.performPreciseEdit = performPreciseEdit;

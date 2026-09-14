@@ -1,3 +1,98 @@
+async function serializeLayerMedia(layer, b64toBlob) {
+    if (!layer || typeof layer !== 'object') return;
+
+    if (layer.image && layer.image.startsWith('data:')) {
+        layer.blob = await b64toBlob(layer.image);
+        delete layer.image;
+    } else if (layer.image && !layer.image.startsWith('http') && layer.image.length > 1000) {
+        layer.blob = await b64toBlob('data:image/png;base64,' + layer.image);
+        delete layer.image;
+    }
+
+    if (layer.mask && layer.mask.startsWith('data:')) {
+        layer.maskBlob = await b64toBlob(layer.mask);
+        delete layer.mask;
+    } else if (layer.mask && !layer.mask.startsWith('http') && layer.mask.length > 1000) {
+        layer.maskBlob = await b64toBlob('data:image/png;base64,' + layer.mask);
+        delete layer.mask;
+    }
+
+    if (layer.cutoutUrl && layer.cutoutUrl.startsWith('data:')) {
+        layer.cutoutBlob = await b64toBlob(layer.cutoutUrl);
+        delete layer.cutoutUrl;
+    }
+
+    if (layer.previewUrl && layer.previewUrl.startsWith('data:')) {
+        layer.previewBlob = await b64toBlob(layer.previewUrl);
+        delete layer.previewUrl;
+    }
+
+    if (Array.isArray(layer.versions)) {
+        for (const version of layer.versions) {
+            if (!version || typeof version !== 'object') continue;
+            if (version.image && version.image.startsWith('data:')) {
+                version.imageBlob = await b64toBlob(version.image);
+                delete version.image;
+            }
+            if (version.mask && version.mask.startsWith('data:')) {
+                version.maskBlob = await b64toBlob(version.mask);
+                delete version.mask;
+            }
+            if (version.cutoutUrl && version.cutoutUrl.startsWith('data:')) {
+                version.cutoutBlob = await b64toBlob(version.cutoutUrl);
+                delete version.cutoutUrl;
+            }
+            if (version.previewUrl && version.previewUrl.startsWith('data:')) {
+                version.previewBlob = await b64toBlob(version.previewUrl);
+                delete version.previewUrl;
+            }
+        }
+    }
+}
+
+async function deserializeLayerMedia(layer, blobToB64) {
+    if (!layer || typeof layer !== 'object') return;
+
+    if (layer.blob) {
+        layer.image = await blobToB64(layer.blob);
+        delete layer.blob;
+    }
+    if (layer.maskBlob) {
+        layer.mask = await blobToB64(layer.maskBlob);
+        delete layer.maskBlob;
+    }
+    if (layer.cutoutBlob) {
+        layer.cutoutUrl = await blobToB64(layer.cutoutBlob);
+        delete layer.cutoutBlob;
+    }
+    if (layer.previewBlob) {
+        layer.previewUrl = await blobToB64(layer.previewBlob);
+        delete layer.previewBlob;
+    }
+
+    if (Array.isArray(layer.versions)) {
+        for (const version of layer.versions) {
+            if (!version || typeof version !== 'object') continue;
+            if (version.imageBlob) {
+                version.image = await blobToB64(version.imageBlob);
+                delete version.imageBlob;
+            }
+            if (version.maskBlob) {
+                version.mask = await blobToB64(version.maskBlob);
+                delete version.maskBlob;
+            }
+            if (version.cutoutBlob) {
+                version.cutoutUrl = await blobToB64(version.cutoutBlob);
+                delete version.cutoutBlob;
+            }
+            if (version.previewBlob) {
+                version.previewUrl = await blobToB64(version.previewBlob);
+                delete version.previewBlob;
+            }
+        }
+    }
+}
+
 self.onmessage = async function(e) {
     const { type, payload, id } = e.data;
     try {
@@ -38,45 +133,22 @@ self.onmessage = async function(e) {
                         item.originalBlob = await b64toBlob(item.originalDataUrl);
                         delete item.originalDataUrl;
                     }
+                    if (item.segmentationSourceUrl && item.segmentationSourceUrl.startsWith('data:')) {
+                        item.segmentationSourceBlob = await b64toBlob(item.segmentationSourceUrl);
+                        delete item.segmentationSourceUrl;
+                    }
                     if (item.cleanPlateDataUrl && item.cleanPlateDataUrl.startsWith('data:')) {
                         item.cleanPlateBlob = await b64toBlob(item.cleanPlateDataUrl);
                         delete item.cleanPlateDataUrl;
                     }
                     if (item.layers && Array.isArray(item.layers)) {
                         for (let layer of item.layers) {
-                            if (layer.image && layer.image.startsWith('data:')) {
-                                layer.blob = await b64toBlob(layer.image);
-                                delete layer.image;
-                            } else if (layer.image && !layer.image.startsWith('http') && layer.image.length > 1000) {
-                                // sometimes it's raw base64 without data:image
-                                layer.blob = await b64toBlob('data:image/png;base64,' + layer.image);
-                                delete layer.image;
-                            }
-                            if (layer.mask && layer.mask.startsWith('data:')) {
-                                layer.maskBlob = await b64toBlob(layer.mask);
-                                delete layer.mask;
-                            } else if (layer.mask && !layer.mask.startsWith('http') && layer.mask.length > 1000) {
-                                layer.maskBlob = await b64toBlob('data:image/png;base64,' + layer.mask);
-                                delete layer.mask;
-                            }
+                            await serializeLayerMedia(layer, b64toBlob);
                         }
                     }
                     if (item.scene && item.scene.layers) {
                         for (let layer of item.scene.layers) {
-                            if (layer.image && layer.image.startsWith('data:')) {
-                                layer.blob = await b64toBlob(layer.image);
-                                delete layer.image;
-                            } else if (layer.image && !layer.image.startsWith('http') && layer.image.length > 1000) {
-                                layer.blob = await b64toBlob('data:image/png;base64,' + layer.image);
-                                delete layer.image;
-                            }
-                            if (layer.mask && layer.mask.startsWith('data:')) {
-                                layer.maskBlob = await b64toBlob(layer.mask);
-                                delete layer.mask;
-                            } else if (layer.mask && !layer.mask.startsWith('http') && layer.mask.length > 1000) {
-                                layer.maskBlob = await b64toBlob('data:image/png;base64,' + layer.mask);
-                                delete layer.mask;
-                            }
+                            await serializeLayerMedia(layer, b64toBlob);
                         }
                     }
                 }
@@ -92,6 +164,10 @@ self.onmessage = async function(e) {
                         asset.originalBlob = await b64toBlob(asset.originalDataUrl);
                         delete asset.originalDataUrl;
                     }
+                    if (asset.segmentationSourceUrl && asset.segmentationSourceUrl.startsWith('data:')) {
+                        asset.segmentationSourceBlob = await b64toBlob(asset.segmentationSourceUrl);
+                        delete asset.segmentationSourceUrl;
+                    }
                     if (asset.cleanPlateDataUrl && asset.cleanPlateDataUrl.startsWith('data:')) {
                         asset.cleanPlateBlob = await b64toBlob(asset.cleanPlateDataUrl);
                         delete asset.cleanPlateDataUrl;
@@ -100,20 +176,7 @@ self.onmessage = async function(e) {
                     const handleLayers = async (layers) => {
                         if (!layers || !Array.isArray(layers)) return;
                         for (let layer of layers) {
-                            if (layer.image && layer.image.startsWith('data:')) {
-                                layer.blob = await b64toBlob(layer.image);
-                                delete layer.image;
-                            } else if (layer.image && !layer.image.startsWith('http') && layer.image.length > 1000) {
-                                layer.blob = await b64toBlob('data:image/png;base64,' + layer.image);
-                                delete layer.image;
-                            }
-                            if (layer.mask && layer.mask.startsWith('data:')) {
-                                layer.maskBlob = await b64toBlob(layer.mask);
-                                delete layer.mask;
-                            } else if (layer.mask && !layer.mask.startsWith('http') && layer.mask.length > 1000) {
-                                layer.maskBlob = await b64toBlob('data:image/png;base64,' + layer.mask);
-                                delete layer.mask;
-                            }
+                            await serializeLayerMedia(layer, b64toBlob);
                         }
                     };
 
@@ -160,32 +223,22 @@ self.onmessage = async function(e) {
                         item.originalDataUrl = await blobToB64(item.originalBlob);
                         delete item.originalBlob;
                     }
+                    if (item.segmentationSourceBlob) {
+                        item.segmentationSourceUrl = await blobToB64(item.segmentationSourceBlob);
+                        delete item.segmentationSourceBlob;
+                    }
                     if (item.cleanPlateBlob) {
                         item.cleanPlateDataUrl = await blobToB64(item.cleanPlateBlob);
                         delete item.cleanPlateBlob;
                     }
                     if (item.layers && Array.isArray(item.layers)) {
                         for (let layer of item.layers) {
-                            if (layer.blob) {
-                                layer.image = await blobToB64(layer.blob);
-                                delete layer.blob;
-                            }
-                            if (layer.maskBlob) {
-                                layer.mask = await blobToB64(layer.maskBlob);
-                                delete layer.maskBlob;
-                            }
+                            await deserializeLayerMedia(layer, blobToB64);
                         }
                     }
                     if (item.scene && item.scene.layers) {
                         for (let layer of item.scene.layers) {
-                            if (layer.blob) {
-                                layer.image = await blobToB64(layer.blob);
-                                delete layer.blob;
-                            }
-                            if (layer.maskBlob) {
-                                layer.mask = await blobToB64(layer.maskBlob);
-                                delete layer.maskBlob;
-                            }
+                            await deserializeLayerMedia(layer, blobToB64);
                         }
                     }
                 }
@@ -201,6 +254,10 @@ self.onmessage = async function(e) {
                         asset.originalDataUrl = await blobToB64(asset.originalBlob);
                         delete asset.originalBlob;
                     }
+                    if (asset.segmentationSourceBlob) {
+                        asset.segmentationSourceUrl = await blobToB64(asset.segmentationSourceBlob);
+                        delete asset.segmentationSourceBlob;
+                    }
                     if (asset.cleanPlateBlob) {
                         asset.cleanPlateDataUrl = await blobToB64(asset.cleanPlateBlob);
                         delete asset.cleanPlateBlob;
@@ -209,14 +266,7 @@ self.onmessage = async function(e) {
                     const handleLayers = async (layers) => {
                         if (!layers || !Array.isArray(layers)) return;
                         for (let layer of layers) {
-                            if (layer.blob) {
-                                layer.image = await blobToB64(layer.blob);
-                                delete layer.blob;
-                            }
-                            if (layer.maskBlob) {
-                                layer.mask = await blobToB64(layer.maskBlob);
-                                delete layer.maskBlob;
-                            }
+                            await deserializeLayerMedia(layer, blobToB64);
                         }
                     };
 

@@ -1,4 +1,4 @@
-import { ai, getTextModel, backgroundModel, getImageModel, MODEL_SUITES, proxyGenerateContent } from "./gemini-client.js";
+import { ai, getTextModel, backgroundModel, getImageModel, MODEL_SUITES, proxyGenerateContent, CONTINUITY_ANCHOR_MODEL, getSelectedModelSuite, callQwenImageRouter, callQwenImageEdit2509Router, isQwenImageModel, isQwenImageEditModel, isQwenImageFamilyModel } from "./gemini-client.js";
 import { ThinkingLevel } from "@google/genai";
 import { state } from "../core/state.js";
 import * as prompts from "./prompts.js";
@@ -9,7 +9,12 @@ const getThinkingLevel = () => {
     return state.thinkingLevel === 'MEDIUM' ? ThinkingLevel.HIGH : ThinkingLevel.LOW;
 };
 
-const getSemanticModel = () => MODEL_SUITES.flash.text || getTextModel();
+const getSemanticModel = () => {
+    if (getSelectedModelSuite() === 'lite') {
+        return 'gemini-3.1-flash-lite';
+    }
+    return 'gemini-3.8-flash';
+};
 
 export async function extractTextFromImage(base64Image, bbox = [0,0,1000,1000], options = {}) {
     try {
@@ -103,6 +108,230 @@ export async function extractTextFromImage(base64Image, bbox = [0,0,1000,1000], 
     }
 }
 
+export async function queryImageWithGemini(prompt, baseImage, referenceImages = [], history = [], options = {}) {
+    if (!baseImage) throw new Error("A base image is required for image analysis.");
+
+    const allParts = [];
+    const imageBase64 = await fileToBase64(baseImage);
+    allParts.push({ inlineData: { data: imageBase64, mimeType: baseImage.type || 'image/png' } });
+
+    for (const file of referenceImages) {
+        if (!file) continue;
+        const base64Data = await fileToBase64(file);
+        allParts.push({ inlineData: { data: base64Data, mimeType: file.type || 'image/png' } });
+    }
+
+    const imageQueryMode = options.imageQueryMode || 'describe_image';
+    const recentHistory = Array.isArray(history)
+        ? history
+            .filter(msg => msg && msg.content && (msg.type === 'text' || msg.type === 'bot-rich'))
+            .slice(-6)
+            .map(msg => `${msg.sender === 'user' ? '用户' : '助手'}：${msg.content}`)
+            .join('\n')
+        : '';
+
+    const intentInstructionMap = {
+        extract_text: "请把重心放在图片文字提取上。优先忠实转写可见文字；如果内容有层级结构，再整理成清晰文本。",
+        summarize_content: "请把重心放在内容整理、提炼和结构化总结上。先识别关键信息，再按逻辑结构输出，不要只做泛泛描述。",
+        answer_question: "请把重心放在围绕图片内容直接回答用户问题上，必要时引用图片里的依据。",
+        describe_image: "请把重心放在帮助用户理解图片内容上，清楚描述主体、结构、重点信息和可见文字。"
+    };
+
+    const analysisPrompt = [
+        `当前执行模式：${imageQueryMode}`,
+        intentInstructionMap[imageQueryMode] || intentInstructionMap.describe_image,
+        options.reason ? `路由判断依据：${options.reason}` : '',
+        recentHistory ? `最近对话上下文：\n${recentHistory}` : '',
+        "如果用户当前这句话很短，比如“开始吧”“继续”“先做第一部分”，必须结合最近对话判断真正目标。",
+        "如果图片里有课程结构、目录、规划、海报信息、流程图或表格，请优先抽取其中的结构，而不是只描述视觉外观。",
+        `用户当前请求：${prompt || '请描述这张图片。'}`
+    ].filter(Boolean).join('\n\n');
+
+    const response = await proxyGenerateContent({
+        model: getTextModel(),
+        systemInstruction: {
+            parts: [{ text: prompts.getImageQuerySystemInstruction() }]
+        },
+        contents: {
+            parts: [
+                ...allParts,
+                { text: analysisPrompt }
+            ]
+        }
+    });
+
+    const text = response?.text?.trim?.() || '';
+    if (!text) {
+        throw new Error("Image analysis returned empty content.");
+    }
+
+    return { success: true, text, thoughtContent: response?.thought || '' };
+}
+
+export function composeReferenceAwareGenerationPrompt(prompt, referenceBrief = '') {
+    const normalizedPrompt = String(prompt || '').trim();
+    const normalizedBrief = String(referenceBrief || '').trim();
+
+    if (!normalizedBrief) {
+        return normalizedPrompt;
+    }
+
+    return [
+        '请把下面的视觉参考约束作为高优先级，但不要机械复制上一张图的构图。',
+        `视觉参考约束：\n${normalizedBrief}`,
+        normalizedPrompt ? `当前生成任务：${normalizedPrompt}` : ''
+    ].filter(Boolean).join('\n\n');
+}
+
+function tryParseStructuredJson(rawText = '') {
+    const normalized = String(rawText || '').trim().replace(/```json|```/g, '');
+    if (!normalized) return null;
+
+    const start = normalized.indexOf('{');
+    const end = normalized.lastIndexOf('}');
+    if (start === -1 || end === -1 || end < start) return null;
+
+    try {
+        return JSON.parse(normalized.slice(start, end + 1));
+    } catch (error) {
+        return null;
+    }
+}
+
+function normalizeAnchorList(values = [], maxItems = 5) {
+    const result = [];
+    const seen = new Set();
+
+    for (const value of values || []) {
+        const text = String(value || '').replace(/\s+/g, ' ').trim();
+        if (!text) continue;
+        const key = text.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        result.push(text);
+        if (result.length >= maxItems) break;
+    }
+
+    return result;
+}
+
+export async function buildSeriesContinuityAnchor(imageFile, history = [], options = {}) {
+    if (!imageFile) return null;
+
+    const base64Data = await fileToBase64(imageFile);
+    const recentHistory = Array.isArray(history)
+        ? history
+            .filter(msg => msg && msg.content && (msg.type === 'text' || msg.type === 'bot-rich'))
+            .slice(-6)
+            .map(msg => `${msg.sender === 'user' ? '用户' : '助手'}：${msg.content}`)
+            .join('\n')
+        : '';
+
+    const anchorPrompt = [
+        '你在为一个连续性视觉项目提炼“系列视觉锚点”。',
+        '目标不是描述当前这张图本身，而是提炼后续新页面、新关卡、新章节仍然要继承的稳定视觉系统。',
+        '请把“稳定继承的系统”与“当前页面可变化的内容”明确拆开，避免把当前场景的偶然细节误当成整个系列都必须照搬的内容。',
+        '优先关注：画风、角色设定、形体语言、版式结构、镜头节奏、材质/渲染方式、信息卡片体系、课程或关卡系统感、整体氛围。',
+        '不要把当前页面的临时文案、一次性道具、局部构图、偶然色块分布写成必须固定。',
+        recentHistory ? `最近上下文：\n${recentHistory}` : '',
+        options.promptHint ? `补充提示：${options.promptHint}` : '',
+        '请只返回 JSON，不要加 markdown。格式如下：{"anchorSummary":"1到2句中文总结","preserveElements":["..."],"variableElements":["..."],"usageNotes":["..."]}'
+    ].filter(Boolean).join('\n\n');
+
+    const response = await proxyGenerateContent({
+        model: CONTINUITY_ANCHOR_MODEL,
+        contents: {
+            parts: [
+                { inlineData: { data: base64Data, mimeType: imageFile.type || 'image/png' } },
+                { text: anchorPrompt }
+            ]
+        },
+        config: { thinkingConfig: { thinkingLevel: getThinkingLevel() } }
+    });
+
+    const rawText = response?.text?.trim?.() || '';
+    const parsed = tryParseStructuredJson(rawText);
+
+    if (parsed) {
+        return {
+            anchorSummary: String(parsed.anchorSummary || '').trim(),
+            preserveElements: normalizeAnchorList(parsed.preserveElements || []),
+            variableElements: normalizeAnchorList(parsed.variableElements || []),
+            usageNotes: normalizeAnchorList(parsed.usageNotes || [], 4),
+            anchorSource: options.anchorSource || 'selected_image',
+            updatedAt: Date.now()
+        };
+    }
+
+    const fallbackLines = rawText
+        .split('\n')
+        .map(line => line.replace(/^[-*\d.\s]+/, '').trim())
+        .filter(Boolean);
+
+    if (fallbackLines.length === 0) {
+        return null;
+    }
+
+    return {
+        anchorSummary: fallbackLines[0],
+        preserveElements: normalizeAnchorList(fallbackLines.slice(1, 4)),
+        variableElements: [],
+        usageNotes: [],
+        anchorSource: options.anchorSource || 'selected_image',
+        updatedAt: Date.now()
+    };
+}
+
+async function buildImageGenerationReferenceBrief(prompt, baseImage = null, referenceImages = [], history = []) {
+    const visualReferences = [];
+    if (baseImage) visualReferences.push(baseImage);
+    for (const file of referenceImages || []) {
+        if (file && !visualReferences.includes(file)) {
+            visualReferences.push(file);
+        }
+    }
+
+    if (visualReferences.length === 0) {
+        return '';
+    }
+
+    const parts = [];
+    for (const file of visualReferences.slice(0, 2)) {
+        const base64Data = await fileToBase64(file);
+        parts.push({ inlineData: { data: base64Data, mimeType: file.type || 'image/png' } });
+    }
+
+    const recentHistory = Array.isArray(history)
+        ? history
+            .filter(msg => msg && msg.content && (msg.type === 'text' || msg.type === 'bot-rich'))
+            .slice(-4)
+            .map(msg => `${msg.sender === 'user' ? '用户' : '助手'}：${msg.content}`)
+            .join('\n')
+        : '';
+
+    const briefPrompt = [
+        '你在为后续图片生成提炼视觉参考约束。',
+        '请根据参考图，总结后续新图必须继承的系列一致性要求。',
+        '优先关注：画风、配色、角色/主体设定、版式层级、镜头语言、材质细节、课程/关卡视觉系统、趣味性表达。',
+        '如果这是系列内容，请强调“保持同系列统一”，但不要要求复制上一张图的构图。',
+        recentHistory ? `最近对话：\n${recentHistory}` : '',
+        prompt ? `当前用户要生成的内容：${prompt}` : '',
+        '输出要求：只输出 4 到 6 条中文短句，每条单独一行，不要加标题，不要解释。'
+    ].filter(Boolean).join('\n\n');
+
+    const response = await proxyGenerateContent({
+        model: getTextModel(),
+        contents: {
+            parts: [
+                ...parts,
+                { text: briefPrompt }
+            ]
+        }
+    });
+
+    return response?.text?.trim?.() || '';
+}
+
 async function ensurePngBase64(imageInput) {
     if (!imageInput) return null;
     return new Promise((resolve) => {
@@ -137,7 +366,104 @@ async function ensurePngBase64(imageInput) {
     });
 }
 
-async function prepareNativeEdit(imageInput, maskInput, direction, targetRatioName, isOutpaint) {
+function getQwenImageSize(aspectRatio = '1:1') {
+    const sizes = {
+        '16:9': '2048*1152',
+        '9:16': '1152*2048',
+        '4:3': '1536*1152',
+        '3:4': '1152*1536',
+        '1:1': '1024*1024'
+    };
+    return sizes[aspectRatio] || '1024*1024';
+}
+
+async function callQwenEdit(prompt, baseImage, referenceImages = [], mask = null, forcedAspectRatio = null, imageCount = 1) {
+    const primaryImage = await ensurePngBase64(baseImage);
+    if (!primaryImage) throw new Error('无法准备 Qwen Image 主图');
+
+    const references = [];
+    for (const reference of referenceImages.slice(0, 2)) {
+        const normalized = await ensurePngBase64(reference);
+        if (normalized) references.push(normalized);
+    }
+
+    const normalizedMask = mask ? await ensurePngBase64(mask) : null;
+    return callQwenImageRouter({
+        mode: 'image_edit',
+        prompt,
+        image: primaryImage,
+        images: references,
+        mask: normalizedMask,
+        size: getQwenImageSize(forcedAspectRatio || '1:1'),
+        imageCount
+    });
+}
+
+async function callQwenEdit2509(prompt, baseImage, referenceImages = [], mask = null, forcedAspectRatio = null, imageCount = 1, mode = 'image_edit') {
+    const primaryImage = baseImage ? await ensurePngBase64(baseImage) : null;
+    const references = [];
+    for (const reference of referenceImages.slice(0, 2)) {
+        const normalized = await ensurePngBase64(reference);
+        if (normalized) references.push(normalized);
+    }
+
+    const normalizedMask = mask ? await ensurePngBase64(mask) : null;
+    return callQwenImageEdit2509Router({
+        mode,
+        prompt,
+        image: primaryImage,
+        images: references,
+        mask: normalizedMask,
+        size: getQwenImageSize(forcedAspectRatio || '1:1'),
+        imageCount
+    });
+}
+
+async function prepareNativeEdit(imageInput, maskInput, direction, targetRatioName, isOutpaint, options = {}) {
+    const GPT_IMAGE_MIN_PIXELS = 655360;
+    const GPT_IMAGE_MAX_PIXELS = 8294400;
+    const GPT_IMAGE_MAX_EDGE = 3840;
+    const GPT_IMAGE_MAX_ASPECT_RATIO = 3;
+    const roundUpTo16 = (value) => Math.max(16, Math.ceil(value / 16) * 16);
+    const roundDownTo16 = (value) => Math.max(16, Math.floor(value / 16) * 16);
+    const normalizeRequestSize = (width, height) => {
+        let normalizedWidth = roundUpTo16(width);
+        let normalizedHeight = roundUpTo16(height);
+
+        const upscaleByMinPixels = () => {
+            const area = normalizedWidth * normalizedHeight;
+            if (area >= GPT_IMAGE_MIN_PIXELS) return;
+            const scale = Math.sqrt(GPT_IMAGE_MIN_PIXELS / area);
+            normalizedWidth = roundUpTo16(normalizedWidth * scale);
+            normalizedHeight = roundUpTo16(normalizedHeight * scale);
+        };
+
+        const downscaleByLimits = () => {
+            const area = normalizedWidth * normalizedHeight;
+            if (normalizedWidth <= GPT_IMAGE_MAX_EDGE && normalizedHeight <= GPT_IMAGE_MAX_EDGE && area <= GPT_IMAGE_MAX_PIXELS) {
+                return;
+            }
+
+            const edgeScale = Math.min(
+                GPT_IMAGE_MAX_EDGE / normalizedWidth,
+                GPT_IMAGE_MAX_EDGE / normalizedHeight,
+                1
+            );
+            const pixelScale = Math.min(Math.sqrt(GPT_IMAGE_MAX_PIXELS / area), 1);
+            const scale = Math.min(edgeScale, pixelScale);
+
+            normalizedWidth = roundDownTo16(normalizedWidth * scale);
+            normalizedHeight = roundDownTo16(normalizedHeight * scale);
+        };
+
+        upscaleByMinPixels();
+        downscaleByLimits();
+        return {
+            requestWidth: normalizedWidth,
+            requestHeight: normalizedHeight
+        };
+    };
+
     const RATIO_MAP = {
         '1:1': 1.0,
         '16:9': 16 / 9,
@@ -170,14 +496,31 @@ async function prepareNativeEdit(imageInput, maskInput, direction, targetRatioNa
             cageW = Math.round(cageW / 16) * 16 || 16;
             cageH = Math.round(cageH / 16) * 16 || 16;
 
+            // GPT-image-2 rejects arbitrary edit canvases over 3:1. Pad the
+            // short side instead of squeezing or cropping source pixels.
+            if (cageW / cageH > GPT_IMAGE_MAX_ASPECT_RATIO) {
+                cageH = roundUpTo16(cageW / GPT_IMAGE_MAX_ASPECT_RATIO);
+            } else if (cageH / cageW > GPT_IMAGE_MAX_ASPECT_RATIO) {
+                cageW = roundUpTo16(cageH / GPT_IMAGE_MAX_ASPECT_RATIO);
+            }
+
+            // The provider enforces a minimum pixel budget. Keep completion
+            // requests on the same compliant normalized canvas as other GPT
+            // edits; the completion-specific guard below verifies the mask
+            // after this scaling instead of bypassing the provider constraint.
+            const isSceneCompletion = Boolean(options?.completionSceneInpaint);
+            const { requestWidth, requestHeight } = normalizeRequestSize(cageW, cageH);
+            const scaleX = requestWidth / cageW;
+            const scaleY = requestHeight / cageH;
+
             const canvasImg = document.createElement('canvas');
-            canvasImg.width = cageW;
-            canvasImg.height = cageH;
+            canvasImg.width = requestWidth;
+            canvasImg.height = requestHeight;
             const ctxImg = canvasImg.getContext('2d');
 
             const canvasMask = document.createElement('canvas');
-            canvasMask.width = cageW;
-            canvasMask.height = cageH;
+            canvasMask.width = requestWidth;
+            canvasMask.height = requestHeight;
             const ctxMask = canvasMask.getContext('2d');
 
             let x = 0, y = 0;
@@ -201,17 +544,24 @@ async function prepareNativeEdit(imageInput, maskInput, direction, targetRatioNa
                 }
             }
 
+            const requestX = Math.round(x * scaleX);
+            const requestY = Math.round(y * scaleY);
+            const requestW = Math.round(naturalW * scaleX);
+            const requestH = Math.round(naturalH * scaleY);
+
             ctxImg.fillStyle = '#FFFFFF';
-            ctxImg.fillRect(0, 0, cageW, cageH);
-            ctxImg.drawImage(img, x, y, naturalW, naturalH);
+            ctxImg.fillRect(0, 0, requestWidth, requestHeight);
+            ctxImg.drawImage(img, requestX, requestY, requestW, requestH);
 
             let finalMaskBase64 = null;
-            if (isOutpaint || maskInput || cageW !== naturalW || cageH !== naturalH) {
+            let maskEditablePixels = null;
+            let maskPreservePixels = null;
+            if (isOutpaint || maskInput || cageW !== naturalW || cageH !== naturalH || requestWidth !== cageW || requestHeight !== cageH) {
                 ctxMask.fillStyle = 'rgba(0,0,0,0)';
-                ctxMask.clearRect(0,0, cageW, cageH);
+                ctxMask.clearRect(0,0, requestWidth, requestHeight);
 
                 ctxMask.fillStyle = '#FFFFFF';
-                ctxMask.fillRect(x, y, naturalW, naturalH);
+                ctxMask.fillRect(requestX, requestY, requestW, requestH);
 
                 if (maskInput) {
                     const maskImg = new Image();
@@ -236,8 +586,37 @@ async function prepareNativeEdit(imageInput, maskInput, direction, targetRatioNa
                             }
                             tempCtx.putImageData(imgData, 0, 0);
 
-                            ctxMask.clearRect(x, y, naturalW, naturalH);
-                            ctxMask.drawImage(tempCanvas, x, y);
+                            // Clear the source-image rectangle before drawing the
+                            // normalized mask. Transparent pixels in tempCanvas
+                            // are the editable region; source-over compositing
+                            // cannot remove the opaque preserve fill by itself.
+                            // Without this clear, the whole image remains
+                            // opaque/preserved and foreground occluders (such as
+                            // stools) are sent back to GPT unchanged.
+                            ctxMask.clearRect(requestX, requestY, requestW, requestH);
+                            ctxMask.drawImage(tempCanvas, requestX, requestY, requestW, requestH);
+                            if (isSceneCompletion) {
+                                // Keep an explicit invariant for scene
+                                // completion: the final API mask must contain
+                                // a non-empty transparent edit region. A
+                                // fully opaque mask makes GPT preserve the
+                                // stool even when the prompt asks it to remove
+                                // the occluder.
+                                const preparedMask = ctxMask.getImageData(
+                                    0,
+                                    0,
+                                    requestWidth,
+                                    requestHeight
+                                ).data;
+                                let editable = 0;
+                                let preserved = 0;
+                                for (let offset = 3; offset < preparedMask.length; offset += 4) {
+                                    if (preparedMask[offset] < 16) editable += 1;
+                                    else preserved += 1;
+                                }
+                                maskEditablePixels = editable;
+                                maskPreservePixels = preserved;
+                            }
                             resMask();
                         };
                         maskImg.onerror = () => resMask();
@@ -247,21 +626,77 @@ async function prepareNativeEdit(imageInput, maskInput, direction, targetRatioNa
                     });
                 }
                 finalMaskBase64 = canvasMask.toDataURL('image/png').split(',')[1];
+                if (isSceneCompletion) {
+                    const totalMaskPixels = Math.max(1, requestWidth * requestHeight);
+                    console.info('[GPT-image-2] completion edit mask prepared', {
+                        sourceSize: `${naturalW}x${naturalH}`,
+                        requestSize: `${requestWidth}x${requestHeight}`,
+                        maskEditablePixels: maskEditablePixels ?? 0,
+                        maskPreservePixels: maskPreservePixels ?? 0,
+                        maskEditableRatio: Number(((maskEditablePixels ?? 0) / totalMaskPixels).toFixed(5)),
+                        maskInvariant: (maskEditablePixels ?? 0) > 0 ? 'editable_region_present' : 'editable_region_empty'
+                    });
+                }
             }
 
             resolve({
                 image: canvasImg.toDataURL('image/png').split(',')[1],
                 mask: finalMaskBase64,
-                width: cageW,
-                height: cageH
+                width: requestWidth,
+                height: requestHeight,
+                outputWidth: cageW,
+                outputHeight: cageH
             });
         };
-        img.onerror = reject;
+        img.onerror = () => reject(new Error('无法加载用于 GPT-image-2 编辑的源图'));
 
         if (typeof imageInput === 'string') {
-            img.src = imageInput.startsWith('data:') || imageInput.startsWith('blob:') || imageInput.startsWith('http') ? imageInput : 'data:image/png;base64,' + imageInput;
+            img.crossOrigin = 'anonymous';
+            img.src = imageInput.startsWith('data:') || imageInput.startsWith('blob:')
+                ? imageInput
+                : imageInput.startsWith('http')
+                    ? getProxiedUrl(imageInput)
+                    : 'data:image/png;base64,' + imageInput;
         } else if (imageInput instanceof File || imageInput instanceof Blob) {
             img.src = URL.createObjectURL(imageInput);
+        }
+    });
+}
+
+async function resizeGeneratedImageToTarget(imageInput, mimeType, targetWidth, targetHeight) {
+    if (!imageInput || !targetWidth || !targetHeight) return imageInput;
+
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => {
+            if (img.naturalWidth === targetWidth && img.naturalHeight === targetHeight) {
+                const sameSizeBase64 = typeof imageInput === 'string' && !imageInput.startsWith('http') && !imageInput.startsWith('data:')
+                    ? imageInput
+                    : null;
+                resolve(sameSizeBase64 || imageInput);
+                return;
+            }
+
+            const canvas = document.createElement('canvas');
+            canvas.width = targetWidth;
+            canvas.height = targetHeight;
+            const ctx = canvas.getContext('2d');
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'high';
+            ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
+            resolve(canvas.toDataURL(mimeType || 'image/png').split(',')[1]);
+        };
+        img.onerror = () => reject(new Error('无法加载 GPT-image-2 返回的图片结果'));
+
+        if (typeof imageInput === 'string') {
+            if (imageInput.startsWith('data:') || imageInput.startsWith('blob:') || imageInput.startsWith('http')) {
+                img.crossOrigin = 'anonymous';
+                img.src = imageInput.startsWith('http') ? getProxiedUrl(imageInput) : imageInput;
+            } else {
+                img.src = `data:${mimeType || 'image/png'};base64,${imageInput}`;
+            }
+        } else {
+            reject(new Error('Unsupported image input for resize'));
         }
     });
 }
@@ -347,12 +782,76 @@ async function prepareNativeMaskAndImage(imageInput, maskInput) {
     });
 }
 
-export async function editOrQueryImageWithGemini(prompt, baseImage, referenceImages = [], mask = null, forcedAspectRatio = null, forceMaterialTask = false) {
+async function buildImageApiError(response, fallbackPrefix = '图像接口请求失败') {
+    let data = null;
+    try {
+        data = await response.json();
+    } catch (err) {
+        data = null;
+    }
+
+    const errorPayload = data?.error || data || {};
+    const code = errorPayload?.code || '';
+    const message = errorPayload?.message || '';
+    const normalizedReason = errorPayload?.normalized_reason || data?.normalized_reason || '';
+    const upstreamStatus = data?.upstream_status;
+
+    if (
+        code === 'moderation_blocked' ||
+        normalizedReason === 'safety_moderation' ||
+        /rejected by the safety system/i.test(message)
+    ) {
+        return new Error(`图片审核拦截(${code || 'moderation_blocked'})：${message || '当前图片或人物相关编辑触发了安全审核'}`);
+    }
+
+    const suffix = message
+        ? `：${message}`
+        : upstreamStatus
+            ? `：HTTP ${response.status}（上游 ${upstreamStatus}）`
+            : `：HTTP ${response.status}`;
+
+    return new Error(`${fallbackPrefix}${suffix}`);
+}
+
+export async function editOrQueryImageWithGemini(prompt, baseImage, referenceImages = [], mask = null, forcedAspectRatio = null, forceMaterialTask = false, options = {}) {
     prompt = prompt || "处理图片";
     if (!baseImage) throw new Error("A base image is required for editing or querying.");
+    const currentModel = options.overrideImageModel || getImageModel();
+
+    if (isQwenImageEditModel(currentModel)) {
+        console.log('🚀 [Qwen Image Edit 2509] 正在调用 SiliconFlow 图片处理接口...');
+        const result = await callQwenEdit2509(
+            prompt,
+            baseImage,
+            referenceImages,
+            mask,
+            forcedAspectRatio,
+            options.imageCount || 1
+        );
+        return {
+            ...result,
+            text: '图片已使用 Qwen Image Edit 2509 处理完成。'
+        };
+    }
+
+    if (isQwenImageModel(currentModel)) {
+        console.log('🚀 [Qwen Image 3.0 Pro] 正在调用 DashScope 图片编辑接口...');
+        const result = await callQwenEdit(
+            prompt,
+            baseImage,
+            referenceImages,
+            mask,
+            forcedAspectRatio,
+            options.imageCount || 1
+        );
+        return {
+            ...result,
+            text: '图片已使用 Qwen Image 3.0 Pro 编辑完成。'
+        };
+    }
 
     // Direct QuickRouter GPT-image-2 API orchestration
-    if (getImageModel() === 'gpt-image-2') {
+    if (currentModel === 'gpt-image-2') {
         console.log("🚀 [GPT-image-2] 正在自适应路由调用高精度中转图像编辑...");
         try {
             const isOutpaint = !mask && forcedAspectRatio && forcedAspectRatio !== '1:1';
@@ -373,7 +872,14 @@ export async function editOrQueryImageWithGemini(prompt, baseImage, referenceIma
                 direction = 'right';
             }
 
-            const prepared = await prepareNativeEdit(baseImage, mask, direction, forcedAspectRatio || '1:1', isOutpaint);
+            const prepared = await prepareNativeEdit(
+                baseImage,
+                mask,
+                direction,
+                forcedAspectRatio || '1:1',
+                isOutpaint,
+                options
+            );
             finalImageBase64 = prepared.image;
             finalMaskBase64 = prepared.mask;
 
@@ -388,6 +894,18 @@ export async function editOrQueryImageWithGemini(prompt, baseImage, referenceIma
             if (finalMaskBase64) {
                 payload.mask = finalMaskBase64;
             }
+            if (Array.isArray(referenceImages) && referenceImages.length > 0) {
+                const normalizedReferences = [];
+                for (const ref of referenceImages.slice(0, 2)) {
+                    if (!ref) continue;
+                    const refBase64 = await ensurePngBase64(ref);
+                    if (refBase64) {
+                        normalizedReferences.push(refBase64.includes(',') ? refBase64.split(',')[1] : refBase64);
+                    }
+                }
+                if (normalizedReferences[0]) payload.image2 = normalizedReferences[0];
+                if (normalizedReferences[1]) payload.image3 = normalizedReferences[1];
+            }
 
             const response = await fetch(`${RECOGNIZE_BACKEND_URL}`, {
                 method: "POST",
@@ -399,11 +917,22 @@ export async function editOrQueryImageWithGemini(prompt, baseImage, referenceIma
             });
 
             if (!response.ok) {
-                throw new Error(`GPT-image-2 接口返回 ${response.status}`);
+                throw await buildImageApiError(response, 'GPT-image-2 图片编辑失败');
             }
 
             const data = await response.json();
-            console.log("📥 [GPT-image-2] 接收原始 API 响应成果:", data);
+            console.log("📥 [GPT-image-2] 编辑响应摘要", {
+                httpStatus: response.status,
+                topLevelKeys: data && typeof data === 'object' ? Object.keys(data) : [],
+                imageCount: Array.isArray(data?.data) ? data.data.length : 0,
+                b64Lengths: Array.isArray(data?.data)
+                    ? data.data.map(item => typeof item?.b64_json === 'string' ? item.b64_json.length : 0)
+                    : [],
+                hasImageUrl: Array.isArray(data?.data) && data.data.some(item => typeof item?.url === 'string'),
+                choiceContentLength: typeof data?.choices?.[0]?.message?.content === 'string'
+                    ? data.choices[0].message.content.length
+                    : 0
+            });
 
             const result = { success: true, text: '图片已使用 GPT-image-2 图像生成模型高精编辑完成。', imageData: null, mimeType: 'image/png' };
 
@@ -426,7 +955,12 @@ export async function editOrQueryImageWithGemini(prompt, baseImage, referenceIma
                 throw new Error("接口返回无法提取有效图像 Base64/URL 成果。");
             }
 
-            result.imageData = rawData;
+            result.imageData = await resizeGeneratedImageToTarget(
+                rawData,
+                result.mimeType,
+                prepared.outputWidth || prepared.width,
+                prepared.outputHeight || prepared.height
+            );
 
             return result;
         } catch (error) {
@@ -486,7 +1020,6 @@ export async function editOrQueryImageWithGemini(prompt, baseImage, referenceIma
         config.imageConfig = { aspectRatio: forcedAspectRatio };
     }
 
-    const currentModel = getImageModel();
     let response;
 
     if (currentModel.startsWith('gemini')) {
@@ -545,7 +1078,8 @@ export async function editOrQueryImageWithGemini(prompt, baseImage, referenceIma
 }
 
 export async function editOrQueryImageWithGemini_Multiple(prompt, baseImage, referenceImages = [], mask = null, forcedAspectRatio = null) {
-    const promises = Array(4).fill().map(() => editOrQueryImageWithGemini(prompt, baseImage, referenceImages, mask, forcedAspectRatio));
+    const requestedCount = Math.max(1, Number(arguments[5]) || 1);
+    const promises = Array(requestedCount).fill().map(() => editOrQueryImageWithGemini(prompt, baseImage, referenceImages, mask, forcedAspectRatio));
     const results = await Promise.all(promises);
     
     const combinedResult = {
@@ -557,16 +1091,50 @@ export async function editOrQueryImageWithGemini_Multiple(prompt, baseImage, ref
     return combinedResult;
 }
 
+function inferSessionTitleFallback(prompt = '') {
+    const text = String(prompt || '').replace(/\s+/g, ' ').trim();
+    if (!text) return '新对话';
+
+    const cleaned = text
+        .replace(/^用户[:：]\s*/g, '')
+        .replace(/^系统[:：]\s*/g, '')
+        .replace(/你好小M[,，!！]*/g, '')
+        .replace(/我们现在要做一个全新的项目[,，]*/g, '')
+        .replace(/帮我|请你|请|我们现在|需要你/g, '')
+        .trim();
+
+    const rules = [
+        { pattern: /总结|整理|提炼|梳理|转成文本|总纲/, title: '内容总结' },
+        { pattern: /课程结构|能力树|递进图/, title: '课程结构' },
+        { pattern: /封面|海报|主视觉/, title: '封面设计' },
+        { pattern: /第一关|小火车村/, title: '第一关封面' },
+        { pattern: /材质|纹理/, title: '材质替换' },
+        { pattern: /扩图|外延|补全/, title: '画面扩展' },
+        { pattern: /重绘|重做|重新生成|再来一版/, title: '方案重做' },
+        { pattern: /空间|室内|家装/, title: '空间方案' }
+    ];
+
+    const matched = rules.find(rule => rule.pattern.test(cleaned));
+    if (matched) return matched.title;
+
+    return cleaned.slice(0, 8) || '新对话';
+}
+
 export async function generateSessionTitle(prompt) {
     if (!prompt || prompt.trim().length === 0) return "新对话";
     const titlePrompt = prompts.getTitleSummaryPrompt(prompt);
-    const response = await proxyGenerateContent({
-        model: backgroundModel,
-        contents: [{ text: titlePrompt }],
-        config: { thinkingConfig: { thinkingLevel: getThinkingLevel() } }
-    });
-    const title = response.text?.trim();
-    return title || prompt.substring(0, 20);
+    try {
+        const response = await proxyGenerateContent({
+            model: backgroundModel,
+            contents: [{ text: titlePrompt }],
+            config: { thinkingConfig: { thinkingLevel: getThinkingLevel() } }
+        });
+        const title = response.text?.trim();
+        return title || inferSessionTitleFallback(prompt);
+    } catch (error) {
+        console.warn('generateSessionTitle fallback triggered:', error);
+        return inferSessionTitleFallback(prompt);
+    }
 }
 
 export async function analyzeWithAgent(agent, base64Data, mimeType) {
@@ -706,7 +1274,7 @@ export async function generateRelitImage(prompt, base64Image) {
 
         const finalPrompt = prompts.getRelightPrompt(prompt || "Relight this image with dramatic lighting");
 
-        if (getImageModel() === 'gpt-image-2') {
+        if (getImageModel() === 'gpt-image-2' || isQwenImageFamilyModel(getImageModel())) {
             const res = await editOrQueryImageWithGemini(finalPrompt, compressedFile, [], null, '1:1');
             return { imageData: res.imageData, mimeType: 'image/png' };
         }
@@ -739,7 +1307,7 @@ export async function generateRelitImage(prompt, base64Image) {
 
 export async function generatePreciseEditImage(contentsParts, aspectRatio = '1:1') {
     try {
-        if (getImageModel() === 'gpt-image-2') {
+        if (getImageModel() === 'gpt-image-2' || isQwenImageFamilyModel(getImageModel())) {
             let baseImageBase64 = null;
             let maskBase64 = null;
             let mimeType = 'image/png';
@@ -982,9 +1550,9 @@ Rules for Layer Proposal:
   1. "ad_background" / designRole "base_background": the full-canvas poster background. Keep texture/pattern as part of this background.
   2. "shape_panel" / designRole "local_panel": each independent carrier panel/card/label strip/copy block behind text or products. Include occluded panels as their full inferred rectangle when clear.
   3. "price_badge" / designRole "price_badge": each badge/circle/pill shape behind a price.
-  4. "product_food" / "product_drink" / designRole "product_image": each photo-realistic product image as a whole unit. Do not split food from plate, cup from saucer, or garnish from dish.
+  4. "product_food" / "product_drink" / designRole "product_image": each photo-realistic OR detailed raster-illustrated product asset as a whole unit. Fruit slices, candy, sticker-like food assets, and detailed illustrated product icons belong here when they should be movable cutouts. Do not split food from plate, cup from saucer, or garnish from dish.
   5. "element_text" / text designRole: each visible text block, including logo, headline words, product names, prices, drink names, descriptions, and website/URL. Use tight bboxes for text.
-  6. "decor_graphic" / designRole "decor_shape": standalone decorative dots, lines, frames, and graphic accents.
+  6. "decor_graphic" / designRole "decor_shape": only simple standalone decorative dots, lines, frames, rays, and geometric accents. Do not use this for detailed fruit, candy, sticker, mascot, character, or illustrated icon assets; those must use a raster-cutout-capable product/object type.
 - Self-check for flat food/menu posters before returning JSON: if visible, include the full background, each large menu panel, each small label panel, each price badge shape, every product photo, and every text group. A simple menu with 2 dishes and 3 drinks commonly has 20+ layers. If your output has only 10-15 layers, you probably merged or omitted editable design units.
 - Do not output composite menu sections as editable atomic layers. For example, split a food section into panel, product image, price badge, product title text, and description text.
 - Repeated product cards, drink labels, price/name strips, and small rounded rectangles are separate shape_panel layers. Do NOT output one broad "drink area", "bottom drink row", "menu strip", or "product row" instead of the individual card/panel backgrounds. If three drinks each sit on a cream label panel, output three separate shape_panel layers.
@@ -1176,15 +1744,33 @@ Output raw JSON only.`;
         return "scene_object";
     };
 
-    const sanitizeRenderMode = (mode, semanticType, compositeRole, layerType) => {
+    const isLikelyRasterDecorAsset = (semanticType, name = '') => {
+        const assetName = String(name || '');
+        const hasComplexRasterName = /柠檬|水果|果片|糖果|棒棒糖|贴纸|吉祥物|角色|人物|女子|主视觉|插画|邮戳|印章|邮票|lemon|fruit|candy|sticker|mascot|character|woman|hero|illustration|stamp|seal/i.test(assetName);
+        // The semantic model may explicitly return vector_shape for a complex
+        // flattened-poster asset. Name evidence must be allowed to override
+        // that mode, otherwise people and stamps become solid design panels.
+        return hasComplexRasterName;
+    };
+
+    const sanitizeRenderMode = (mode, semanticType, compositeRole, layerType, name = '') => {
         const validModes = ["background_plate", "vector_shape", "raster_cutout", "text_css", "semantic_group", "deferred"];
         const modeLower = String(mode || '').toLowerCase();
+        // Older semantic records can explicitly label a detailed decorative
+        // illustration as a vector shape. Preserve actual layout primitives,
+        // but give known illustrated assets a path to raster extraction.
+        if (isLikelyRasterDecorAsset(semanticType, name)) return "raster_cutout";
         if (validModes.includes(modeLower)) return modeLower;
 
         if (compositeRole === "composite_group") return "semantic_group";
         if (layerType === "background_plate" || semanticType === "ad_background") return "background_plate";
         if (semanticType === "element_text") return "text_css";
-        if (["shape_panel", "price_badge", "cta_button", "logo_mark", "decor_graphic", "flat_ad_layout"].includes(semanticType)) {
+        // Decorative graphics in a flattened poster can be either simple
+        // vector-like marks or complex raster illustrations (fruit, candy,
+        // stickers, mascots). Only force the known layout primitives down the
+        // vector path. A decor_graphic without an explicit renderMode remains
+        // a raster cutout candidate for Magic Layers/SAM.
+        if (["shape_panel", "price_badge", "cta_button", "logo_mark", "flat_ad_layout"].includes(semanticType)) {
             return "vector_shape";
         }
         return "raster_cutout";
@@ -1346,7 +1932,13 @@ Output raw JSON only.`;
                 const normalizedCompositeRole = normalizedSemanticType === "shape_panel" && children.length === 0
                     ? "atomic_object"
                     : compositeRole;
-                const renderMode = sanitizeRenderMode(layer.renderMode, normalizedSemanticType, normalizedCompositeRole, layerType);
+                const renderMode = sanitizeRenderMode(
+                    layer.renderMode,
+                    normalizedSemanticType,
+                    normalizedCompositeRole,
+                    layerType,
+                    layer.name
+                );
                 
                 return {
                     id: id,
@@ -1465,10 +2057,90 @@ export async function analyzeTargetBoundingBox(image, prompt) {
     return null;
 }
 
-export async function generateImage(prompt, aspectRatio = '1:1') {
+export async function generateImage(prompt, aspectRatio = '1:1', options = {}) {
     prompt = prompt || "生成一张图片";
-    
+    const imageCount = Math.max(1, Number(options.imageCount) || 1);
     const imageModel = getImageModel();
+    const referenceBrief = isQwenImageFamilyModel(imageModel)
+        ? ''
+        : await buildImageGenerationReferenceBrief(
+            prompt,
+            options.baseImage || null,
+            options.referenceImages || [],
+            options.history || []
+        );
+    const finalPrompt = composeReferenceAwareGenerationPrompt(prompt, referenceBrief);
+
+    if (isQwenImageEditModel(imageModel)) {
+        console.log('🚀 [Qwen Image Edit 2509] 正在调用 SiliconFlow 图片处理接口...');
+        const baseImage = options.baseImage ? await ensurePngBase64(options.baseImage) : null;
+        const references = [];
+        for (const reference of (options.referenceImages || []).slice(0, 2)) {
+            const normalized = await ensurePngBase64(reference);
+            if (normalized) references.push(normalized);
+        }
+
+        const runQwenGeneration = () => callQwenImageEdit2509Router({
+            mode: 'image_generation',
+            prompt: finalPrompt,
+            image: baseImage,
+            images: references,
+            size: getQwenImageSize(aspectRatio),
+            imageCount
+        });
+
+        if (imageCount > 1) {
+            const results = await Promise.all(
+                Array.from({ length: imageCount }, () => runQwenGeneration())
+            );
+            return {
+                success: true,
+                imageData: results.map(result => ({
+                    imageData: result.imageData,
+                    mimeType: result.mimeType
+                })),
+                mimeType: results[0]?.mimeType || 'image/png'
+            };
+        }
+
+        return runQwenGeneration();
+    }
+
+    if (isQwenImageModel(imageModel)) {
+        console.log('🚀 [Qwen Image 3.0 Pro] 正在调用 DashScope 图片生成接口...');
+        const baseImage = options.baseImage ? await ensurePngBase64(options.baseImage) : null;
+        const references = [];
+        for (const reference of (options.referenceImages || []).slice(0, 2)) {
+            const normalized = await ensurePngBase64(reference);
+            if (normalized) references.push(normalized);
+        }
+
+        const runQwenGeneration = () => callQwenImageRouter({
+            mode: 'image_generation',
+            prompt: finalPrompt,
+            image: baseImage,
+            images: references,
+            size: getQwenImageSize(aspectRatio),
+            imageCount
+        });
+
+        if (imageCount > 1) {
+            const results = await Promise.all(
+                Array.from({ length: imageCount }, () => runQwenGeneration())
+            );
+            return {
+                success: true,
+                imageData: results.map(result => ({
+                    imageData: result.imageData,
+                    mimeType: result.mimeType
+                })),
+                mimeType: results[0]?.mimeType || 'image/png'
+            };
+        }
+
+        return runQwenGeneration();
+    }
+
     if (imageModel === 'gpt-image-2') {
         console.log("🚀 [GPT-image-2] 正在自适应路由调用高精度中转图像生成...");
         try {
@@ -1482,8 +2154,8 @@ export async function generateImage(prompt, aspectRatio = '1:1') {
 
             const payload = {
                 mode: "image_generation",
-               
-                prompt: prompt,
+                prompt: finalPrompt,
+                n: imageCount,
                 size: size,
                 quality: "auto",
                 output_format: "jpeg"
@@ -1499,32 +2171,45 @@ export async function generateImage(prompt, aspectRatio = '1:1') {
             });
 
             if (!response.ok) {
-                throw new Error(`GPT-image-2 接口返回 ${response.status}`);
+                throw await buildImageApiError(response, 'GPT-image-2 图片生成失败');
             }
 
             const data = await response.json();
-            console.log("📥 [GPT-image-2] 接收原始 API 响应成果:", data);
+            console.log("📥 [GPT-image-2] 生成响应摘要", {
+                httpStatus: response.status,
+                topLevelKeys: data && typeof data === 'object' ? Object.keys(data) : [],
+                imageCount: Array.isArray(data?.data) ? data.data.length : 0,
+                b64Lengths: Array.isArray(data?.data)
+                    ? data.data.map(item => typeof item?.b64_json === 'string' ? item.b64_json.length : 0)
+                    : [],
+                hasImageUrl: Array.isArray(data?.data) && data.data.some(item => typeof item?.url === 'string'),
+                choiceContentLength: typeof data?.choices?.[0]?.message?.content === 'string'
+                    ? data.choices[0].message.content.length
+                    : 0
+            });
 
-            let imageData = null;
-            if (data.data && data.data[0]) {
-                const item = data.data[0];
-                if (item.b64_json) {
-                    imageData = item.b64_json;
-                } else if (item.url) {
-                    imageData = item.url;
+            if (Array.isArray(data.data) && data.data.length > 0) {
+                const imageItems = data.data.map(item => {
+                    if (item?.b64_json) return { imageData: item.b64_json, mimeType: 'image/jpeg' };
+                    if (item?.url) return { imageData: item.url, mimeType: 'image/jpeg' };
+                    return null;
+                }).filter(Boolean);
+
+                if (imageItems.length > 1) {
+                    return { success: true, imageData: imageItems, mimeType: 'image/jpeg' };
+                }
+
+                if (imageItems.length === 1) {
+                    return { success: true, imageData: imageItems[0].imageData, mimeType: imageItems[0].mimeType };
                 }
             } else if (data.choices && data.choices[0] && data.choices[0].message) {
                 const content = data.choices[0].message.content;
                 if (content && (content.startsWith('http') || content.trim().length > 100)) {
-                    imageData = content.includes(',') ? content.split(',')[1] : content;
+                    const imageData = content.includes(',') ? content.split(',')[1] : content;
+                    return { success: true, imageData: imageData, mimeType: 'image/jpeg' };
                 }
             }
-
-            if (!imageData) {
-                throw new Error("接口返回无法提取有效图像 Base64/URL 成果。");
-            }
-
-            return { success: true, imageData: imageData, mimeType: 'image/jpeg' };
+            throw new Error("接口返回无法提取有效图像 Base64/URL 成果。");
         } catch (error) {
             console.error("⚠️ [GPT-image-2] 图像生成链路异常，抛出异常阻断降级:", error);
             throw error;
@@ -1536,10 +2221,13 @@ export async function generateImage(prompt, aspectRatio = '1:1') {
         if (imageModel.includes('3.1') || imageModel.includes('3-pro')) {
             imageConfig.imageSize = "4K";
         }
+        if (imageCount > 1) {
+            imageConfig.numberOfImages = imageCount;
+        }
         
         if (imageModel.startsWith('gemini')) {
             const payload = {
-                contents: [{ role: "user", parts: [{ text: prompt }] }],
+                contents: [{ role: "user", parts: [{ text: finalPrompt }] }],
                 config: { imageConfig: imageConfig }
             };
 
@@ -1555,10 +2243,14 @@ export async function generateImage(prompt, aspectRatio = '1:1') {
             const data = await response.json();
             
             if (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) {
-                for (const part of data.candidates[0].content.parts) {
-                    if (part.inlineData) {
-                        return { success: true, imageData: part.inlineData.data, mimeType: part.inlineData.mimeType || 'image/png' };
-                    }
+                const imageParts = data.candidates[0].content.parts
+                    .filter(part => part.inlineData)
+                    .map(part => ({ imageData: part.inlineData.data, mimeType: part.inlineData.mimeType || 'image/png' }));
+                if (imageParts.length > 1) {
+                    return { success: true, imageData: imageParts, mimeType: imageParts[0].mimeType };
+                }
+                if (imageParts.length === 1) {
+                    return { success: true, imageData: imageParts[0].imageData, mimeType: imageParts[0].mimeType };
                 }
             }
             throw new Error("Failed to generate image via proxy.");
@@ -1566,17 +2258,21 @@ export async function generateImage(prompt, aspectRatio = '1:1') {
 
         const response = await proxyGenerateContent({
             model: imageModel,
-            contents: { parts: [{ text: prompt }] },
+            contents: { parts: [{ text: finalPrompt }] },
             config: {
                 imageConfig: imageConfig
             }
         });
         
         if (response.candidates && response.candidates[0] && response.candidates[0].content && response.candidates[0].content.parts) {
-            for (const part of response.candidates[0].content.parts) {
-                if (part.inlineData) {
-                    return { success: true, imageData: part.inlineData.data, mimeType: part.inlineData.mimeType || 'image/png' };
-                }
+            const imageParts = response.candidates[0].content.parts
+                .filter(part => part.inlineData)
+                .map(part => ({ imageData: part.inlineData.data, mimeType: part.inlineData.mimeType || 'image/png' }));
+            if (imageParts.length > 1) {
+                return { success: true, imageData: imageParts, mimeType: imageParts[0].mimeType };
+            }
+            if (imageParts.length === 1) {
+                return { success: true, imageData: imageParts[0].imageData, mimeType: imageParts[0].mimeType };
             }
         }
         throw new Error("Failed to generate image with banana model.");
@@ -1585,15 +2281,25 @@ export async function generateImage(prompt, aspectRatio = '1:1') {
     // Fallback to Imagen
     const response = await ai.models.generateImages({
         model: 'imagen-4.0-generate-001',
-        prompt: prompt,
+        prompt: finalPrompt,
         config: {
-            numberOfImages: 1,
+            numberOfImages: imageCount,
             outputMimeType: 'image/jpeg',
             aspectRatio: aspectRatio
         }
     });
     
     if (response.generatedImages && response.generatedImages.length > 0) {
+        if (response.generatedImages.length > 1) {
+            return {
+                success: true,
+                imageData: response.generatedImages.map(item => ({
+                    imageData: item.image.imageBytes,
+                    mimeType: 'image/jpeg'
+                })),
+                mimeType: 'image/jpeg'
+            };
+        }
         const imageData = response.generatedImages[0].image.imageBytes;
         return { success: true, imageData, mimeType: 'image/jpeg' };
     }
@@ -1630,11 +2336,27 @@ export async function applyCameraLens(image, prompt) {
 
 export async function generateVideo(image, prompt, aspectRatio) {
     prompt = prompt || "将这张图片转换为动态视频";
-    const { generateVeoVideo } = await import("./gemini-client.js");
-    const { fileToBase64 } = await import("../core/utils.js");
-    const b64 = await fileToBase64(image);
-    const vidBlob = await generateVeoVideo(prompt, b64, image.type || 'image/png', aspectRatio);
-    return vidBlob;
+    const { fileToDataURL } = await import("../core/utils.js");
+    const { generateWanMotionPreview, pickWanImageSize } = await import("./siliconflow-video.js");
+    const dataUrl = await fileToDataURL(image);
+    let imageSize = '1280x720';
+
+    if (aspectRatio === '9:16' || aspectRatio === '3:4') {
+        imageSize = '720x1280';
+    } else if (aspectRatio === '1:1') {
+        imageSize = '960x960';
+    } else if (aspectRatio) {
+        const [w, h] = aspectRatio.split(':').map(Number);
+        if (w && h) {
+            imageSize = pickWanImageSize(w, h);
+        }
+    }
+
+    return await generateWanMotionPreview({
+        prompt,
+        image: dataUrl,
+        imageSize
+    });
 }
 
 export async function upscaleImage(image, prompt) {

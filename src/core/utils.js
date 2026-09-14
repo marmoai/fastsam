@@ -26,6 +26,44 @@ export const isMaterialRequest = (text) => {
     return keywords.some(k => text.toLowerCase().includes(k));
 };
 
+export const getExplicitRequestedImageCount = (text, maxCount = 6) => {
+    if (!text || typeof text !== 'string') return 1;
+
+    const normalized = text.replace(/\s+/g, '');
+    const cappedMax = Math.max(1, Number(maxCount) || 6);
+    const numeralMap = {
+        '一': 1,
+        '两': 2,
+        '二': 2,
+        '三': 3,
+        '四': 4,
+        '五': 5,
+        '六': 6,
+        '1': 1,
+        '2': 2,
+        '3': 3,
+        '4': 4,
+        '5': 5,
+        '6': 6
+    };
+
+    const explicitPatterns = [
+        /(生成|出|给我|来|做|重来|重新生成|再来|再出|再做)([一二两三四五六1-6])(?:张|版|个版本|个方案|幅|套)/i,
+        /([一二两三四五六1-6])(?:张|版|个版本|个方案|幅|套)(?:图|图片|海报|插画|版本|方案)?/i
+    ];
+
+    for (const pattern of explicitPatterns) {
+        const match = normalized.match(pattern);
+        if (!match) continue;
+        const rawCount = match[2] || match[1];
+        const parsed = numeralMap[rawCount];
+        if (!parsed) continue;
+        return Math.min(cappedMax, Math.max(1, parsed));
+    }
+
+    return 1;
+};
+
 export const fileToDataURL = (file) => {
     return new Promise((resolve, reject) => {
         if (!file) {
@@ -147,7 +185,7 @@ export const blobToBase64 = (blob) => {
 
 export const isImageGenerationRequest = (text) => {
     if (!text) return false;
-    const keywords = ['生成', '画', '绘制', '创造', '图片', '图像', '照片', '插画', '海报', 'logo', '图标', '风格', '场景', '人物', '建筑', '风景', '写实', '抽象', '4K', '高清', '渲染'];
+    const keywords = ['生成', '生图', '出图', '做图', '画', '绘制', '创造', '图片', '图像', '照片', '插画', '海报', 'logo', '图标', '风格', '场景', '人物', '建筑', '风景', '写实', '抽象', '4K', '高清', '渲染'];
     return keywords.some(keyword => text.toLowerCase().includes(keyword));
 };
 
@@ -261,17 +299,25 @@ export const compressImage = async (fileOrBlob, maxWidth = 4096, quality = 0.92)
                 originalName = originalName.substring(0, originalName.lastIndexOf('.'));
             }
 
-            canvas.toBlob((blob) => {
-                if (blob) {
-                    const newFile = new File([blob], originalName + outputExt, {
-                        type: outputType,
-                        lastModified: Date.now(),
-                    });
-                    resolve(newFile);
-                } else {
-                    reject(new Error('Canvas to Blob failed'));
-                }
-            }, outputType, quality);
+            try {
+                canvas.toBlob((blob) => {
+                    if (blob) {
+                        const newFile = new File([blob], originalName + outputExt, {
+                            type: outputType,
+                            lastModified: Date.now(),
+                        });
+                        resolve(newFile);
+                    } else {
+                        reject(new Error('Canvas to Blob failed'));
+                    }
+                }, outputType, quality);
+            } catch (error) {
+                // A cross-origin source can taint the canvas even when the
+                // image loaded successfully. Upload the original bytes rather
+                // than leaving callers waiting on an unresolved Promise.
+                console.warn('Image compression skipped because canvas export was blocked:', error);
+                resolve(fileOrBlob);
+            }
         };
         img.onerror = (err) => {
             URL.revokeObjectURL(url);

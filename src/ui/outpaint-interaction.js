@@ -247,7 +247,7 @@ export async function handleOutpaintDragEnd(e) {
         workbenchGrid.appendChild(placeholder);
 
         // --- 添加聊天提示信息 ---
-        const tempMsg = addMessage({ sender: 'bot', type: 'text', content: `🎨 正在向 **${direction}** 方向扩展至 **${targetRatioName}** 比例...` });
+        const tempMsg = addMessage({ sender: 'bot', type: 'text', visibility: 'progress', persist: false, content: `🎨 正在向 **${direction}** 方向扩展至 **${targetRatioName}** 比例...` });
 
         const promptToUse = customPrompt || fullPrompt;
 

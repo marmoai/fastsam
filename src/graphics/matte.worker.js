@@ -45,29 +45,31 @@ self.onmessage = async (e) => {
             // A flat foreground object (like a smooth black headphone case) can trick engine.sampleBackground().
             // Because we added 15% padding to the bounding box during extraction, we KNOW the outer 5-10% 
             // is 100% the generated solid background. So we strictly sample the borders to find the TRUE generated color (which might have slight variations from pure hex due to AI).
-            let sumR = 0, sumG = 0, sumB = 0, count = 0;
-            const marginX = engine.w * 0.05;
-            const marginY = engine.h * 0.05;
-            
-            for (let y = 0; y < engine.h; y += 3) {
-                for (let x = 0; x < engine.w; x += 3) {
-                    if (x < marginX || x >= engine.w - marginX || y < marginY || y >= engine.h - marginY) {
-                        const idx = ((y * engine.w) + x) * 4;
-                        sumR += engine.data[idx];
-                        sumG += engine.data[idx+1];
-                        sumB += engine.data[idx+2];
-                        count++;
-                    }
-                }
-            }
-            if (count > 0) {
-                engine.bgR = sumR / count;
-                engine.bgG = sumG / count;
-                engine.bgB = sumB / count;
-            } else if (options && options.bgColor) {
+            if (options && options.bgColor) {
                 engine.bgR = options.bgColor[0];
                 engine.bgG = options.bgColor[1];
                 engine.bgB = options.bgColor[2];
+            } else {
+                let sumR = 0, sumG = 0, sumB = 0, count = 0;
+                const marginX = engine.w * 0.05;
+                const marginY = engine.h * 0.05;
+
+                for (let y = 0; y < engine.h; y += 3) {
+                    for (let x = 0; x < engine.w; x += 3) {
+                        if (x < marginX || x >= engine.w - marginX || y < marginY || y >= engine.h - marginY) {
+                            const idx = ((y * engine.w) + x) * 4;
+                            sumR += engine.data[idx];
+                            sumG += engine.data[idx+1];
+                            sumB += engine.data[idx+2];
+                            count++;
+                        }
+                    }
+                }
+                if (count > 0) {
+                    engine.bgR = sumR / count;
+                    engine.bgG = sumG / count;
+                    engine.bgB = sumB / count;
+                }
             }
             
             alphaData = engine.fastChromaKey(deepMaskArray);

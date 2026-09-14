@@ -5,6 +5,7 @@ import { blobToBase64, dataURLtoFileSync } from '../core/utils.js';
 import { generateVisualSearch } from '../ai-services/gemini-client.js';
 import { addImageToWorkbench } from './workbench-core.js';
 import { preciseEditMode } from './fusion-editor.js';
+import { recordWorkspaceAction } from '../services/workspace-context.js';
 
 export class MarmoLens {
     constructor(aiInstance) {
@@ -258,10 +259,25 @@ export class MarmoLens {
             
             // 3. Process Response
             this.renderResults(resultData, croppedBase64, webLinks);
+            const itemId = Array.from(state.workbenchItems.entries())
+                .find(([, candidate]) => candidate === item)?.[0] || null;
+            recordWorkspaceAction(state, {
+                actionName: 'lens_search_completed',
+                itemId,
+                status: 'completed',
+                hasResult: true
+            });
+            return {
+                success: true,
+                resultData,
+                webLinks,
+                box: objectData.box
+            };
 
         } catch (e) {
             console.error("Search failed:", e);
             this.resultsContainer.innerHTML = `<p style="text-align:center; padding:20px; color:#e53e3e;">识别失败: ${e.message}</p>`;
+            return { success: false, error: e.message || '未知错误' };
         } finally {
             this.loadingIndicator.style.display = 'none';
         }

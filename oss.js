@@ -459,28 +459,34 @@ async function saveSessionsManifestToProjectStorage(userId, entries = []) {
   return manifest;
 }
 
-async function loadSessionsFromProjectStorage(userId) {
+async function loadSessionManifestFromProjectStorage(userId) {
   const manifest = await readJsonFromOss(getManifestKey(userId), null);
-  if (!manifest || !Array.isArray(manifest.sessions)) {
+  if (manifest && Array.isArray(manifest.sessions)) {
+    return manifest.sessions
+      .filter(entry => entry?.id && !entry.deletedAt)
+      .map(buildSessionManifestEntry)
+      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  }
+
+  const legacyData = await readJsonFromOss(getLegacySessionsKey(userId), null);
+  if (!Array.isArray(legacyData?.sessions)) {
     return null;
   }
 
-  const sessions = [];
-  for (const entry of manifest.sessions) {
-    if (!entry?.id || entry.deletedAt) continue;
-    const session = await readJsonFromOss(getSessionDataKey(userId, entry.id), null);
-    if (!session) continue;
-    sessions.push({
-      ...session,
-      title: entry.title || session.title,
-      timestamp: entry.timestamp || session.timestamp,
-      updatedAt: entry.updatedAt || session.updatedAt,
-      isAutoRenamed: typeof entry.isAutoRenamed === 'boolean' ? entry.isAutoRenamed : !!session.isAutoRenamed
-    });
-  }
+  return legacyData.sessions
+    .filter(session => session?.id && !session.deletedAt)
+    .map(buildSessionManifestEntry)
+    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+}
 
-  sessions.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-  return sessions;
+async function loadSessionFromProjectStorage(userId, sessionId) {
+  const session = await readJsonFromOss(getSessionDataKey(userId, sessionId), null);
+  if (session) return session;
+
+  // Compatibility for accounts that still only have the legacy aggregate file.
+  const legacyData = await readJsonFromOss(getLegacySessionsKey(userId), null);
+  if (!Array.isArray(legacyData?.sessions)) return null;
+  return legacyData.sessions.find(candidate => candidate?.id === sessionId) || null;
 }
 
 function enforceRateLimit(req, res, headers, routeKey, identity) {
@@ -850,11 +856,7 @@ if (req.url === '/products' && req.method === 'GET') {
         const auth = await requireAuth(req, res, headers, userId);
         if (!auth) return;
 
-        let sessions = await loadSessionsFromProjectStorage(userId);
-        if (!sessions) {
-          const legacyData = await readJsonFromOss(getLegacySessionsKey(userId), { sessions: [] });
-          sessions = Array.isArray(legacyData?.sessions) ? legacyData.sessions : [];
-        }
+        const sessions = (await loadSessionManifestFromProjectStorage(userId)) || [];
 
         res.writeHead(200, headers);
         res.end(JSON.stringify({ 
@@ -864,6 +866,34 @@ if (req.url === '/products' && req.method === 'GET') {
         }));
       } catch (error) {
         console.error('获取会话失败:', error);
+        res.writeHead(400, headers);
+        res.end(JSON.stringify({ status: 'error', message: error.message }));
+      }
+      return;
+    }
+
+    // 按需获取单个会话详情，避免启动时把所有聊天和工作台数据拼成一个大响应
+    if (req.url.startsWith('/get-session') && req.method === 'GET') {
+      try {
+        const url = new URL(req.url, `http://${req.headers.host}`);
+        const userId = url.searchParams.get('userId');
+        const sessionId = url.searchParams.get('sessionId');
+        if (!userId) throw new Error('缺少 userId');
+        if (!sessionId) throw new Error('缺少 sessionId');
+        const auth = await requireAuth(req, res, headers, userId);
+        if (!auth) return;
+
+        const session = await loadSessionFromProjectStorage(userId, sessionId);
+        if (!session) {
+          res.writeHead(404, headers);
+          res.end(JSON.stringify({ status: 'error', message: '会话不存在' }));
+          return;
+        }
+
+        res.writeHead(200, headers);
+        res.end(JSON.stringify({ status: 'success', session }));
+      } catch (error) {
+        console.error('获取单个会话失败:', error);
         res.writeHead(400, headers);
         res.end(JSON.stringify({ status: 'error', message: error.message }));
       }

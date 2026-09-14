@@ -15,6 +15,21 @@ export const state = {
     draggedWorkbenchItem: null,
     currentActiveWorkbenchItemId: null,
     currentIntentLock: null,
+    // Internal bridge between Workbench actions and ChatPanel/assistant context.
+    // This is not chat history and should not be rendered as messages.
+    workspaceContext: {
+        activeItemId: null,
+        activeItem: null,
+        activeLayerId: null,
+        activeLayerName: null,
+        selectedItemIds: [],
+        selectedItems: [],
+        sceneMode: 'unknown',
+        status: 'ready',
+        lastAction: null,
+        recentActions: [],
+        lastUpdatedAt: null
+    },
     activeConnectors: [],
     collisionTargetId: null,
     injectionSourceId: null,
@@ -46,7 +61,7 @@ export const state = {
     panOffsetX: 0,
     panOffsetY: 0,
     workbenchZoom: 0.2,
-    selectedModel: 'gpt-image-2',
+    selectedModel: 'lite',
     thinkingLevel: 'LOW',
     maskEditor: {
         isDrawing: false,

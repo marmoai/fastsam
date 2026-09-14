@@ -1,4 +1,6 @@
 import { DESIGN_PATTERNS } from '../runtime/DesignPatternSystem';
+import { resultFeedbackRuntime } from '../runtime/ResultFeedbackRuntime';
+import { interactionAttributionRuntime } from '../runtime/InteractionAttributionRuntime';
 
 // Add the original state and other imports
 import { state } from '../core/state.js';
@@ -16,11 +18,14 @@ import { performDeepFusion } from './fusion.js';
 import { extractLayerAsset, editLayerAsset, undoLayerVersion, resetLayerVersion, exportCurrentSceneImage, cleanBackground, cleanMultipleBackgrounds } from './workbench/layer-assets.js';
 import { PRESETS } from '../config/presets.js';
 import { globalMatteTaskSystem } from '../graphics/matte-task-system.js';
-import { buildSemanticLayerViews, applySemanticLayerViewsToItem, getCleanupLayerForEditableLayer, updateLayerExtractionMetadata } from '../services/semantic-layer-views.js';
+import { buildSemanticLayerViews, applySemanticLayerViewsToItem, getBackgroundSemanticHint, getCleanupLayerForEditableLayer, updateLayerExtractionMetadata } from '../services/semantic-layer-views.js';
 import { segmentSingleLayer } from '../services/segmentation-service.js';
 import { buildExtractedTextState } from './text-style-utils.js';
 import { filterTextLinesToBbox, getCachedTextExtraction, normalizeOcrTextLines } from '../services/text-extraction-cache.js';
+import { recordWorkspaceAction } from '../services/workspace-context.js';
 import { prepareTextContainerCandidates, restoreTextContainerShapes } from './text-container-restore.js';
+import { isAgentRuntimeFeatureEnabled } from '../core/config.js';
+import { startLayerExtractionJob } from './agent-task-controller.js';
 
 const DISABLE_NON_SEMANTIC_GEMINI_FOR_FASTSAM_TEST = true;
 
@@ -625,6 +630,32 @@ export function ensureSchemeSwitcher(itemId) {
         }
         const dataUrl = await exportCurrentSceneImage(itemId);
         if (dataUrl) {
+            try {
+                const source = interactionAttributionRuntime.resolveSource({
+                    assetUid: itemId,
+                    fallbackSourceType: 'manual'
+                });
+                resultFeedbackRuntime.recordEvent({
+                    type: 'result_exported',
+                    assetUid: itemId,
+                    schemeId: item.activeSchemeId || undefined,
+                    sessionId: state.currentSessionId || undefined,
+                    projectId: window.mvrRuntime?.getCurrentWorkspace?.()?.projectId || undefined,
+                    sourceType: source.sourceType,
+                    sourceId: source.sourceId,
+                    context: {
+                        taskType: item.type || undefined,
+                        workflowStage: 'scheme_export'
+                    },
+                    metadata: {
+                        activeSchemeId: item.activeSchemeId || null,
+                        layerCount: Array.isArray(layers) ? layers.length : 0,
+                        attributionMetadata: source.metadata || null
+                    }
+                });
+            } catch (error) {
+                console.error('[ResultFeedback] Failed to record result_exported:', error);
+            }
             const a = document.createElement('a');
             a.href = dataUrl;
             a.download = `scheme_${item.activeSchemeId}.jpg`;
@@ -729,7 +760,31 @@ export function ensureLayerPanelFooter(itemId) {
     const recomposeBtn = footer.querySelector('#recomposeBtn');
     
     if (fusionBtn) fusionBtn.onclick = () => handleFusionEdit(itemId);
-    if (explodeBtn) explodeBtn.onclick = () => window.triggerLayerExplosion(itemId);
+    if (explodeBtn) explodeBtn.onclick = async () => {
+        if (!isAgentRuntimeFeatureEnabled('magicLayersCommand')) {
+            await window.triggerLayerExplosion(itemId);
+            return;
+        }
+        const item = workbenchItems.get(itemId);
+        const layers = item?.scene?.layers || item?.layers || [];
+        const layerIds = layers
+            .map((layer, index) => ({ layer, index }))
+            .filter(({ index, layer }) => {
+                const layerState = getLayerState(itemId, index);
+                return layer?.id && layerState.selected && !layerState.locked;
+            })
+            .map(({ layer }) => layer.id);
+        if (layerIds.length === 0) {
+            addMessage({ sender: 'bot', type: 'text', content: '⚠️ 请先在语义列表中选择至少一个可提取图层。' });
+            return;
+        }
+        await startLayerExtractionJob({
+            runtime: window.mvrRuntime,
+            itemId,
+            layerIds,
+            goal: `提取选定图层（${layerIds.length} 个）`
+        });
+    };
     if (recomposeBtn) recomposeBtn.onclick = () => handleRecomposeVerification(itemId);
 }
 
@@ -998,6 +1053,7 @@ export function renderLayerList(layers, itemId) {
             nameDiv.style.display = 'flex';
             nameDiv.style.alignItems = 'center';
             nameDiv.style.minWidth = '0';
+            nameDiv.title = `文字图层（共 ${entry.entries.length} 个）`;
             nameDiv.innerHTML = `
                 <div style="display:flex;align-items:center;gap:6px;min-width:0;white-space:nowrap;overflow:hidden;">
                     <i class="fas fa-font" style="font-size:11px;color:#475569;"></i>
@@ -1082,6 +1138,15 @@ export function renderLayerList(layers, itemId) {
             updateFusionUI(itemId);
             
             state.currentActiveWorkbenchItemId = itemId;
+            recordWorkspaceAction(state, {
+                actionName: 'semantic_layer_selection_changed',
+                itemId,
+                layerId: layer.id || `layer-${index}`,
+                layerName,
+                activeLayerId: newSelected ? (layer.id || `layer-${index}`) : null,
+                activeLayerName: newSelected ? layerName : null,
+                status: 'ready'
+            });
             if (newSelected && typeof window.triggerCapsuleAlert === 'function') {
                 window.triggerCapsuleAlert(itemId);
             }
@@ -1118,6 +1183,15 @@ export function renderLayerList(layers, itemId) {
             updateFusionUI(itemId);
             
             state.currentActiveWorkbenchItemId = itemId;
+            recordWorkspaceAction(state, {
+                actionName: 'semantic_layer_selection_changed',
+                itemId,
+                layerId: layer.id || `layer-${index}`,
+                layerName,
+                activeLayerId: isChecked ? (layer.id || `layer-${index}`) : null,
+                activeLayerName: isChecked ? layerName : null,
+                status: 'ready'
+            });
             if (isChecked && typeof window.triggerCapsuleAlert === 'function') {
                 window.triggerCapsuleAlert(itemId);
             }
@@ -1154,12 +1228,26 @@ export function renderLayerList(layers, itemId) {
             statusIcon = '<i class="fas fa-check-circle" style="color: #10b981; font-size: 10px;" title="图层已就绪"></i>';
         }
 
-        titleRow.innerHTML = `<span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;">${layerName}</span> ${statusIcon}`;
+        const layerNameSpan = document.createElement('span');
+        layerNameSpan.textContent = layerName;
+        layerNameSpan.title = layerName;
+        layerNameSpan.style.whiteSpace = 'nowrap';
+        layerNameSpan.style.overflow = 'hidden';
+        layerNameSpan.style.textOverflow = 'ellipsis';
+        layerNameSpan.style.minWidth = '0';
+        layerNameSpan.style.flex = '1';
+
+        titleRow.appendChild(layerNameSpan);
+        if (statusIcon) {
+            const statusWrapper = document.createElement('span');
+            statusWrapper.innerHTML = statusIcon;
+            titleRow.appendChild(statusWrapper);
+        }
         nameDiv.appendChild(titleRow);
 
         nameDiv.onclick = (e) => {
             e.stopPropagation();
-            highlightLayerInImage(itemId, layerName, layer.bbox || [0,0,1000,1000], el);
+            highlightLayerInImage(itemId, layerName, layer, el);
         };
 
         const actionsDiv = document.createElement('div');
@@ -1395,7 +1483,7 @@ export async function handleFusionEdit(itemId) {
     
     const executeMultiLayerEdit = async (customPrompt) => {
         const promptToUse = customPrompt || promptText;
-        const tempMsg = addMessage({ sender: 'bot', type: 'text', content: `🎨 **正在融合编辑**: [${layerNames.join(', ')}]\n指令: "${promptToUse}"` });
+        const tempMsg = addMessage({ sender: 'bot', type: 'text', visibility: 'progress', persist: false, content: `🎨 **正在融合编辑**: [${layerNames.join(', ')}]\n指令: "${promptToUse}"` });
 
         try {
             const fullPrompt = `${promptToUse}. Change ONLY the visual appearance (color, material, style) of the selected objects. Keep the background and other objects unchanged.`;
@@ -1431,40 +1519,175 @@ export async function handleFusionEdit(itemId) {
 
 let currentHighlightOverlay = null;
 
-export function highlightLayerInImage(itemId, layerName, bbox, listItemEl) {
+function mergeNormalizedBboxes(bboxes = []) {
+    const valid = bboxes.filter(bbox => Array.isArray(bbox) && bbox.length === 4);
+    if (!valid.length) return null;
+    return [
+        Math.min(...valid.map(bbox => Number(bbox[0]) || 0)),
+        Math.min(...valid.map(bbox => Number(bbox[1]) || 0)),
+        Math.max(...valid.map(bbox => Number(bbox[2]) || 0)),
+        Math.max(...valid.map(bbox => Number(bbox[3]) || 0))
+    ];
+}
+
+function parseWorkbenchCssPx(value) {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    const parsed = Number.parseFloat(String(value || '').replace('px', '').trim());
+    return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function getWorkbenchHighlightHost() {
+    const grid = window.workbenchGrid || document.getElementById('workbenchGrid');
+    if (!grid) return null;
+    let host = grid.querySelector('.global-layer-highlight-host');
+    if (!host) {
+        host = document.createElement('div');
+        host.className = 'global-layer-highlight-host';
+        host.style.position = 'absolute';
+        host.style.inset = '0';
+        host.style.pointerEvents = 'none';
+        host.style.zIndex = '999999';
+        host.style.overflow = 'visible';
+        grid.appendChild(host);
+    }
+    return host;
+}
+
+function getTextNoteRuntimeBboxInParent(candidate, item) {
+    if (!candidate?.el || !item?.el) return null;
+    const childLeft = parseWorkbenchCssPx(candidate.el.style.left);
+    const childTop = parseWorkbenchCssPx(candidate.el.style.top);
+    const childWidth = Math.max(1, parseWorkbenchCssPx(candidate.el.style.width));
+    const childHeight = Math.max(1, parseWorkbenchCssPx(candidate.el.style.height));
+    const parentLeft = parseWorkbenchCssPx(item.el.style.left);
+    const parentTop = parseWorkbenchCssPx(item.el.style.top);
+    const parentWidth = Math.max(1, parseWorkbenchCssPx(item.el.style.width));
+    const parentHeight = Math.max(1, parseWorkbenchCssPx(item.el.style.height));
+
+    return [
+        Math.max(0, Math.min(1000, ((childTop - parentTop) / parentHeight) * 1000)),
+        Math.max(0, Math.min(1000, ((childLeft - parentLeft) / parentWidth) * 1000)),
+        Math.max(0, Math.min(1000, (((childTop - parentTop) + childHeight) / parentHeight) * 1000)),
+        Math.max(0, Math.min(1000, (((childLeft - parentLeft) + childWidth) / parentWidth) * 1000))
+    ];
+}
+
+function getTextNoteContentBboxInParent(candidate, item) {
+    const contentEl = candidate?.el?.querySelector?.('.note-content');
+    if (!contentEl || !item?.el || typeof contentEl.getBoundingClientRect !== 'function' || typeof item.el.getBoundingClientRect !== 'function') {
+        return null;
+    }
+
+    const contentRect = contentEl.getBoundingClientRect();
+    const parentRect = item.el.getBoundingClientRect();
+    const parentWidth = Math.max(1, parentRect.width);
+    const parentHeight = Math.max(1, parentRect.height);
+
+    return [
+        Math.max(0, Math.min(1000, ((contentRect.top - parentRect.top) / parentHeight) * 1000)),
+        Math.max(0, Math.min(1000, ((contentRect.left - parentRect.left) / parentWidth) * 1000)),
+        Math.max(0, Math.min(1000, ((contentRect.bottom - parentRect.top) / parentHeight) * 1000)),
+        Math.max(0, Math.min(1000, ((contentRect.right - parentRect.left) / parentWidth) * 1000))
+    ];
+}
+
+function normalizedBboxesSimilar(a, b, tolerance = 18) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== 4 || b.length !== 4) return false;
+    return a.every((value, index) => Math.abs((Number(value) || 0) - (Number(b[index]) || 0)) <= tolerance);
+}
+
+function bboxDistanceScore(a, b) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== 4 || b.length !== 4) return Number.POSITIVE_INFINITY;
+    return a.reduce((sum, value, index) => sum + Math.abs((Number(value) || 0) - (Number(b[index]) || 0)), 0);
+}
+
+function resolveTextLayerHighlightBbox(item, layerName, fallbackBbox, layerInfo = null) {
+    if (!item) return fallbackBbox;
+    const textNoteMatches = [];
+    const normalizedLayerName = String(layerName || '').trim();
+    const sourceTextLayerId = layerInfo?.sourceTextLayerId || layerInfo?.id || layerInfo?.cleanPlateLayerId || null;
+    const fallback = Array.isArray(layerInfo?.bbox) && layerInfo.bbox.length === 4 ? layerInfo.bbox : fallbackBbox;
+
+    workbenchItems.forEach((candidate) => {
+        if (!candidate || candidate.parentId !== item.id || candidate.type !== 'text-note') return;
+        const candidateBbox = getTextNoteContentBboxInParent(candidate, item) ||
+            (Array.isArray(candidate.originalBbox) && candidate.originalBbox.length === 4
+                ? candidate.originalBbox
+                : getTextNoteRuntimeBboxInParent(candidate, item));
+        if (!Array.isArray(candidateBbox) || candidateBbox.length !== 4) return;
+
+        const candidateLayerName = String(candidate.layerName || '').trim();
+        const candidateSourceId = candidate.sourceTextLayerId;
+        const matchesExactSourceId = sourceTextLayerId && candidateSourceId && candidateSourceId === sourceTextLayerId;
+        const matchesFallbackBbox = Array.isArray(fallback) && fallback.length === 4 && normalizedBboxesSimilar(candidateBbox, fallback);
+        const matchesByName = normalizedLayerName && candidateLayerName === normalizedLayerName;
+        const matchesBySourceId = candidateSourceId && item.scene?.layers?.some(layer =>
+            String(layer.name || '').trim() === normalizedLayerName &&
+            [layer.id, layer.sourceTextLayerId, layer.cleanPlateLayerId].includes(candidateSourceId)
+        );
+
+        if (matchesExactSourceId || matchesFallbackBbox || matchesBySourceId || matchesByName) {
+            textNoteMatches.push({
+                bbox: candidateBbox,
+                score:
+                    (matchesExactSourceId ? 0 : 1000) +
+                    (matchesFallbackBbox ? 0 : 100) +
+                    (matchesBySourceId ? 10 : 0) +
+                    (matchesByName ? 20 : 0) +
+                    bboxDistanceScore(candidateBbox, fallback)
+            });
+        }
+    });
+
+    if (textNoteMatches.length === 0) return fallback;
+    textNoteMatches.sort((a, b) => a.score - b.score);
+    return textNoteMatches[0]?.bbox || fallback;
+}
+
+export function highlightLayerInImage(itemId, layerName, bboxOrLayer, listItemEl) {
     const item = workbenchItems.get(itemId);
     if (!item || !item.el) return;
     
+    const overlayHost = getWorkbenchHighlightHost();
+    if (!overlayHost) return;
+
     const itemEl = item.el;
-    const itemWidth = itemEl.offsetWidth;
-    const itemHeight = itemEl.offsetHeight;
+    const cropContainer = itemEl.querySelector('.crop-container') || itemEl;
+    const itemLeft = parseWorkbenchCssPx(itemEl.style.left);
+    const itemTop = parseWorkbenchCssPx(itemEl.style.top);
+    const itemWidth = Math.max(1, cropContainer.offsetWidth || itemEl.offsetWidth || parseWorkbenchCssPx(itemEl.style.width));
+    const itemHeight = Math.max(1, cropContainer.offsetHeight || itemEl.offsetHeight || parseWorkbenchCssPx(itemEl.style.height));
+    const offsetLeft = cropContainer.offsetLeft || 0;
+    const offsetTop = cropContainer.offsetTop || 0;
     
     if (currentHighlightOverlay) currentHighlightOverlay.remove();
     
-    const [ymin, xmin, ymax, xmax] = bbox;
-    const x = (xmin / 1000) * itemWidth;
-    const y = (ymin / 1000) * itemHeight;
+    const layerInfo = Array.isArray(bboxOrLayer) ? null : bboxOrLayer;
+    const fallbackBbox = Array.isArray(bboxOrLayer) ? bboxOrLayer : (layerInfo?.bbox || [0,0,1000,1000]);
+    const resolvedBbox = resolveTextLayerHighlightBbox(item, layerName, fallbackBbox, layerInfo);
+    const [ymin, xmin, ymax, xmax] = resolvedBbox;
+    const x = itemLeft + offsetLeft + (xmin / 1000) * itemWidth;
+    const y = itemTop + offsetTop + (ymin / 1000) * itemHeight;
     const width = ((xmax - xmin) / 1000) * itemWidth;
     const height = ((ymax - ymin) / 1000) * itemHeight;
     
     const overlay = document.createElement('div');
     overlay.className = 'layer-highlight-overlay';
-
     const visualBorderWidth = 2;
-    const adjustedBorderWidth = visualBorderWidth / state.workbenchZoom;
-
+    const adjustedBorderWidth = Math.max(1, visualBorderWidth / state.workbenchZoom);
     overlay.style.position = 'absolute';
     overlay.style.left = `${x}px`;
     overlay.style.top = `${y}px`;
     overlay.style.width = `${width}px`;
     overlay.style.height = `${height}px`;
-    overlay.style.background = 'rgba(33, 150, 243, 0.1)';
     overlay.style.pointerEvents = 'none';
-    overlay.style.zIndex = '1001';
-    overlay.style.borderRadius = '4px';
+    overlay.style.zIndex = '2';
+    overlay.style.boxSizing = 'border-box';
     overlay.style.border = `${adjustedBorderWidth}px dashed #2196F3`;
+    overlay.style.borderRadius = '4px';
+    overlay.style.background = 'transparent';
 
-    itemEl.appendChild(overlay);
+    overlayHost.appendChild(overlay);
     currentHighlightOverlay = overlay;
     
     setTimeout(() => { if (overlay) overlay.remove(); }, 3000);
@@ -1486,6 +1709,18 @@ export async function performLayerAction(action, layerName, itemId, layerInfo) {
     const layerManagerModal = getEl('layerManagerPanel');
     if(layerManagerModal) layerManagerModal.style.display = 'none';
 
+    // The semantic-list extraction button now enters the same Agent Job
+    // boundary as batch extraction. Text layers keep their dedicated OCR
+    // pipeline because they produce editable text nodes, not image assets.
+    if (action === 'extract' && !isTextLayer && isAgentRuntimeFeatureEnabled('magicLayersCommand') && layerInfo?.id) {
+        return startLayerExtractionJob({
+            runtime: window.mvrRuntime,
+            itemId,
+            layerIds: [layerInfo.id],
+            goal: `提取图层“${layerName}”`
+        });
+    }
+
     let defaultPrompt = "";
     if (action === 'remove') {
         defaultPrompt = `Remove the object "${layerName}" from this image. Use context-aware inpainting to fill the gap seamlessly.`;
@@ -1498,6 +1733,8 @@ export async function performLayerAction(action, layerName, itemId, layerInfo) {
         const tempMsg = addMessage({ 
             sender: 'bot', 
             type: 'text', 
+            visibility: 'progress',
+            persist: false,
             content: action === 'remove' 
                 ? `👁️ **正在移除**: "${layerName}"... AI 正在计算背景补全。\n指令: "${promptToUse}"` 
                 : `✨ **正在重建**: "${layerName}"... AI 正在进行独立资产重建。\n指令: "${promptToUse}"` 
@@ -1510,10 +1747,12 @@ export async function performLayerAction(action, layerName, itemId, layerInfo) {
                 let cleanedBg = null;
                 try {
                     const cleanupLayerPayload = cleanupLayerOverride || cleanupLayerInfo;
+                    const backgroundHint = getBackgroundSemanticHint(item);
                     cleanedBg = await cleanBackground(baseBg, {
                         ...cleanupLayerPayload,
                         name: cleanupLayerPayload?.name || layerName,
-                        promptHint: cleanupLayerPayload?.promptHint || cleanupPromptHint
+                        promptHint: cleanupLayerPayload?.promptHint || cleanupPromptHint,
+                        backgroundHint
                     });
                 } catch (e) {
                     console.warn(`[Modals] Failed to clean background for ${layerName}`, e);
@@ -1524,6 +1763,12 @@ export async function performLayerAction(action, layerName, itemId, layerInfo) {
                     item.dataUrl = cleanedBg;
                     item.cleanPlateStatus = 'ready';
                     workbenchItems.set(itemId, item);
+                    recordWorkspaceAction(state, {
+                        actionName: 'clean_plate_completed',
+                        itemId,
+                        status: 'completed',
+                        hasResult: true
+                    });
                     await persistWorkbenchItemSemanticState(itemId, item);
                     if (window.historyManager) window.historyManager.pushState();
 
@@ -1581,7 +1826,10 @@ export async function performLayerAction(action, layerName, itemId, layerInfo) {
                     baseBg, 
                     layersForCleanup,
                     "Remove all text, letters, logomarks, icon elements, typography, and any text-container artifacts from the image. Preserve only the background and inpaint the cleared regions seamlessly.",
-                    { preserveBackgroundOnly: true }
+                    {
+                        preserveBackgroundOnly: true,
+                        backgroundHint: getBackgroundSemanticHint(item)
+                    }
                 );
                 
                 if (cleanedBg) {
@@ -1589,6 +1837,12 @@ export async function performLayerAction(action, layerName, itemId, layerInfo) {
                     item.dataUrl = cleanedBg;
                     item.cleanPlateStatus = 'ready';
                     workbenchItems.set(itemId, item);
+                    recordWorkspaceAction(state, {
+                        actionName: 'clean_plate_completed',
+                        itemId,
+                        status: 'completed',
+                        hasResult: true
+                    });
                     await persistWorkbenchItemSemanticState(itemId, item);
                     if (window.historyManager) window.historyManager.pushState();
                     if (item.el) {
@@ -1682,38 +1936,11 @@ export async function performLayerAction(action, layerName, itemId, layerInfo) {
                             name: layerName,
                             bbox
                         },
-                        onProgress: (message) => tempMsg.update(message)
+                        onProgress: (message) => tempMsg.update(message),
+                        qualityProfile: 'completion'
                     });
 
                     if (segmented?.dataUrl) {
-                        if (segmented.shouldGenerateRuntimeLayer === false || segmented.runtimeAction === 'hold') {
-                            const layers = item.scene && item.scene.layers ? item.scene.layers : item.layers;
-                            if (layers) {
-                                const layerIndex = layers.findIndex(l => (l.name || l) === layerName);
-                                if (layerIndex >= 0) {
-                                    updateLayerExtractionMetadata(item, {
-                                        id: layers[layerIndex].id,
-                                        name: layerName,
-                                        cleanPlateLayerId: layers[layerIndex].cleanPlateLayerId,
-                                        sourceTextLayerId: layers[layerIndex].sourceTextLayerId
-                                    }, {
-                                        extractEngine: segmented.extractEngine || 'fastsam',
-                                        quality: segmented.quality || {
-                                            status: 'low_quality',
-                                            runtimeAction: 'hold',
-                                            reason: 'quality_gate_hold'
-                                        },
-                                        bbox: segmented.bbox || bbox
-                                    });
-                                    renderLayerList(layers, itemId);
-                                    renderCanvasLayers(itemId);
-                                    await persistWorkbenchItemSemanticState(itemId, item);
-                                }
-                            }
-                            tempMsg.update(`⚠️ **FastSAM 质量不足**: "${layerName}" 已标记为需要高精度模型处理，未生成可编辑图层。`);
-                            return;
-                        }
-
 	                        const newFile = await dataURLToFile(segmented.dataUrl, `extracted-${Date.now()}.png`);
 	                        const parentWidth = parseFloat(item.el.style.width) || 300;
 	                        const parentHeight = parseFloat(item.el.style.height) || 300;
@@ -1721,13 +1948,15 @@ export async function performLayerAction(action, layerName, itemId, layerInfo) {
 	                        const baseY = parseFloat(item.el.style.top) || 0;
 	                        const originalBbox = segmented.bbox || bbox;
 	                        const layerRect = bboxToWorkbenchRect(originalBbox, baseX, baseY, parentWidth, parentHeight, 1, 1);
+	                        const sourceLayerId = !Array.isArray(layerInfo) ? layerInfo?.id || null : null;
 
-	                        addImageToWorkbench(newFile, `拆解-${layerName}`, {
+	                        await addImageToWorkbench(newFile, `拆解-${layerName}`, {
 	                            x: layerRect.left,
 	                            y: layerRect.top,
 	                            initialWidth: layerRect.width,
 	                            initialHeight: layerRect.height,
 	                            parentId: itemId,
+	                            sourceLayerId,
 	                            originalBbox,
 	                            layerName,
 	                            type: 'layer-explode',
@@ -1752,7 +1981,9 @@ export async function performLayerAction(action, layerName, itemId, layerInfo) {
                                         score: null,
                                         reason: 'fastsam_extracted'
                                     },
-                                    bbox: segmented.bbox || bbox
+                                    bbox: segmented.bbox || bbox,
+                                    cutoutUrl: segmented.dataUrl,
+                                    previewUrl: segmented.dataUrl
                                 });
                                 updateLayerState(itemId, layerIndex, { visible: false });
                                 renderLayerList(layers, itemId);
@@ -1769,7 +2000,21 @@ export async function performLayerAction(action, layerName, itemId, layerInfo) {
                             promptHint: cleanupLayerInfo?.promptHint || promptToUse
                         });
 
-                        tempMsg.update(`✅ **FastSAM 提取完成**: "${layerName}" 已生成透明图层。`);
+	                        let completionResult = { completed: 0, eligible: 0 };
+	                        try {
+	                            if (typeof window.runAutomaticCompletionForItem === 'function') {
+	                                completionResult = await window.runAutomaticCompletionForItem(itemId, {
+	                                    onProgress: message => tempMsg.update(`✨ **自动补全**：${message}`)
+	                                });
+	                            }
+	                        } catch (completionError) {
+	                            console.warn('[Single Layer Completion] post-extraction completion skipped:', completionError);
+	                        }
+
+	                        const completionText = completionResult.completed > 0
+	                            ? `，已自动补全 ${completionResult.completed} 个被遮挡实体`
+	                            : '';
+	                        tempMsg.update(`✅ **FastSAM 提取完成**: "${layerName}" 已生成透明图层${completionText}。`);
                         return;
                     }
                 } catch (error) {
@@ -2101,7 +2346,9 @@ ${bgColorRule}`;
 }
 
 
-export function showVideoPromptModal(onConfirm) {
+export function showVideoPromptModal(onConfirm, options = {}) {
+    const initialPrompt = typeof options.initialPrompt === 'string' ? options.initialPrompt : '';
+    const placeholder = options.placeholder || '请输入视频生成描述（例如：镜头推进，赛博朋克风格...）';
     const modal = document.createElement('div');
     modal.style.cssText = `
         position: fixed;
@@ -2119,7 +2366,7 @@ export function showVideoPromptModal(onConfirm) {
     modal.innerHTML = `
         <div style="background: white; padding: 20px; border-radius: 12px; width: 300px;">
             <h3 style="margin-top: 0; color: #2A5C82;">🎥 视频生成描述</h3>
-            <textarea id="videoPromptInput" placeholder="请输入视频生成描述（例如：镜头推进，赛博朋克风格...）" 
+            <textarea id="videoPromptInput" placeholder="${placeholder}" 
                 style="width: 100%; height: 100px; padding: 10px; margin-bottom: 15px; border: 1px solid #ddd; border-radius: 8px; outline: none; font-family: inherit;"></textarea>
             <div style="display: flex; gap: 10px;">
                 <button id="cancelVideoPrompt" style="padding: 8px 16px; background: #eee; border: none; border-radius: 6px; cursor: pointer;">取消</button>
@@ -2133,6 +2380,7 @@ export function showVideoPromptModal(onConfirm) {
     const confirmBtn = document.getElementById('confirmVideoPrompt');
     const cancelBtn = document.getElementById('cancelVideoPrompt');
     const promptInput = document.getElementById('videoPromptInput');
+    promptInput.value = initialPrompt;
 
     confirmBtn.onclick = async () => {
         const videoPrompt = promptInput.value.trim();
@@ -2148,14 +2396,19 @@ export function showVideoPromptModal(onConfirm) {
         document.body.removeChild(modal);
     };
 
-    setTimeout(() => promptInput.focus(), 100);
+    setTimeout(() => {
+        promptInput.focus();
+        if (initialPrompt) {
+            promptInput.setSelectionRange(initialPrompt.length, initialPrompt.length);
+        }
+    }, 100);
 }
 
 export async function handleRecomposeVerification(itemId) {
     const parentItem = workbenchItems.get(itemId);
     if (!parentItem) return;
 
-    const tempMsg = addMessage({ sender: 'bot', type: 'text', content: `🧩 **回贴验证 (Recomposition)**\n正在将提取的资产重新贴回净化后的底板，验证重建完整性...` });
+    const tempMsg = addMessage({ sender: 'bot', type: 'text', visibility: 'progress', persist: false, content: `🧩 **回贴验证 (Recomposition)**\n正在将提取的资产重新贴回净化后的底板，验证重建完整性...` });
 
     try {
         // 1. Get current scene composite using the renderer (with high resolution)

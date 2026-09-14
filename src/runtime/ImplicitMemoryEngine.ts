@@ -1,4 +1,6 @@
 import localforage from 'localforage';
+import { resultFeedbackRuntime } from './ResultFeedbackRuntime';
+import { inferTaskBucketFromAsset, inferTaskBucketFromText, inferTaskBucketFromWorkbenchState, normalizeTaskType } from './taskBuckets';
 
 export interface SatisfactionRule {
     id: string;
@@ -12,6 +14,13 @@ export interface SatisfactionRule {
     crop?: { top: number; left: number; right: number; bottom: number }; // cropping metrics
     aspectRatio?: string;   // Aspect Ratio of the generated image
     presetTags?: string[];  // Described parameters block tag label
+    taskType?: string;
+}
+
+export interface SatisfactionRuleMatch {
+    rule: SatisfactionRule;
+    score: number;
+    taskType: string;
 }
 
 class ImplicitMemoryManager {
@@ -46,7 +55,8 @@ class ImplicitMemoryManager {
                 lastUsed: Date.now(),
                 fusionProperties: { brightness: 105, contrast: 110, saturation: 115, blur: 0 },
                 aspectRatio: '1:1',
-                presetTags: ['紫粉色霓虹调', '1:1 正投影']
+                presetTags: ['紫粉色霓虹调', '1:1 正投影'],
+                taskType: 'general'
             },
             {
                 id: 'default-interior',
@@ -57,7 +67,8 @@ class ImplicitMemoryManager {
                 lastUsed: Date.now(),
                 fusionProperties: { brightness: 100, contrast: 95, saturation: 90, blur: 1 },
                 aspectRatio: '4:3',
-                presetTags: ['高级景深温煦色系', '4:3 比例']
+                presetTags: ['高级景深温煦色系', '4:3 比例'],
+                taskType: 'space'
             },
             {
                 id: 'default-product',
@@ -68,7 +79,8 @@ class ImplicitMemoryManager {
                 lastUsed: Date.now(),
                 fusionProperties: { brightness: 102, contrast: 100, saturation: 95, blur: 0 },
                 aspectRatio: '1:1',
-                presetTags: ['高端静物水泥展台', '双倍透光度']
+                presetTags: ['高端静物水泥展台', '双倍透光度'],
+                taskType: 'product'
             },
             {
                 id: 'default-capsule',
@@ -79,7 +91,8 @@ class ImplicitMemoryManager {
                 lastUsed: Date.now(),
                 fusionProperties: { brightness: 95, contrast: 105, saturation: 100, blur: 2 },
                 aspectRatio: '16:9',
-                presetTags: ['智能灵感舱暗红色调', '16:9 高能缩放']
+                presetTags: ['智能灵感舱暗红色调', '16:9 高能缩放'],
+                taskType: 'general'
             },
             {
                 id: 'default-classic-landscape',
@@ -90,9 +103,14 @@ class ImplicitMemoryManager {
                 lastUsed: Date.now(),
                 fusionProperties: { brightness: 98, contrast: 90, saturation: 80, blur: 3 },
                 aspectRatio: '16:9',
-                presetTags: ['古香古典墨白山水调', '景深三级虚化']
+                presetTags: ['古香古典墨白山水调', '景深三级虚化'],
+                taskType: 'space'
             }
         ];
+    }
+
+    private getRuleTaskType(rule: SatisfactionRule) {
+        return normalizeTaskType(rule.taskType) || inferTaskBucketFromText(`${rule.initialPrompt} ${rule.finalPrompt}`) || 'general';
     }
 
     private async loadFromStorage() {
@@ -122,7 +140,8 @@ class ImplicitMemoryManager {
                         ...existing,
                         ...newRule,
                         count: Math.max(existing.count, newRule.count),
-                        lastUsed: Math.max(existing.lastUsed, newRule.lastUsed)
+                        lastUsed: Math.max(existing.lastUsed, newRule.lastUsed),
+                        taskType: newRule.taskType || existing.taskType
                     };
                 }
             } else {
@@ -400,6 +419,7 @@ class ImplicitMemoryManager {
         let cropMetrics = null;
         let aspectRatio = null;
         let pTags = null;
+        let taskType = null;
 
         if (imgSrc && stateObj && stateObj.workbenchItems) {
             let matchedItem = null;
@@ -411,6 +431,7 @@ class ImplicitMemoryManager {
             }
 
             if (matchedItem) {
+                taskType = inferTaskBucketFromAsset(matchedItem);
                 if (matchedItem.fusionProperties) {
                     fusionProps = JSON.parse(JSON.stringify(matchedItem.fusionProperties));
                 }
@@ -445,7 +466,15 @@ class ImplicitMemoryManager {
             }
         }
 
-        await this.addOrUpdateRule(initialPrompt, finalPrompt, fusionProps, cropMetrics, aspectRatio, pTags);
+        if (!taskType) {
+            taskType = inferTaskBucketFromWorkbenchState(
+                stateObj?.workbenchItems,
+                stateObj?.currentActiveWorkbenchItemId,
+                finalPrompt
+            );
+        }
+
+        await this.addOrUpdateRule(initialPrompt, finalPrompt, fusionProps, cropMetrics, aspectRatio, pTags, taskType || undefined);
         console.log(`[ImplicitMemory] Implicit Satisfaction Recorded! Learned flow: "${initialPrompt}" ===> "${finalPrompt}"`);
     }
 
@@ -482,7 +511,8 @@ class ImplicitMemoryManager {
         fusionProps?: any, 
         cropMetrics?: any, 
         aspectRatio?: string,
-        presetTags?: string[]
+        presetTags?: string[],
+        taskType?: string
     ) {
         if (!initial || !final || initial.trim() === final.trim()) {
             // Also store single prompts if they are substantial (length > 10) to help prompt autocompletion
@@ -495,6 +525,7 @@ class ImplicitMemoryManager {
                     if (cropMetrics) existing.crop = cropMetrics;
                     if (aspectRatio) existing.aspectRatio = aspectRatio;
                     if (presetTags) existing.presetTags = presetTags;
+                    if (taskType) existing.taskType = taskType;
                 } else {
                     const kws = this.extractStemKeywords(initial);
                     this.rules.push({
@@ -508,7 +539,8 @@ class ImplicitMemoryManager {
                         fusionProperties: fusionProps,
                         crop: cropMetrics,
                         aspectRatio: aspectRatio,
-                        presetTags: presetTags
+                        presetTags: presetTags,
+                        taskType: taskType
                     });
                 }
                 await this.saveToStorage();
@@ -529,6 +561,7 @@ class ImplicitMemoryManager {
             if (cropMetrics) this.rules[existingIdx].crop = cropMetrics;
             if (aspectRatio) this.rules[existingIdx].aspectRatio = aspectRatio;
             if (presetTags) this.rules[existingIdx].presetTags = presetTags;
+            if (taskType) this.rules[existingIdx].taskType = taskType;
         } else {
             const kws = this.extractStemKeywords(cleanInitial);
             this.rules.push({
@@ -542,48 +575,142 @@ class ImplicitMemoryManager {
                 fusionProperties: fusionProps,
                 crop: cropMetrics,
                 aspectRatio: aspectRatio,
-                presetTags: presetTags
+                presetTags: presetTags,
+                taskType: taskType
             });
         }
         await this.saveToStorage();
+    }
+
+    public findBestMatch(
+        currentInput: string,
+        options: {
+            taskType?: string;
+            strictTaskType?: boolean;
+            preferTaskType?: boolean;
+        } = {}
+    ): SatisfactionRuleMatch | null {
+        if (!currentInput || currentInput.trim().length < 2) return null;
+        const clean = currentInput.trim().toLowerCase();
+        const taskBucket = normalizeTaskType(options.taskType) || inferTaskBucketFromWorkbenchState(
+            (window as any)?.state?.workbenchItems,
+            (window as any)?.state?.currentActiveWorkbenchItemId,
+            currentInput
+        );
+
+        const keywords = this.extractStemKeywords(currentInput);
+        const candidates = this.rules
+            .map(rule => {
+                const ruleTaskType = this.getRuleTaskType(rule);
+                if (options.strictTaskType && taskBucket && ruleTaskType !== taskBucket) {
+                    return null;
+                }
+
+                const startsWith = rule.initialPrompt.toLowerCase().startsWith(clean);
+                const includes = rule.initialPrompt.toLowerCase().includes(clean);
+                const overlap = keywords.length > 0
+                    ? rule.keywords.filter(kw => keywords.some(userKw => kw.includes(userKw) || userKw.includes(kw))).length
+                    : 0;
+
+                if (
+                    rule.finalPrompt.length <= currentInput.length ||
+                    (!startsWith && !includes && overlap < 1)
+                ) {
+                    return null;
+                }
+
+                let score = 0;
+                if (startsWith) score += 120;
+                else if (includes) score += 70;
+                score += overlap * 25;
+                score += Math.min(rule.count, 10) * 4;
+
+                if (taskBucket && taskBucket !== 'general') {
+                    const bucketScore = resultFeedbackRuntime.getPromptRuleInsights(rule.id, { taskType: taskBucket }).score;
+                    score += bucketScore * (options.preferTaskType ? 14 : 10);
+                    if (ruleTaskType === taskBucket) {
+                        score += options.preferTaskType ? 48 : 20;
+                    }
+                }
+
+                const globalScore = resultFeedbackRuntime.getScoreForPromptRule(rule.id);
+                score += globalScore * 6;
+                score += Math.min(rule.count, 10) * (ruleTaskType === taskBucket ? 2 : 0);
+                score += Math.min((Date.now() - rule.lastUsed) / (1000 * 60 * 60 * 24), 30) * -0.6;
+
+                return { rule, score, taskType: ruleTaskType };
+            })
+            .filter(Boolean) as SatisfactionRuleMatch[];
+
+        candidates.sort((a, b) => b.score - a.score);
+        return candidates[0] || null;
+    }
+
+    public findTaskBucketMatch(currentInput: string, taskType?: string): SatisfactionRuleMatch | null {
+        const normalized = normalizeTaskType(taskType);
+        if (!normalized || normalized === 'general') return null;
+        const strict = this.findBestMatch(currentInput, {
+            taskType: normalized,
+            strictTaskType: true,
+            preferTaskType: true
+        });
+        if (strict) return strict;
+
+        const genericInput = currentInput.trim();
+        const genericTokens = this.extractStemKeywords(genericInput);
+        const isLooseStarter = genericInput.length <= 16 || genericTokens.length <= 2;
+        if (!isLooseStarter) return null;
+
+        const fallbackCandidates = this.rules
+            .filter(rule => this.getRuleTaskType(rule) === normalized && rule.finalPrompt.length > genericInput.length)
+            .map(rule => {
+                const globalScore = resultFeedbackRuntime.getScoreForPromptRule(rule.id);
+                const bucketScore = resultFeedbackRuntime.getPromptRuleInsights(rule.id, { taskType: normalized }).score;
+                const promptAffinity = genericTokens.length > 0
+                    ? rule.keywords.filter(kw => genericTokens.some(token => kw.includes(token) || token.includes(kw))).length
+                    : 0;
+                const score =
+                    (bucketScore * 18) +
+                    (globalScore * 6) +
+                    (Math.min(rule.count, 10) * 8) +
+                    (promptAffinity * 12);
+                return { rule, score, taskType: normalized };
+            })
+            .sort((a, b) => b.score - a.score);
+
+        if (fallbackCandidates[0] && fallbackCandidates[0].score > 20) {
+            return fallbackCandidates[0];
+        }
+        return null;
+    }
+
+    public getTopRules(taskType?: string, limit: number = 5): SatisfactionRule[] {
+        const normalized = normalizeTaskType(taskType);
+        const scopedRules = this.rules.filter(rule => {
+            if (!normalized || normalized === 'general') return true;
+            return this.getRuleTaskType(rule) === normalized;
+        });
+
+        return [...scopedRules]
+            .sort((a, b) => {
+                const aBucketScore = normalized && normalized !== 'general'
+                    ? resultFeedbackRuntime.getPromptRuleInsights(a.id, { taskType: normalized }).score
+                    : 0;
+                const bBucketScore = normalized && normalized !== 'general'
+                    ? resultFeedbackRuntime.getPromptRuleInsights(b.id, { taskType: normalized }).score
+                    : 0;
+                const aScore = (aBucketScore * 16) + (resultFeedbackRuntime.getScoreForPromptRule(a.id) * 6) + a.count;
+                const bScore = (bBucketScore * 16) + (resultFeedbackRuntime.getScoreForPromptRule(b.id) * 6) + b.count;
+                return bScore - aScore;
+            })
+            .slice(0, limit);
     }
 
     /**
      * Match user's ongoing typing and suggest a perfected final prompt!
      */
     public findMatch(currentInput: string): SatisfactionRule | null {
-        if (!currentInput || currentInput.trim().length < 2) return null;
-        const clean = currentInput.trim().toLowerCase();
-
-        // 1. Try exact initialPrompt start matches
-        let match = this.rules.find(r => r.initialPrompt.toLowerCase().startsWith(clean) && r.finalPrompt.length > clean.length);
-        if (match) return match;
-
-        // 2. Try partial substring matches on initialPrompt
-        match = this.rules.find(r => r.initialPrompt.toLowerCase().includes(clean) && r.finalPrompt.length > r.initialPrompt.length);
-        if (match) return match;
-
-        // 3. Match via keywords
-        const keywords = this.extractStemKeywords(currentInput);
-        if (keywords.length > 0) {
-            // Find rule that shares the most keywords
-            let bestRule: SatisfactionRule | null = null;
-            let maxOverlap = 0;
-
-            for (const rule of this.rules) {
-                const overlap = rule.keywords.filter(kw => keywords.some(userKw => kw.includes(userKw) || userKw.includes(kw))).length;
-                if (overlap > maxOverlap && rule.finalPrompt.length > currentInput.length) {
-                    maxOverlap = overlap;
-                    bestRule = rule;
-                }
-            }
-
-            if (bestRule && maxOverlap >= 1) {
-                return bestRule;
-            }
-        }
-
-        return null;
+        return this.findBestMatch(currentInput)?.rule || null;
     }
 
     public getRules(): SatisfactionRule[] {

@@ -15,14 +15,25 @@ class HistoryManager {
         this.maxSize = 50;
         this.isRestoring = false;
         this.debounceTimer = null;
+        this.cloudSyncInFlight = null;
+        this.cloudSyncQueued = false;
+        this.cloudSyncTimer = null;
     }
 
     clear() {
+        if (this.debounceTimer) {
+            clearTimeout(this.debounceTimer);
+            this.debounceTimer = null;
+        }
+        if (this.cloudSyncTimer) {
+            clearTimeout(this.cloudSyncTimer);
+            this.cloudSyncTimer = null;
+        }
         this.undoStack = [];
         this.redoStack = [];
     }
 
-    pushState() {
+    pushState(options = {}) {
         if (this.isRestoring || window.isRestoringSession || state.isCropping) return;
         
         if (this.debounceTimer) {
@@ -33,7 +44,9 @@ class HistoryManager {
             // Double check cropping state inside the timeout to prevent capturing temporary UI
             if (state.isCropping) return;
 
-            const snapshot = this._createSnapshot(state.workbenchItems);
+            const snapshot = options.transformOnly
+                ? this._createTransformSnapshot(state.workbenchItems)
+                : this._createSnapshot(state.workbenchItems);
             
             if (this.undoStack.length > 0) {
                 const lastSnapshot = this.undoStack[this.undoStack.length - 1];
@@ -48,33 +61,61 @@ class HistoryManager {
             }
             this.redoStack = [];
 
-            // 同步到云端
-            try {
-                await this.syncToCloud();
-            } catch (e) {
-                console.error('同步状态到云端失败', e);
-            }
+            // Dragging still persists the complete current session. Its write
+            // is deferred briefly so consecutive drops produce one payload.
+            this._requestCloudSync({ defer: options.transformOnly });
         }, 100);
     }
 
-    undo() {
-        if (this.undoStack.length <= 1) return;
+    pushTransformState() {
+        this.pushState({ transformOnly: true });
+    }
+
+    _isTransformSnapshot(snapshot) {
+        return snapshot?.snapshotType === 'transforms';
+    }
+
+    _createTransformSnapshot(stateMap) {
+        const snapshot = new Map();
+        snapshot.snapshotType = 'transforms';
+        snapshot.baseSnapshot = [...this.undoStack]
+            .reverse()
+            .find(candidate => !this._isTransformSnapshot(candidate)) || null;
+        stateMap.forEach((item, id) => {
+            if (!item.el) return;
+            snapshot.set(id, {
+                style: {
+                    left: item.el.style.left,
+                    top: item.el.style.top,
+                    width: item.el.style.width,
+                    height: item.el.style.height,
+                    transform: item.el.style.transform,
+                    zIndex: item.el.style.zIndex,
+                    display: item.el.style.display
+                }
+            });
+        });
+        return snapshot;
+    }
+
+    async undo() {
+        if (this.isRestoring || this.undoStack.length <= 1) return;
         
         const currentState = this.undoStack.pop();
         this.redoStack.push(currentState);
         
         const previousState = this.undoStack[this.undoStack.length - 1];
         if (previousState) {
-            this._restoreSnapshot(previousState);
+            await this._restoreSnapshot(previousState);
         }
     }
 
-    redo() {
-        if (this.redoStack.length === 0) return;
+    async redo() {
+        if (this.isRestoring || this.redoStack.length === 0) return;
         
         const nextState = this.redoStack.pop();
         this.undoStack.push(nextState);
-        this._restoreSnapshot(nextState);
+        await this._restoreSnapshot(nextState);
     }
 
     _createSnapshot(stateMap) {
@@ -108,6 +149,7 @@ class HistoryManager {
 
     _isEqual(snap1, snap2) {
         if (snap1.size !== snap2.size) return false;
+        const compareContent = !this._isTransformSnapshot(snap1) && !this._isTransformSnapshot(snap2);
         for (let [id, item1] of snap1) {
             const item2 = snap2.get(id);
             if (!item2) return false;
@@ -117,15 +159,213 @@ class HistoryManager {
                 item1.style.height !== item2.style.height ||
                 item1.style.transform !== item2.style.transform ||
                 item1.style.zIndex !== item2.style.zIndex ||
-                item1.dataUrl !== item2.dataUrl ||
-                item1.content !== item2.content) {
+                (compareContent && (item1.dataUrl !== item2.dataUrl || item1.content !== item2.content))) {
                 return false;
             }
         }
         return true;
     }
 
-    _restoreSnapshot(snapshot) {
+    _requestCloudSync({ defer = false } = {}) {
+        this.cloudSyncQueued = true;
+        if (defer) {
+            if (this.cloudSyncTimer) clearTimeout(this.cloudSyncTimer);
+            this.cloudSyncTimer = setTimeout(() => {
+                this.cloudSyncTimer = null;
+                this._startCloudSync();
+            }, 350);
+            return this.cloudSyncInFlight || Promise.resolve();
+        }
+
+        if (this.cloudSyncTimer) {
+            clearTimeout(this.cloudSyncTimer);
+            this.cloudSyncTimer = null;
+        }
+        return this._startCloudSync();
+    }
+
+    _startCloudSync() {
+        if (!this.cloudSyncInFlight) {
+            this.cloudSyncInFlight = this._flushCloudSync().finally(() => {
+                this.cloudSyncInFlight = null;
+                // A request can arrive in the narrow window after the final
+                // loop check. Start one final pass instead of dropping it.
+                if (this.cloudSyncQueued && !this.cloudSyncTimer) {
+                    this._startCloudSync();
+                }
+            });
+        }
+        return this.cloudSyncInFlight;
+    }
+
+    async _flushCloudSync() {
+        while (this.cloudSyncQueued) {
+            this.cloudSyncQueued = false;
+            try {
+                await this.syncToCloud();
+            } catch (error) {
+                console.error('同步状态到云端失败', error);
+            }
+        }
+    }
+
+    _parseRotation(transform, fallback = 0) {
+        const match = typeof transform === 'string' ? transform.match(/rotate\((-?[\d.]+)deg\)/) : null;
+        return match ? Number(match[1]) || 0 : fallback;
+    }
+
+    _getSnapshotTransform(item, existingTransform = {}) {
+        const style = item?.style || {};
+        return {
+            x: parseFloat(style.left) || 0,
+            y: parseFloat(style.top) || 0,
+            width: parseFloat(style.width) || existingTransform.width || 100,
+            height: parseFloat(style.height) || existingTransform.height || 100,
+            rotation: this._parseRotation(style.transform, existingTransform.rotation || 0),
+            zIndex: parseInt(style.zIndex, 10) || existingTransform.zIndex || 0
+        };
+    }
+
+    _applySnapshotAssetMetadata(asset, item) {
+        const sourceImage = item?.dataUrl || item?.originalDataUrl;
+        if (sourceImage) asset.sourceImage = sourceImage;
+        if (item?.originalDataUrl !== undefined) asset.originalDataUrl = item.originalDataUrl;
+        if (item?.segmentationSourceUrl !== undefined) asset.segmentationSourceUrl = item.segmentationSourceUrl;
+        if (item?.cleanPlateDataUrl !== undefined) asset.cleanPlateDataUrl = item.cleanPlateDataUrl;
+        if (item?.cleanPlateStatus !== undefined) asset.cleanPlateStatus = item.cleanPlateStatus;
+
+        const metadataFields = [
+            'genealogy', 'parentId', 'layerName', 'originalBbox', 'sourceTextLayerId',
+            'layers', 'scene', 'semanticViews', 'hasFullSemanticAnalysis', 'fusionProperties'
+        ];
+        metadataFields.forEach(field => {
+            if (item?.[field] !== undefined) asset[field] = item[field];
+        });
+        if (item?.label !== undefined) asset.name = item.label;
+        asset.transform = this._getSnapshotTransform(item, asset.transform);
+    }
+
+    _createAssetFromSnapshot(item, id) {
+        const sourceImage = item?.dataUrl || item?.originalDataUrl || '';
+        const now = Date.now();
+        const asset = {
+            uid: id,
+            type: item?.assetType || (item?.type && item.type !== 'image' ? item.type : 'unknown'),
+            sourceImage,
+            masks: [],
+            variants: [],
+            metadata: {
+                createdAt: now,
+                updatedAt: now,
+                creatorId: 'local_user',
+                usageCount: 1,
+                tags: item?.label ? [item.label] : []
+            },
+            fusionProperties: item?.fusionProperties || {
+                brightness: 100,
+                contrast: 100,
+                saturation: 100,
+                blur: 0
+            },
+            transform: this._getSnapshotTransform(item),
+            genealogy: item?.genealogy,
+            parentId: item?.parentId || null,
+            layerName: item?.layerName || item?.label,
+            originalBbox: item?.originalBbox,
+            layers: item?.layers,
+            scene: item?.scene,
+            semanticViews: item?.semanticViews,
+            hasFullSemanticAnalysis: item?.hasFullSemanticAnalysis,
+            originalDataUrl: item?.originalDataUrl || sourceImage,
+            segmentationSourceUrl: item?.segmentationSourceUrl || null,
+            cleanPlateDataUrl: item?.cleanPlateDataUrl || null,
+            cleanPlateStatus: item?.cleanPlateStatus || 'idle'
+        };
+        this._applySnapshotAssetMetadata(asset, item);
+        return asset;
+    }
+
+    _reconcileRuntimeWithSnapshot(snapshot) {
+        const workspace = runtime.getCurrentWorkspace();
+        if (!workspace) return;
+
+        const runtimeItems = new Map(
+            [...snapshot].filter(([, item]) => isRuntimeManagedWorkbenchItem(item))
+        );
+        const registry = workspace.currentState.assetRegistry;
+        const sceneGraph = workspace.currentState.sceneGraph;
+        const snapshotIds = new Set(runtimeItems.keys());
+
+        // The DOM snapshot is authoritative for the visible workbench. Remove
+        // runtime image assets that were created after this snapshot.
+        registry.getAll().forEach(asset => {
+            if (!snapshotIds.has(asset.uid)) {
+                registry.delete(asset.uid);
+                sceneGraph.removeNode(asset.uid);
+            }
+        });
+
+        runtimeItems.forEach((item, id) => {
+            const existingAsset = registry.get(id);
+            if (existingAsset) {
+                this._applySnapshotAssetMetadata(existingAsset, item);
+            } else {
+                registry.register(this._createAssetFromSnapshot(item, id));
+            }
+            sceneGraph.addNode(id);
+        });
+
+        // Retain valid existing relations and restore parent links represented
+        // by the snapshot, without reintroducing removed child assets.
+        const validIds = new Set(registry.getAll().map(asset => asset.uid));
+        const existingEdges = sceneGraph.getAllEdges().filter(edge =>
+            validIds.has(edge.sourceId) && validIds.has(edge.targetId)
+        );
+        const edgeKeys = new Set(existingEdges.map(edge => `${edge.sourceId}:${edge.targetId}:${edge.relationType}`));
+        runtimeItems.forEach((item, id) => {
+            const parents = Array.isArray(item?.genealogy?.parents) ? item.genealogy.parents : [];
+            parents.forEach(parentId => {
+                if (!validIds.has(parentId)) return;
+                const key = `${parentId}:${id}:parent_of`;
+                if (!edgeKeys.has(key)) {
+                    existingEdges.push({
+                        id: `edge_${parentId}_${id}`,
+                        sourceId: parentId,
+                        targetId: id,
+                        relationType: 'parent_of',
+                        properties: {
+                            action: item.genealogy?.action,
+                            prompt: item.genealogy?.prompt
+                        }
+                    });
+                    edgeKeys.add(key);
+                }
+            });
+        });
+        sceneGraph.clear();
+        validIds.forEach(id => sceneGraph.addNode(id));
+        existingEdges.forEach(edge => {
+            try {
+                sceneGraph.addEdge(edge);
+            } catch (error) {
+                console.warn('[History] Skipped invalid restored scene relation:', error);
+            }
+        });
+
+        // External DOM restoration must reset the MVR timeline baseline; its
+        // previous snapshots may still contain assets that were just removed.
+        workspace.history = [workspace.currentState.serialize()];
+        workspace.historyIndex = 0;
+        workspace.currentState.notify();
+        console.info(`[History] Runtime reconciled assets=${validIds.size}`);
+    }
+
+    async _restoreSnapshot(snapshot) {
+        if (this._isTransformSnapshot(snapshot)) {
+            await this._restoreTransformSnapshot(snapshot);
+            return;
+        }
+
         this.isRestoring = true;
         const workbenchGrid = document.getElementById('workbenchGrid');
         if (!workbenchGrid) {
@@ -195,10 +435,62 @@ class HistoryManager {
             }
         });
 
+        this._reconcileRuntimeWithSnapshot(snapshot);
         this.isRestoring = false;
-        
-        // 恢复后也同步一次云端
-        this.syncToCloud().catch(console.error);
+
+        // Persist only after both DOM and runtime have reached the restored
+        // state. Awaiting this write prevents a stale runtime snapshot from
+        // winning the next refresh.
+        try {
+            await this.syncToCloud();
+        } catch (error) {
+            console.error('[History] Failed to persist restored snapshot:', error);
+        }
+    }
+
+    async _restoreTransformSnapshot(snapshot) {
+        // A transform snapshot intentionally contains no media or DOM clone.
+        // Restore its nearest full baseline first so undoing a later add,
+        // delete, or content edit still restores the exact scene structure.
+        if (snapshot.baseSnapshot && snapshot.baseSnapshot !== snapshot) {
+            await this._restoreSnapshot(snapshot.baseSnapshot);
+        }
+
+        this.isRestoring = true;
+        try {
+            const workspace = runtime.getCurrentWorkspace();
+            snapshot.forEach((snapItem, id) => {
+                const currentItem = state.workbenchItems.get(id);
+                if (!currentItem?.el || !snapItem?.style) return;
+
+                Object.assign(currentItem.el.style, snapItem.style);
+
+                const asset = workspace?.currentState.assetRegistry.get(id);
+                if (asset) {
+                    asset.transform = {
+                        ...asset.transform,
+                        x: parseFloat(snapItem.style.left) || 0,
+                        y: parseFloat(snapItem.style.top) || 0,
+                        width: parseFloat(snapItem.style.width) || asset.transform?.width || 100,
+                        height: parseFloat(snapItem.style.height) || asset.transform?.height || 100,
+                        rotation: this._parseRotation(snapItem.style.transform, asset.transform?.rotation || 0),
+                        zIndex: parseInt(snapItem.style.zIndex, 10) || asset.transform?.zIndex || 1
+                    };
+                }
+            });
+
+            if (typeof window.drawGenealogyConnections === 'function') {
+                window.drawGenealogyConnections();
+            }
+            runtime.getCurrentWorkspace()?.currentState.notify();
+        } finally {
+            this.isRestoring = false;
+        }
+
+        // Keep both restore paths durable: local runtime recovery and the
+        // current session/OSS pipeline receive the restored coordinates.
+        await runtime.saveCurrentWorkspace();
+        await this.syncToCloud();
     }
 
     async syncToCloud() {
@@ -305,12 +597,14 @@ class HistoryManager {
                 parentId: item.parentId,
                 layerName: item.layerName,
                 originalBbox: item.originalBbox,
+                sourceTextLayerId: item.sourceTextLayerId || null,
                 key: item.key,
                 layers: item.layers,
                 scene: item.scene,
                 semanticViews: item.semanticViews,
                 hasFullSemanticAnalysis: item.hasFullSemanticAnalysis,
                 originalDataUrl: item.originalDataUrl,
+                segmentationSourceUrl: item.segmentationSourceUrl,
                 cleanPlateDataUrl: item.cleanPlateDataUrl,
                 cleanPlateStatus: item.cleanPlateStatus
             });
@@ -332,7 +626,8 @@ class HistoryManager {
                 decisionGraph: workspace.decisionGraph.getHistory()
             };
         }
-        await window.dbHelper.saveSession(currentSession);
+        await window.dbHelper.saveSession(currentSession, { syncImmediately: true });
+        console.info(`[History] Cloud persisted revision=${currentSession.updatedAt || 'unknown'}`);
     }
 
     async loadFromCloud() {
@@ -414,6 +709,8 @@ class HistoryManager {
                             await window.addImageToWorkbench(null, item.label || '', {
                                 id: item.id,
                                 dataUrl: item.dataUrl,
+                                originalDataUrl: item.originalDataUrl || item.metadata?.originalDataUrl,
+                                segmentationSourceUrl: item.segmentationSourceUrl || item.metadata?.segmentationSourceUrl || null,
                                 left: left,
                                 top: top,
                                 initialWidth: parseFloat(width),
@@ -456,6 +753,8 @@ class HistoryManager {
                 type: item.type,
                 label: item.label,
                 dataUrl: item.dataUrl,
+                originalDataUrl: item.originalDataUrl,
+                segmentationSourceUrl: item.segmentationSourceUrl,
                 style: {
                     left: item.el.style.left,
                     top: item.el.style.top,

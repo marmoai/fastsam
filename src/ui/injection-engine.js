@@ -4,6 +4,7 @@ import { addImageToWorkbench } from './workbench/items.js';
 import { editOrQueryImageWithGemini_Multiple } from '../ai-services/skills-engine.js';
 import { dataURLToFile, fileToDataURL } from '../core/utils.js';
 import { handleSend } from './chat-actions.js';
+import { isImageFusionEnabled } from '../core/config.js';
 
 const { workbenchItems, selectedWorkbenchItems } = state;
 
@@ -12,7 +13,12 @@ let activeConnectors = [];
 export function initInjectionEngine() {
     const injectionMenu = document.getElementById('injectionMenu');
     if (injectionMenu) {
+        injectionMenu.hidden = !isImageFusionEnabled();
+        injectionMenu.setAttribute('aria-hidden', String(!isImageFusionEnabled()));
+    }
+    if (injectionMenu) {
         injectionMenu.addEventListener('click', (e) => {
+            if (!isImageFusionEnabled()) return;
             const option = e.target.closest('.injection-option');
             if (!option) return;
             
@@ -48,6 +54,13 @@ export function getIntersectionArea(rect1, rect2) {
 }
 
 export function checkProximity() {
+    if (!isImageFusionEnabled()) {
+        activeConnectors.forEach(el => el.remove());
+        activeConnectors = [];
+        document.querySelectorAll('.collision-active').forEach(el => el.classList.remove('collision-active'));
+        return;
+    }
+
     // 清除旧的连接器
     activeConnectors.forEach(el => el.remove());
     activeConnectors = [];
@@ -125,6 +138,8 @@ export function checkProximity() {
 }
 
 export function createConnector(id1, id2, pos) {
+    if (!isImageFusionEnabled()) return;
+
     const btn = document.createElement('div');
     btn.className = 'world-connector';
     btn.innerHTML = '<i class="fas fa-link"></i>';
@@ -157,6 +172,8 @@ export function createConnector(id1, id2, pos) {
 }
 
 async function handleInjection(action, sourceId, targetId) {
+    if (!isImageFusionEnabled()) return;
+
     const sourceItem = workbenchItems.get(sourceId);
     const targetItem = workbenchItems.get(targetId);
     
@@ -202,6 +219,8 @@ async function handleInjection(action, sourceId, targetId) {
 }
 
 async function handleBridgeGeneration(id1, id2, customPrompt) {
+    if (!isImageFusionEnabled()) return;
+
     const item1 = workbenchItems.get(id1);
     const item2 = workbenchItems.get(id2);
     if (!item1 || !item2) return;

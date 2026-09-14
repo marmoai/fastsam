@@ -194,6 +194,15 @@ function bboxToRect(bbox, baseX, baseY, parentWidth, parentHeight, minWidth = 20
     };
 }
 
+function rectToBbox(left, top, width, height, baseX, baseY, parentWidth, parentHeight) {
+    return [
+        clamp(((top - baseY) / Math.max(1, parentHeight)) * 1000, 0, 1000),
+        clamp(((left - baseX) / Math.max(1, parentWidth)) * 1000, 0, 1000),
+        clamp((((top - baseY) + height) / Math.max(1, parentHeight)) * 1000, 0, 1000),
+        clamp((((left - baseX) + width) / Math.max(1, parentWidth)) * 1000, 0, 1000)
+    ];
+}
+
 function expandNormalizedBbox(bbox, ratioX = 0.12, ratioY = 0.16) {
     if (!Array.isArray(bbox) || bbox.length !== 4) return bbox;
     const [ymin, xmin, ymax, xmax] = bbox.map(Number);
@@ -1744,6 +1753,8 @@ export async function buildExtractedTextState({
     const css = lineObj?.css && typeof lineObj.css === 'object' ? { ...lineObj.css } : {};
     const textContent = lineObj?.textContent || '';
     const parsedStyle = parseFontStyle(lineObj?.fontStyle || layerObj?.fontStyle || '');
+    const sourceTextLayerId = layerObj?.id || layerObj?.sourceTextLayerId || layerObj?.cleanPlateLayerId || null;
+    const layerName = layerObj?.name || '';
 
     const cssFamily = cssValue(css, 'font-family', 'fontFamily');
     const cssColor = cssValue(css, 'color');
@@ -2030,6 +2041,39 @@ export async function buildExtractedTextState({
         delete outputCss.lineHeight;
     }
 
+    const buildMotionReadyBbox = (left, top, width, height, { fontSizePx = fontSizeNum, lineCount = numLines, boost = 1 } = {}) => {
+        const safeFontSizePx = Math.max(8, Number(fontSizePx) || 0);
+        const horizontalPad = Math.max(4, safeFontSizePx * 0.18, width * 0.06) * boost;
+        const verticalPad = Math.max(3, safeFontSizePx * 0.16, height * 0.08 / Math.max(1, lineCount)) * boost;
+        return rectToBbox(
+            left - horizontalPad,
+            top - verticalPad,
+            width + horizontalPad * 2,
+            height + verticalPad * 2,
+            baseX,
+            baseY,
+            parentWidth,
+            parentHeight
+        );
+    };
+
+    const attachTextStateMetadata = (state, options = {}) => ({
+        ...state,
+        originalBbox: buildMotionReadyBbox(
+            state.left,
+            state.top,
+            state.width,
+            state.height,
+            {
+                fontSizePx: parsePixelValue(state.fontSize) || fontSizeNum,
+                lineCount: Math.max(1, String(state.content || '').split('\n').length),
+                boost: options.boost || 1
+            }
+        ),
+        sourceTextLayerId,
+        layerName
+    });
+
     if (stackedSymbolLines) {
         const splitCssBase = { ...outputCss };
         delete splitCssBase.transform;
@@ -2119,7 +2163,7 @@ export async function buildExtractedTextState({
             }
         }
 
-        return splitStates;
+        return splitStates.map(state => attachTextStateMetadata(state, { boost: 1.08 }));
     }
 
     if (visualHierarchySplit?.parts?.length === 2 && Array.isArray(visualHierarchySplit.groups) && visualHierarchySplit.groups.length === 2) {
@@ -2209,7 +2253,7 @@ export async function buildExtractedTextState({
             }
         }
 
-        return splitStates;
+        return splitStates.map(state => attachTextStateMetadata(state, { boost: 1.04 }));
     }
 
     const splitPriceParts = getSplitPriceParts(textContent, lineBbox, matchedPriceBadge);
@@ -2385,7 +2429,7 @@ export async function buildExtractedTextState({
             }
         }
 
-        return splitStates;
+        return splitStates.map(state => attachTextStateMetadata(state, { boost: 1.06 }));
     }
 
     if (typeof window !== 'undefined') {
@@ -2425,7 +2469,7 @@ export async function buildExtractedTextState({
         }
     }
 
-    return {
+    return attachTextStateMetadata({
         id: `text-${Date.now()}-${Math.random().toString(36).substr(2, 6)}-${index}`,
         content: textContent,
         left: lX,
@@ -2450,5 +2494,7 @@ export async function buildExtractedTextState({
             overflowWrap: 'normal',
             whiteSpace: preserveLineBreaks ? 'pre' : (textContent.includes('\n') ? 'pre-wrap' : 'nowrap')
         }
-    };
+    }, {
+        boost: isSingleLineDisplayTitle || isDoubleLineDisplayTitle || isMultiLineDisplayTitle ? 1.12 : 1
+    });
 }

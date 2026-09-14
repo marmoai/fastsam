@@ -1,9 +1,38 @@
 import { GoogleGenAI, Type, ThinkingLevel } from "@google/genai";
 import { state } from "../core/state.js";
 import { RECOGNIZE_BACKEND_URL } from "../core/utils.js";
+import * as prompts from "./prompts.js";
 
 const API_KEY = "AIzaSyAuqFL8VJ1pQS0ZvVwQEwY4RIwH-wJ7qa4";
 export const ai = new GoogleGenAI({ apiKey: API_KEY });
+
+function isVisibleTextPart(part) {
+    return !!(part && part.text && !part.thought);
+}
+
+function isThoughtTextPart(part) {
+    return !!(part && part.text && part.thought);
+}
+
+function collectVisibleTextFromParts(parts = []) {
+    let text = "";
+    for (const part of parts) {
+        if (isVisibleTextPart(part)) {
+            text += part.text;
+        }
+    }
+    return text;
+}
+
+function collectThoughtTextFromParts(parts = []) {
+    let text = "";
+    for (const part of parts) {
+        if (isThoughtTextPart(part)) {
+            text += part.text;
+        }
+    }
+    return text;
+}
 
 export async function proxyGenerateContent(request) {
     const model = request.model;
@@ -54,17 +83,22 @@ export async function proxyGenerateContent(request) {
         // 统一接口：REST 接口返回的是 RAW JSON，缺少 SDK 生成的 .text 属性/getter
         // 我们在此将 candidates[0].content.parts[0].text 统一映射挂载
         if (data && !Object.prototype.hasOwnProperty.call(data, 'text')) {
-            let extractedText = "";
-            if (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) {
-                for (const part of data.candidates[0].content.parts) {
-                    if (part.text) {
-                        extractedText += part.text;
-                    }
-                }
-            }
+            const extractedText = data.candidates?.[0]?.content?.parts
+                ? collectVisibleTextFromParts(data.candidates[0].content.parts)
+                : "";
+            const extractedThought = data.candidates?.[0]?.content?.parts
+                ? collectThoughtTextFromParts(data.candidates[0].content.parts)
+                : "";
             Object.defineProperty(data, 'text', {
                 get() {
                     return extractedText;
+                },
+                configurable: true,
+                enumerable: true
+            });
+            Object.defineProperty(data, 'thought', {
+                get() {
+                    return extractedThought;
                 },
                 configurable: true,
                 enumerable: true
@@ -98,20 +132,203 @@ export const MODEL_SUITES = {
         image: 'gpt-image-2',
         name: 'GPT-image-2 (中转高精生成与编辑)'
     },
+    'qwen-image-3.0-pro': {
+        text: 'gemini-3.1-pro-preview',
+        image: 'qwen-image-3.0-pro',
+        name: 'Qwen Image 3.0 Pro (全能图片生成/编辑)'
+    },
+    'qwen-image-edit-2509': {
+        text: 'gemini-3.1-pro-preview',
+        image: 'Qwen/Qwen-Image-Edit-2509',
+        name: 'Qwen Image Edit 2509 (全能图片处理)'
+    },
+    // Compatibility alias for sessions saved with the old Clean Plate name.
     'qwen-cleanplate': {
         text: 'gemini-3.1-pro-preview',
-        image: 'gpt-image-2',
-        name: 'Qwen Clean Plate (仅背景净化)'
+        image: 'qwen-image-3.0-pro',
+        name: 'Qwen Image 3.0 Pro (兼容旧配置)'
     }
 };
 
+export const QWEN_IMAGE_MODEL = 'qwen-image-3.0-pro';
+export const QWEN_IMAGE_EDIT_MODEL = 'Qwen/Qwen-Image-Edit-2509';
+
+export function isQwenImageModel(model = '') {
+    return String(model || '').toLowerCase() === QWEN_IMAGE_MODEL;
+}
+
+export function isQwenImageEditModel(model = '') {
+    return String(model || '').toLowerCase() === QWEN_IMAGE_EDIT_MODEL.toLowerCase();
+}
+
+export function isQwenImageFamilyModel(model = '') {
+    return isQwenImageModel(model) || isQwenImageEditModel(model);
+}
+
+export const CHAT_TEXT_MODEL = 'gemini-3.8-flash';
+export const CONTINUITY_ANCHOR_MODEL = 'gemini-3.8-flash';
+
+export const getSelectedModelSuite = () => {
+    if (typeof document !== 'undefined') {
+        const modelSelect = document.getElementById('modelSelect');
+        const selectedValue = modelSelect?.value;
+        if (selectedValue && MODEL_SUITES[selectedValue]) {
+            if (state.selectedModel !== selectedValue) {
+                state.selectedModel = selectedValue;
+            }
+            return selectedValue;
+        }
+    }
+
+    if (state.selectedModel && MODEL_SUITES[state.selectedModel]) {
+        return state.selectedModel;
+    }
+
+    return 'flash';
+};
+
 export const getTextModel = () => {
-    return MODEL_SUITES[state.selectedModel]?.text || MODEL_SUITES['flash'].text;
+    return CHAT_TEXT_MODEL;
 };
 
 export const getImageModel = () => {
-    return MODEL_SUITES[state.selectedModel]?.image || MODEL_SUITES['flash'].image;
+    return MODEL_SUITES[getSelectedModelSuite()]?.image || MODEL_SUITES['flash'].image;
 };
+
+function extractQwenImageData(responseData) {
+    const direct = responseData?.imageData
+        || responseData?.data?.[0]?.b64_json
+        || responseData?.data?.[0]?.base64
+        || responseData?.output?.[0]?.b64_json
+        || responseData?.output?.[0]?.base64;
+    if (direct) return direct;
+
+    const url = responseData?.imageUrl
+        || responseData?.data?.[0]?.url
+        || responseData?.output?.[0]?.url;
+    return url || null;
+}
+
+export async function callQwenImageRouter({
+    mode = 'image_edit',
+    prompt,
+    image = null,
+    images = [],
+    mask = null,
+    size = null,
+    negativePrompt = null,
+    imageCount = 1
+} = {}) {
+    const payload = {
+        mode,
+        model: QWEN_IMAGE_MODEL,
+        prompt: prompt || '处理图片',
+        image,
+        imageCount: Math.max(1, Number(imageCount) || 1)
+    };
+
+    const normalizedImages = Array.isArray(images) ? images.filter(Boolean).slice(0, 3) : [];
+    normalizedImages.forEach((value, index) => {
+        payload[`image${index + 2}`] = value;
+    });
+    if (mask) payload.mask = mask;
+    if (size) payload.size = size;
+    if (negativePrompt) payload.negative_prompt = negativePrompt;
+
+    if (!payload.image) delete payload.image;
+
+    const response = await fetch(RECOGNIZE_BACKEND_URL, {
+        method: 'POST',
+        headers: {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+    });
+    const rawText = await response.text();
+    let data = null;
+    try {
+        data = JSON.parse(rawText);
+    } catch (error) {
+        data = { raw: rawText };
+    }
+
+    if (!response.ok) {
+        const message = data?.error?.message || data?.error || data?.message || `HTTP ${response.status}`;
+        throw new Error(`Qwen Image 请求失败：${message}`);
+    }
+
+    const imageData = extractQwenImageData(data);
+    if (!imageData) {
+        throw new Error('Qwen Image 接口未返回图片结果');
+    }
+
+    return {
+        success: true,
+        imageData,
+        mimeType: data?.mimeType || 'image/png',
+        raw: data
+    };
+}
+
+export async function callQwenImageEdit2509Router({
+    mode = 'image_edit',
+    prompt,
+    image = null,
+    images = [],
+    mask = null,
+    size = null,
+    negativePrompt = null,
+    imageCount = 1
+} = {}) {
+    const payload = {
+        mode,
+        model: QWEN_IMAGE_EDIT_MODEL,
+        prompt: prompt || '处理图片',
+        image,
+        imageCount: Math.max(1, Number(imageCount) || 1)
+    };
+
+    const normalizedImages = Array.isArray(images) ? images.filter(Boolean).slice(0, 3) : [];
+    normalizedImages.forEach((value, index) => {
+        payload[`image${index + 2}`] = value;
+    });
+    if (mask) payload.mask = mask;
+    if (size) payload.size = size;
+    if (negativePrompt) payload.negative_prompt = negativePrompt;
+    if (!payload.image) delete payload.image;
+
+    const response = await fetch(RECOGNIZE_BACKEND_URL, {
+        method: 'POST',
+        headers: {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+    });
+    const rawText = await response.text();
+    let data = null;
+    try {
+        data = JSON.parse(rawText);
+    } catch (error) {
+        data = { raw: rawText };
+    }
+
+    if (!response.ok) {
+        const message = data?.error?.message || data?.error || data?.message || `HTTP ${response.status}`;
+        throw new Error(`Qwen Image Edit 2509 请求失败：${message}`);
+    }
+
+    const imageData = extractQwenImageData(data);
+    if (!imageData) throw new Error('Qwen Image Edit 2509 接口未返回图片结果');
+
+    return {
+        success: true,
+        imageData,
+        mimeType: data?.mimeType || 'image/png',
+        raw: data
+    };
+}
 
 export const backgroundModel = 'gemini-3.1-flash-lite';
 
@@ -216,9 +433,7 @@ export async function generateVisualSearch(base64Image) {
 
     let resultText = "";
     if (response.candidates && response.candidates[0] && response.candidates[0].content && response.candidates[0].content.parts) {
-        for (const part of response.candidates[0].content.parts) {
-            if (part.text) { resultText += part.text; }
-        }
+        resultText = collectVisibleTextFromParts(response.candidates[0].content.parts);
     } else if (response.text) {
         resultText = response.text;
     }
@@ -254,9 +469,7 @@ export async function generateTextWithSearch(prompt) {
     
     let resultText = "";
     if (response.candidates && response.candidates[0] && response.candidates[0].content && response.candidates[0].content.parts) {
-        for (const part of response.candidates[0].content.parts) {
-            if (part.text) { resultText += part.text; }
-        }
+        resultText = collectVisibleTextFromParts(response.candidates[0].content.parts);
     } else if (response.text) {
         resultText = response.text;
     }
@@ -268,6 +481,26 @@ export async function generateTextWithSearch(prompt) {
 export async function generateLatentImage(prompt, base64Sketch, seed) {
     const currentModel = getImageModel();
     let response;
+
+    if (isQwenImageEditModel(currentModel)) {
+        const qwenResult = await callQwenImageEdit2509Router({
+            mode: 'image_generation',
+            prompt: `Turn this rough sketch into a high-quality, photorealistic image. Prompt: ${prompt}. Maintain the composition exactly.`,
+            image: base64Sketch,
+            size: '1024*1024'
+        });
+        return qwenResult.imageData;
+    }
+
+    if (isQwenImageModel(currentModel)) {
+        const qwenResult = await callQwenImageRouter({
+            mode: 'image_generation',
+            prompt: `Turn this rough sketch into a high-quality, photorealistic image. Prompt: ${prompt}. Maintain the composition exactly.`,
+            image: base64Sketch,
+            size: '1024*1024'
+        });
+        return qwenResult.imageData;
+    }
 
     if (currentModel.startsWith('gemini')) {
         const payload = {
@@ -309,7 +542,13 @@ export async function generateLatentImage(prompt, base64Sketch, seed) {
         }
     }
     if (!imageData) {
-        console.log("No image data in response. Full response:", response);
+        console.warn("No image data in Gemini response", {
+            candidateCount: Array.isArray(response?.candidates) ? response.candidates.length : 0,
+            partCount: Array.isArray(response?.candidates?.[0]?.content?.parts)
+                ? response.candidates[0].content.parts.length
+                : 0,
+            responseKeys: response && typeof response === 'object' ? Object.keys(response) : []
+        });
     }
     return imageData;
 }
@@ -335,12 +574,11 @@ export async function generateTextWithGemini(prompt, sessionId, history, canvasS
             parts: [{ text: msg.content }]
         }));
     
-    const systemInstruction = `你是一个名为 小M 的、乐于助人的中文AI助手。
+    const systemInstruction = `${prompts.getChatSystemInstruction()}
 你现在可以感知用户的工作台(Canvas)状态。请根据用户的问题和工作台状态进行回答。
 如果用户提到“左边”、“上面”等方位词，请参考工作台状态中的 position (left, top) 和 size (width, height) 来理解。
-如果用户要求修改工作台上的某张图片，请调用 edit_image 工具。
-如果用户要求移动、缩放或删除工作台上的元素，请调用 manipulate_item 工具。
-请用中文回答。`;
+如果用户明确要求修改工作台上的某张图片，请调用 edit_image 工具。
+如果用户明确要求移动、缩放或删除工作台上的元素，请调用 manipulate_item 工具。`;
 
     let finalPrompt = prompt;
     if (canvasState) {
@@ -378,7 +616,7 @@ export async function generateTextWithGemini(prompt, sessionId, history, canvasS
 
         if (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) {
             for (const part of data.candidates[0].content.parts) {
-                if (part.text) responseText += part.text;
+                if (isVisibleTextPart(part)) responseText += part.text;
                 if (part.functionCall) functionCalls.push(part.functionCall);
             }
         }
@@ -387,6 +625,7 @@ export async function generateTextWithGemini(prompt, sessionId, history, canvasS
             return {
                 success: true,
                 text: responseText || "正在执行操作...",
+                thoughtContent: data?.thought || '',
                 functionCalls: functionCalls.map(call => ({
                     name: call.name,
                     args: call.args
@@ -394,7 +633,7 @@ export async function generateTextWithGemini(prompt, sessionId, history, canvasS
             };
         }
         
-        return { success: true, text: responseText };
+        return { success: true, text: responseText, thoughtContent: data?.thought || '' };
     }
 
     const chat = await createChatSession(formattedHistory, systemInstruction);
@@ -416,7 +655,7 @@ export async function generateTextWithGemini(prompt, sessionId, history, canvasS
         };
     }
     
-    return { success: true, text: response.text };
+    return { success: true, text: response.text, thoughtContent: response?.thought || '' };
 }
 
 const chatSessionsCache = new Map();

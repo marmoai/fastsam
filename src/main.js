@@ -2,6 +2,8 @@ import { updateHeader } from './ui/header.js';
 import { runtime } from './runtime/CoreRuntime';
 import { memoryLayer } from './runtime/CreativeMemoryLayer';
 import { implicitMemoryEngine } from './runtime/ImplicitMemoryEngine';
+import { resultFeedbackRuntime } from './runtime/ResultFeedbackRuntime';
+import { interactionAttributionRuntime } from './runtime/InteractionAttributionRuntime';
 import { initPredictivePromptEngine } from './ui/predictive-prompt.js';
 import localforage from 'localforage';
 import {
@@ -32,7 +34,9 @@ import {
 } from './ui/fusion-editor.js';
 import { setupToolboxEvents } from './ui/toolboxes.js';
 import {
-    triggerLayerExplosion, handleQuickFusionSync, handleIsolatedAssetEdit, performPreciseEdit
+    triggerLayerExplosion, executeAgentLayerExtraction, undoAgentLayerExtraction, commitAgentLayerExtraction, releaseAgentLayerExtraction,
+    executeAgentCapability, undoAgentCapability, commitAgentCapabilities, releaseAgentCapabilities,
+    handleQuickFusionSync, handleIsolatedAssetEdit, performPreciseEdit
 } from './ui/layer-manager.js';
 import { initSidebar, sidebarState } from './ui/sidebar.js';
 import {
@@ -41,16 +45,26 @@ import {
     addTextNoteToWorkbench, handleUploadImage, deleteWorkbenchItem,
     clearWorkbench, addAtmosphereNode
 } from './ui/workbench-core.js';
-import { buildMessageContentHTML, addMessage, renderMessages, appendSuggestionButtons, buildBotFallbackText, renderAgentDebateInChat } from './ui/chat-panel.js';
+import { buildMessageContentHTML, addMessage, renderMessages, yieldToChatPaint, appendSuggestionButtons, buildBotFallbackText, renderAgentDebateInChat } from './ui/chat-panel.js';
+import { handleAssetReuseRequest, isAssetReuseRequest, handleLayerExtractionRequest, isLayerExtractionRequest } from './ui/agent-task-controller.js';
 import { initChatSourceRail } from './ui/chat-source-rail.js';
     
     import { Modality } from "@google/genai";
     import { AGENTS } from "/src/ai-services/agents.js";
-    import { ai, getTextModel, generateTextWithSearch, generateLatentImage, createChatSession, generateVeoVideo, generateTextWithGemini, clearChatSession } from "/src/ai-services/gemini-client.js";
-    import { editOrQueryImageWithGemini, editOrQueryImageWithGemini_Multiple, generateImage, generateSessionTitle, analyzeWithAgent, getSmartSuggestions, analyzeImageLayers, generateRelitImage, generatePreciseEditImage, generateVisualSearch, classifyImageCategory, planGraph } from "/src/ai-services/skills-engine.js";
-    import { SNAP_THRESHOLD, ZOOM_MIN, ZOOM_MAX, ZOOM_STEP, RESIZE_RADIUS, OUTPAINT_RADIUS, CANVAS_CENTER, DEFAULT_ZOOM, RATIO_MAP, ATMOSPHERE_OPTS } from "/src/core/config.js";
+    import { ai, getTextModel, getImageModel, generateTextWithSearch, generateLatentImage, createChatSession, generateVeoVideo, generateTextWithGemini, clearChatSession } from "/src/ai-services/gemini-client.js";
+    import { editOrQueryImageWithGemini, editOrQueryImageWithGemini_Multiple, generateImage, generateSessionTitle, analyzeWithAgent, getSmartSuggestions, analyzeImageLayers, generateRelitImage, generatePreciseEditImage, generateVisualSearch, classifyImageCategory, planGraph, buildSeriesContinuityAnchor } from "/src/ai-services/skills-engine.js";
+    import { SNAP_THRESHOLD, ZOOM_MIN, ZOOM_MAX, ZOOM_STEP, RESIZE_RADIUS, OUTPAINT_RADIUS, CANVAS_CENTER, DEFAULT_ZOOM, RATIO_MAP, ATMOSPHERE_OPTS, isAgentRuntimeFeatureEnabled } from "/src/core/config.js";
     import { state } from "/src/core/state.js";
-    import { isRemovalRequest, isMaterialRequest, fileToDataURL, fileToBase64, dataURLToFile, dataURLtoFileSync, blobToBase64, isImageGenerationRequest, addWatermark, getProxiedUrl, isInvalidImageSrc, showToast } from "/src/core/utils.js";
+    import { getExplicitRequestedImageCount, isRemovalRequest, isMaterialRequest, fileToDataURL, fileToBase64, dataURLToFile, dataURLtoFileSync, blobToBase64, addWatermark, getProxiedUrl, isInvalidImageSrc, showToast } from "/src/core/utils.js";
+    import { determineConversationIntent, executeConversationIntent, composeExecutionPrompt, resolveExecutionPrompt, mergeRegeneratePrompt, getIntentPlaceholderText, shouldUseImagePlaceholder } from "/src/ai-services/intent-router.js";
+    import { interpretConversationTurn } from "/src/ai-services/conversation-interpreter.js";
+    import { resolveStateConflict } from "/src/ai-services/state-conflict-resolver.js";
+    import { getAssistantWorkspaceContext } from "/src/services/workspace-context.js";
+    import { recordWorkspaceAction } from "/src/services/workspace-context.js";
+    import { applyWorkspaceCommand, buildWorkspaceCommandResponse, detectWorkspaceCommand } from "/src/services/workspace-intents.js";
+    import { executeLensSearch, looksLikeLensSearchRequest } from "/src/services/capability-orchestrator.js";
+    import { createDefaultWorkingMemory, ensureSessionWorkingMemory, mergeInterpreterResultIntoSession, finalizeWorkingMemoryWithAssistantResult, setContinuityAnchor } from "/src/ai-services/session-working-memory.js";
+    import { shouldUseQwenLocalImageRouting, getQwenLocalRoutingDiagnostics } from "/src/ai-services/qwen-local-routing.js";
     import { initMaskDrawer, openMaskEditor, closeMaskEditor, applyMask } from "/src/graphics/mask-drawer.js";
     import { initRelightEngine, updateRelightingPreview, applyRelighting } from "/src/graphics/relight-engine.js";
     import { initGenealogyLines, drawGenealogyConnections } from "/src/graphics/genealogy-lines.js";
@@ -60,11 +74,18 @@ import { MarmoLens } from "./ui/marmo-lens.js";
 import { initAtmospherePalette, applyAtmosphereToImage } from "./ui/atmosphere.js";
 import { initDecisionLog } from "./ui/decision-log.js";
 import { historyManager } from './core/history.js';
-import { loadSession, startNewSession, dbHelper } from "./core/session.js";
+import { loadSession, startNewSession, dbHelper, setLastActiveSessionId } from "./core/session.js";
 import { graphStore } from './engine/graph-store.js';
 import { graphRunner } from './engine/graph-runner.js';
 import { NODE_REGISTRY } from './engine/node-registry.js';
 import { executeNode } from './engine/node-executor.js';
+import { installCrashDiagnostics } from './core/crash-diagnostics.js';
+import { initAgentVisualSurface } from './ui/agent-visual-surface.js';
+import { initAgentDock } from './ui/agent-dock.js';
+
+// Install before application restoration so failures during startup and long
+// running Magic Layers jobs leave a recoverable diagnostic trail.
+installCrashDiagnostics();
 
 // Expose to window for debugging and future Agent use
 window.graphStore = graphStore;
@@ -171,10 +192,11 @@ window.executeNode = executeNode;
     const redoBtn = document.getElementById('redoBtn');
 
     function updateHistoryButtons() {
-        const workspace = runtime.getCurrentWorkspace();
-        if (workspace) {
-            undoBtn.disabled = workspace.historyIndex <= 0;
-            redoBtn.disabled = workspace.historyIndex >= workspace.history.length - 1;
+        if (window.historyManager) {
+            const canUndo = window.historyManager.undoStack.length > 1;
+            const canRedo = window.historyManager.redoStack.length > 0;
+            undoBtn.disabled = !canUndo;
+            redoBtn.disabled = !canRedo;
             undoBtn.style.opacity = undoBtn.disabled ? '0.3' : '1';
             redoBtn.style.opacity = redoBtn.disabled ? '0.3' : '1';
             undoBtn.style.cursor = undoBtn.disabled ? 'default' : 'pointer';
@@ -184,21 +206,13 @@ window.executeNode = executeNode;
 
     if (undoBtn) {
         undoBtn.addEventListener('click', () => {
-            const workspace = runtime.getCurrentWorkspace();
-            if (workspace) {
-                workspace.undo();
-                updateHistoryButtons();
-            }
+            Promise.resolve(window.historyManager?.undo()).finally(updateHistoryButtons);
         });
     }
 
     if (redoBtn) {
         redoBtn.addEventListener('click', () => {
-            const workspace = runtime.getCurrentWorkspace();
-            if (workspace) {
-                workspace.redo();
-                updateHistoryButtons();
-            }
+            Promise.resolve(window.historyManager?.redo()).finally(updateHistoryButtons);
         });
     }
 
@@ -246,6 +260,7 @@ window.executeNode = executeNode;
 
             const workspace = window.mvrRuntime ? window.mvrRuntime.getCurrentWorkspace() : null;
             const transformsToBatch = [];
+            const runtimeMoveRoots = new Set();
 
             selectedWorkbenchItems.forEach(id => {
                 const item = workbenchItems.get(id);
@@ -278,6 +293,7 @@ window.executeNode = executeNode;
                             uid: id,
                             transform: { x: left, y: top }
                         });
+                        runtimeMoveRoots.add(id);
                     } else {
                         item.el.style.top = `${top}px`;
                         item.el.style.left = `${left}px`;
@@ -300,36 +316,42 @@ window.executeNode = executeNode;
             if (workspace && transformsToBatch.length > 0) {
                 workspace.dispatcher.dispatch({
                     type: 'BATCH_UPDATE_TRANSFORMS',
-                    payload: { transforms: transformsToBatch }
+                    payload: { transforms: transformsToBatch },
+                    meta: { skipSnapshot: true, persistWithoutSnapshot: true }
+                });
+
+                // Dispatcher cascades parent movement to linked children. The
+                // runtime is authoritative, so reconcile only the moved roots
+                // and their descendants after the complete action queue settles.
+                const runtimeIdsToSync = new Set(runtimeMoveRoots);
+                const pendingIds = [...runtimeMoveRoots];
+                while (pendingIds.length > 0) {
+                    const parentId = pendingIds.shift();
+                    const edges = workspace.currentState.sceneGraph.getEdgesForNode(parentId);
+                    edges.forEach((edge) => {
+                        if (edge.sourceId !== parentId || edge.relationType !== 'parent_of') return;
+                        if (runtimeIdsToSync.has(edge.targetId)) return;
+                        if (!workspace.currentState.assetRegistry.get(edge.targetId)) return;
+                        runtimeIdsToSync.add(edge.targetId);
+                        pendingIds.push(edge.targetId);
+                    });
+                }
+
+                runtimeIdsToSync.forEach((id) => {
+                    if (typeof window.syncDOMToScene === 'function') {
+                        window.syncDOMToScene(id);
+                    }
                 });
             }
 
             if (window.historyManager) {
-                window.historyManager.pushState();
+                window.historyManager.pushTransformState();
             }
         }
 
         if (e.ctrlKey || e.metaKey) {
             isCtrlPressed = true;
             
-            // Undo: Ctrl+Z
-            if (e.key.toLowerCase() === 'z' && !e.shiftKey) {
-                e.preventDefault();
-                const workspace = runtime.getCurrentWorkspace();
-                if (workspace) {
-                    workspace.undo();
-                    updateHistoryButtons();
-                }
-            }
-            // Redo: Ctrl+Y or Ctrl+Shift+Z
-            if (e.key.toLowerCase() === 'y' || (e.key.toLowerCase() === 'z' && e.shiftKey)) {
-                e.preventDefault();
-                const workspace = runtime.getCurrentWorkspace();
-                if (workspace) {
-                    workspace.redo();
-                    updateHistoryButtons();
-                }
-            }
         }
         if (e.altKey) {
             isAltPressed = true;
@@ -400,7 +422,11 @@ window.executeNode = executeNode;
             currentState: {
                 stateId: workspace.currentState.stateId,
                 canvasState: workspace.currentState.canvasState,
-                assets: workspace.currentState.assetRegistry.getAll(),
+                assets: workspace.currentState.assetRegistry.getAll().map(asset => {
+                    const serializableAsset = { ...asset };
+                    delete serializableAsset.runtimeDisplayUrl;
+                    return serializableAsset;
+                }),
                 nodes: workspace.currentState.sceneGraph.getNodes(),
                 edges: workspace.currentState.sceneGraph.getAllEdges()
             },
@@ -434,29 +460,25 @@ window.generateSessionTitle = generateSessionTitle;
 window.dbHelper = dbHelper;
 window.addImageToWorkbench = addImageToWorkbench;
 
-// 创作连续性：将工作台操作同步到聊天窗口
+// Workbench actions update internal assistant context. Only final media/results
+// are shown in chat; the action itself is not fabricated as a user message.
 window.addWorkbenchActionToChat = async (actionName, prompt, resultImageSrc, retryCallback, resultHtml = null) => {
-    if (!state.currentSessionId) {
-        // 如果没有会话，先创建一个
-        await startNewSession(actionName);
-    }
-    const currentSession = state.sessions.find(s => s.id === state.currentSessionId);
-    if (!currentSession) return;
+    const timestamp = Date.now();
+    const actionRecord = {
+        actionName,
+        prompt: prompt || '',
+        itemId: state.currentActiveWorkbenchItemId || null,
+        hasResult: !!(resultImageSrc || resultHtml),
+        timestamp
+    };
 
-    // 添加用户操作记录
-    const userMsg = { sender: 'user', type: 'text', content: `[工作台操作] ${actionName}: ${prompt}` };
-    currentSession.messages.push(userMsg);
-    
-    // 添加 AI 响应记录
-    const botMsg = { sender: 'bot', type: 'text', content: `操作已完成。` };
-    if (resultImageSrc) {
-        botMsg.type = 'image';
-        botMsg.imageData = { src: resultImageSrc };
-    } else if (resultHtml) {
-        botMsg.type = 'html';
-        botMsg.content = resultHtml;
+    recordWorkspaceAction(state, actionRecord);
+
+    let currentSession = state.sessions.find(s => s.id === state.currentSessionId);
+    if ((resultImageSrc || resultHtml) && !currentSession) {
+        await startNewSession(actionName);
+        currentSession = state.sessions.find(s => s.id === state.currentSessionId);
     }
-    currentSession.messages.push(botMsg);
     
     // --- Sync to MVR DecisionGraph ---
     if (window.mvrRuntime) {
@@ -467,18 +489,30 @@ window.addWorkbenchActionToChat = async (actionName, prompt, resultImageSrc, ret
                 action: 'custom',
                 prompt: prompt,
                 context: actionName,
-                changePayload: { actionName, prompt, hasResult: !!resultImageSrc },
-                timestamp: Date.now()
+                changePayload: actionRecord,
+                timestamp
             });
             window.mvrRuntime.saveCurrentWorkspace();
         }
     }
     // --------------------------------
 
-    // 渲染并保存
-    renderMessages(currentSession.messages);
-    renderHistoryList();
-    if (dbHelper) await dbHelper.saveSession(currentSession);
+    // Render only the useful final artifact, not a synthetic user/assistant pair.
+    if (resultImageSrc || resultHtml) {
+        const resultMessage = {
+            sender: 'bot',
+            type: resultImageSrc ? 'image' : 'html',
+            content: `✅ ${actionName}完成。`,
+            ...(resultImageSrc ? { imageData: { src: resultImageSrc } } : {}),
+            ...(resultHtml ? { content: resultHtml } : {})
+        };
+        addMessage(resultMessage);
+    }
+
+    if (currentSession) {
+        renderHistoryList();
+        if (dbHelper) await dbHelper.saveSession(currentSession);
+    }
 
     // 更新 lastGenerationContext 以支持重试
     if (retryCallback) {
@@ -510,8 +544,10 @@ window.fileToDataURL = fileToDataURL;
     window.hideWorkbenchToolbox = hideWorkbenchToolbox;
     function hideWorkbenchToolbox() {
         workbenchToolbox.style.display = 'none';
-        currentActiveWorkbenchItemId = null;
-        // Turn the floating editor into idle/virtual-hidden (虚隐) instead of completely destroying it
+        // Hiding the toolbar must not clear the selected visual object. The
+        // Visual Object surface is selection-driven; the toolbar is only a
+        // transient control for standalone images.
+        // Turn the legacy floating editor into idle/virtual-hidden instead of completely destroying it.
         const floatingEditor = document.getElementById('floatingFusionEditor');
         if (floatingEditor) {
             floatingEditor.classList.add('idle');
@@ -529,38 +565,68 @@ window.fileToDataURL = fileToDataURL;
 
 
 
-    function handleSelectedItems() {
-        if (selectedWorkbenchItems.size === 0) return;
-        
-        const selectedItems = Array.from(selectedWorkbenchItems).map(id => workbenchItems.get(id));
-        
-        if (selectedItems.length > 0) {
-            if (mainImageFile) {
-                // 已经有主图，所有选中项都作为参考图
-                selectedItems.forEach(item => {
-                    if (item.file !== mainImageFile && !referenceImageFiles.includes(item.file)) {
-                        referenceImageFiles.push(item.file);
-                        pendingReferenceImageShares.add(item.file);
-                    }
-                });
-            } else {
-                // 没有主图，第一个选中项作为主图，其他作为参考图
-                const [firstItem, ...otherItems] = selectedItems;
-                
-                mainImageFile = firstItem.file;
-                pendingBaseImageShare = true;
-                
-                otherItems.forEach(item => {
-                    if (!referenceImageFiles.includes(item.file)) {
-                        referenceImageFiles.push(item.file);
-                        pendingReferenceImageShares.add(item.file);
-                    }
-                });
-            }
-            
-            updateImagePreview();
-            updateSendBtnState();
+    function getWorkbenchItemContextSource(item) {
+        if (!item) return null;
+        const candidate = item.file || item.dataUrl || item.originalDataUrl || item.el?.querySelector('img')?.src || null;
+        if (typeof candidate === 'string' && isInvalidImageSrc(candidate)) {
+            return null;
         }
+        return candidate || null;
+    }
+
+    function hasMatchingContextSource(collection, source) {
+        return collection.some(existing => existing === source);
+    }
+
+    async function handleSelectedItems() {
+        if (selectedWorkbenchItems.size === 0) {
+            return { syncedCount: 0, skippedCount: 0, selectedImageCount: 0 };
+        }
+        
+        const selectedImageItems = Array.from(selectedWorkbenchItems)
+            .map(id => workbenchItems.get(id))
+            .filter(item => item)
+            .map(item => ({ item, source: getWorkbenchItemContextSource(item) }))
+            .filter(({ source }) => !!source);
+
+        const skippedCount = selectedWorkbenchItems.size - selectedImageItems.length;
+
+        if (selectedImageItems.length === 0) {
+            updateSendBtnState();
+            return { syncedCount: 0, skippedCount, selectedImageCount: 0 };
+        }
+
+        let syncedCount = 0;
+
+        if (mainImageFile) {
+            // 已经有主图，所有选中项都作为参考图
+            selectedImageItems.forEach(({ source }) => {
+                if (source !== mainImageFile && !hasMatchingContextSource(referenceImageFiles, source)) {
+                    referenceImageFiles.push(source);
+                    pendingReferenceImageShares.add(source);
+                    syncedCount += 1;
+                }
+            });
+        } else {
+            // 没有主图，第一个选中项作为主图，其他作为参考图
+            const [firstItem, ...otherItems] = selectedImageItems;
+            
+            mainImageFile = firstItem.source;
+            pendingBaseImageShare = true;
+            syncedCount += 1;
+            
+            otherItems.forEach(({ source }) => {
+                if (!hasMatchingContextSource(referenceImageFiles, source)) {
+                    referenceImageFiles.push(source);
+                    pendingReferenceImageShares.add(source);
+                    syncedCount += 1;
+                }
+            });
+        }
+        
+        await updateImagePreview();
+        updateSendBtnState();
+        return { syncedCount, skippedCount, selectedImageCount: selectedImageItems.length };
     }
 
 // 手动将当前选中的图片同步到聊天上下文
@@ -568,7 +634,18 @@ async function pushSelectedToChat() {
     if (selectedWorkbenchItems.size === 0) return;
     
     // 1. 执行原有的同步逻辑
-    handleSelectedItems();
+    const { syncedCount, skippedCount, selectedImageCount } = await handleSelectedItems();
+
+    if (syncedCount === 0) {
+        let noImageMessage = '⚠️ 选中的项目里没有可加入对话的图片。';
+        if (selectedImageCount > 0) {
+            noImageMessage = skippedCount > 0
+                ? `⚠️ 选中的图片已经在对话上下文里了，另有 ${skippedCount} 个非图片项目未加入。`
+                : '⚠️ 选中的图片已经在对话上下文里了。';
+        }
+        addMessage({ sender: 'bot', content: noImageMessage });
+        return;
+    }
     
     // 2. 视觉反馈：选中的图片闪烁绿光，表示“成功收录”
     selectedWorkbenchItems.forEach(id => {
@@ -588,7 +665,8 @@ async function pushSelectedToChat() {
     });
 
     // 3. 提示用户
-    addMessage({ sender: 'bot', content: `✅ 已将选中的 ${selectedWorkbenchItems.size} 张图片加入对话上下文。` });
+    const skippedSuffix = skippedCount > 0 ? `，另有 ${skippedCount} 个非图片项目未加入` : '';
+    addMessage({ sender: 'bot', content: `✅ 已将选中的 ${syncedCount} 张图片加入对话上下文${skippedSuffix}。` });
     
     // 4. (可选) 推送后清除工作台的蓝色选中状态，保持干净
     // selectedWorkbenchItems.clear();
@@ -759,7 +837,10 @@ async function pushSelectedToChat() {
                 addMessage(userMsg);
             }
             
-            const newPrompt = actualInput || lastGenerationContext.prompt;
+            const newPrompt = mergeRegeneratePrompt(
+                lastGenerationContext.resolvedPrompt || lastGenerationContext.prompt,
+                actualInput
+            );
             userInput.value = '';
             userInput.style.height = '';
             
@@ -770,7 +851,7 @@ async function pushSelectedToChat() {
         isSending = true; 
         updateSendBtnState();
         
-        const { baseImage, referenceImages, mask, prompt, isGenTask, isEditTask } = lastGenerationContext;
+        const { baseImage, referenceImages, mask, prompt, corePrompt, isGenTask, isEditTask } = lastGenerationContext;
         const currentSession = sessions.find(s => s.id === currentSessionId);
         if (!currentSession) { isSending = false; updateSendBtnState(); return; }
 
@@ -785,8 +866,8 @@ async function pushSelectedToChat() {
         placeholderDiv.className = 'message bot-message';
         const botAvatar = `<img src="https://www.marmoai.cn/images/avatars/WeChat84b8e05cc8464bb089de1c46bed38809.jpg" alt="小M" style="width:32px;height:32px;border-radius:50%; flex-shrink: 0;">`;
         
-        const isMasklessMaterialEdit = isEditTask && !mask && isMaterialRequest(prompt);
-        let placeholderText = isMasklessMaterialEdit ? "正在为您重新生成多个版本..." : "收到，正在为您重新生成...";
+        const requestedImageCount = getExplicitRequestedImageCount(corePrompt || prompt, 6);
+        let placeholderText = requestedImageCount > 1 ? "正在为您生成多个版本..." : "收到，正在为您重新生成...";
         
         let placeholderContent = `<div class="image-placeholder-container"><div class="image-placeholder-box"><div class="spinner"></div></div><div class="placeholder-text">${placeholderText}</div></div>`;
         placeholderDiv.innerHTML = botAvatar + placeholderContent;
@@ -795,12 +876,30 @@ async function pushSelectedToChat() {
         
         (async () => {
             try {
+                const retryCorePrompt = mergeRegeneratePrompt(corePrompt || prompt, actualInput);
+                const retryPrompt = composeExecutionPrompt(
+                    { route: isEditTask ? 'image_edit' : 'image_generation' },
+                    {
+                        prompt: retryCorePrompt,
+                        baseImage,
+                        referenceImages,
+                        mask,
+                        history: currentSession.messages,
+                        workingMemory: currentSession.workingMemory,
+                        workspaceContext: getAssistantWorkspaceContext(state)
+                    }
+                );
                 let result;
                 if (isEditTask) {
-                    if (isMasklessMaterialEdit) result = await editOrQueryImageWithGemini_Multiple(prompt, baseImage, referenceImages, mask);
-                    else result = await editOrQueryImageWithGemini(prompt, baseImage, referenceImages, mask);
+                    if (requestedImageCount > 1) result = await editOrQueryImageWithGemini_Multiple(retryPrompt, baseImage, referenceImages, mask, null, requestedImageCount);
+                    else result = await editOrQueryImageWithGemini(retryPrompt, baseImage, referenceImages, mask);
                 } else if (isGenTask) {
-                    result = await generateImage(prompt);
+                    result = await generateImage(retryPrompt, '1:1', {
+                        baseImage,
+                        referenceImages,
+                        history: currentSession.messages,
+                        imageCount: requestedImageCount
+                    });
                 } else throw new Error("Regeneration is only available for image tasks.");
                 
                 if (result.success) {
@@ -825,7 +924,7 @@ async function pushSelectedToChat() {
                                 await addImageToWorkbench(file, 'AI生成', {
                                     dataUrl: imgData.src,
                                     parentId: baseImage ? fileToWorkbenchIdMap.get(baseImage) : null,
-                                    generationParams: { prompt: prompt }
+                                    generationParams: { prompt: retryPrompt }
                                 });
                             } catch(e) {}
                         });
@@ -837,7 +936,7 @@ async function pushSelectedToChat() {
                     } else if (result.imageData) {
                         const watermarkedImgSrc = await addWatermark(`data:${result.mimeType};base64,${result.imageData}`);
                         botMessage.imageData = { src: watermarkedImgSrc };
-                        botMessage.content = result.text || buildBotFallbackText(prompt, {isEditTask, isGenTask});
+                        botMessage.content = result.text || buildBotFallbackText(retryPrompt, {isEditTask, isGenTask});
 
                         // 【同步点1】对话框上屏
                         placeholderDiv.innerHTML = botAvatar + buildMessageContentHTML(botMessage);
@@ -846,8 +945,9 @@ async function pushSelectedToChat() {
 
                         // 【同步点2】工作台瞬间同步
                         const newFile = dataURLtoFileSync(watermarkedImgSrc, `regen-${Date.now()}.png`);
-                        lastGeneratedImageForEditing = newFile;
-                        mainImageFile = newFile;
+                        // 不再自动把 AI 结果设为下一轮对话底图，避免后续纯文本请求被误路由到图片链路
+                        lastGeneratedImageForEditing = null;
+                        mainImageFile = null;
 
                         let finalX = 50000, finalY = 50000;
                         const baseId = fileToWorkbenchIdMap.get(baseImage);
@@ -865,7 +965,7 @@ async function pushSelectedToChat() {
                             dataUrl: watermarkedImgSrc,
                             parentId: baseId,
                             type: 'regenerate',
-                            generationParams: { prompt: prompt }
+                            generationParams: { prompt: retryPrompt }
                         });
 
                         // 【后台任务】加载建议
@@ -879,19 +979,6 @@ async function pushSelectedToChat() {
             }
         })();
     }
-
-    const isImageEditRequest = (text, hasMask, hasRefImages) => {
-        if (hasMask || hasRefImages) return true;
-        if (!text) return false;
-        const keywords = [
-            '修改', '添加', '变成', '改成', '改为', '换成', '删除', '擦掉', '移除', '让它', 
-            '把它', '增加', '画上', '调整', '编辑', '替换', '风格转换', '重绘', '扩图', 
-            '角度', '方向', '朝向', '移动', '旋转', '翻转', '颜色', '色调', '亮度', '对比度', 
-            '饱和度', '材质', '质感', '效果', '滤镜', '模糊', '锐化', '加上', '放入', 
-            '去掉', '拿走', '改变', '变换', '变成', '变为'
-        ];
-        return keywords.some(keyword => text.toLowerCase().includes(keyword));
-    };
 
     const GENERIC_TITLES = [
         '新建项目', '图片对话', '新对话', 'Untitled', 'New Project', 'New Chat', '开启新对话',
@@ -909,6 +996,8 @@ async function pushSelectedToChat() {
         const placeholderSessions = [];
         for (const session of placeholderCandidates) {
             const fullSession = await dbHelper.getSessionData(session.id);
+            // 云端清单不包含重数据；详情尚未加载时不能判定为本地空会话。
+            if (!fullSession) continue;
             const mergedSession = { ...session, ...(fullSession || {}) };
             const messageCount = Array.isArray(mergedSession.messages) ? mergedSession.messages.length : 0;
             const runtimeAssetCount = Array.isArray(mergedSession.runtimeWorkspace?.currentState?.assets)
@@ -943,14 +1032,40 @@ async function pushSelectedToChat() {
                 title: initialTitle, 
                 timestamp: Date.now(), 
                 messages: [],
-                isAutoRenamed: isAutoRenamed
+                isAutoRenamed: isAutoRenamed,
+                workingMemory: createDefaultWorkingMemory()
             };
             sessions.unshift(newSession);
             await dbHelper.saveSession(newSession);
+            setLastActiveSessionId(newSession.id);
             renderHistoryList();
             return true;
         }
         return false;
+    }
+
+    async function appendAgentTaskUserMessage(text) {
+        await ensureSessionExists('资产任务');
+        const currentSession = sessions.find(session => session.id === currentSessionId);
+        if (!currentSession) return;
+        ensureSessionWorkingMemory(currentSession);
+        const userMessage = { sender: 'user', type: 'text', content: text };
+        currentSession.messages.push(userMessage);
+        addMessage(userMessage);
+        currentSession.updatedAt = Date.now();
+        userInput.value = '';
+        userInput.style.height = '';
+        renderHistoryList();
+        await dbHelper.saveSession(currentSession);
+    }
+
+    async function persistAgentTaskResult() {
+        const currentSession = sessions.find(session => session.id === currentSessionId);
+        if (currentSession) {
+            currentSession.updatedAt = Date.now();
+            await dbHelper.saveSession(currentSession);
+            renderHistoryList();
+        }
     }
 
     let renameTimeout = null;
@@ -1039,7 +1154,9 @@ async function pushSelectedToChat() {
         // 1. Add user message to chat
         await ensureSessionExists('AI 流程');
         const currentSession = sessions.find(s => s.id === currentSessionId);
+        const hadSessionMessages = currentSession.messages.length > 0;
         
+        let messagesToAppend = userMessages || [];
         if (userMessages && userMessages.length > 0) {
             userMessages.forEach(msg => {
                 if (msg.type === 'text') {
@@ -1050,9 +1167,14 @@ async function pushSelectedToChat() {
         } else {
             const userMsg = { sender: 'user', type: 'text', content: `[AI 流程策划] ${textFromInput}` };
             currentSession.messages.push(userMsg);
+            messagesToAppend = [userMsg];
         }
         
-        renderMessages(currentSession.messages);
+        if (hadSessionMessages) {
+            messagesToAppend.forEach(message => addMessage(message));
+        } else {
+            renderMessages(currentSession.messages);
+        }
         userInput.value = '';
         userInput.style.height = '';
         
@@ -1070,6 +1192,7 @@ async function pushSelectedToChat() {
         placeholderDiv.innerHTML = botAvatar + `<div class="placeholder-text">正在策划 AI 流程...</div>`;
         chatMessages.appendChild(placeholderDiv);
         chatMessages.scrollTop = chatMessages.scrollHeight;
+        await yieldToChatPaint();
 
         try {
             // 3. Get Selected Scenario
@@ -1294,6 +1417,69 @@ async function pushSelectedToChat() {
         }
         currentIntentLock = null;
 
+        // Feature-flagged bridge to the Runtime Job protocol. The existing
+        // image/chat pipeline remains untouched when this flag is disabled.
+        if (
+            isAgentRuntimeFeatureEnabled('assetReuseFromChat') &&
+            isAssetReuseRequest(textFromInput) &&
+            !isWorkflowMode &&
+            !mainImageFile &&
+            !lastGeneratedImageForEditing &&
+            !pendingBaseImageShare &&
+            referenceImageFiles.length === 0
+        ) {
+            if (isSending) return;
+            isSending = true;
+            updateSendBtnState();
+            try {
+                await handleAssetReuseRequest({
+                    text: textFromInput,
+                    runtime,
+                    onUserMessage: appendAgentTaskUserMessage,
+                    onFinished: persistAgentTaskResult
+                });
+            } catch (error) {
+                addMessage({ sender: 'bot', content: `资产任务启动失败：${error?.message || error}` });
+            } finally {
+                isSending = false;
+                updateSendBtnState();
+            }
+            return;
+        }
+
+        if (
+            isAgentRuntimeFeatureEnabled('magicLayersCommand') &&
+            isLayerExtractionRequest(textFromInput) &&
+            !isWorkflowMode &&
+            !mainImageFile &&
+            !lastGeneratedImageForEditing &&
+            !pendingBaseImageShare &&
+            referenceImageFiles.length === 0
+        ) {
+            if (isSending) return;
+            isSending = true;
+            updateSendBtnState();
+            try {
+                const result = await handleLayerExtractionRequest({
+                    text: textFromInput,
+                    runtime,
+                    onUserMessage: appendAgentTaskUserMessage,
+                    onFinished: persistAgentTaskResult
+                });
+                if (result) {
+                    userInput.value = '';
+                    userInput.style.height = '';
+                    return;
+                }
+            } catch (error) {
+                addMessage({ sender: 'bot', content: `图层提取任务启动失败：${error?.message || error}` });
+            } finally {
+                isSending = false;
+                updateSendBtnState();
+            }
+            return;
+        }
+
         const regenerationKeywords = ["不满意", "重来", "再试一次", "重新生成", "换一个", "另一个版本"];
         if (regenerationKeywords.some(k => textFromInput.toLowerCase().includes(k)) && lastGenerationContext) {
             handleRegenerate(); return;
@@ -1307,12 +1493,16 @@ async function pushSelectedToChat() {
                     await ensureSessionExists('精准修图');
                 }
                 const currentSession = sessions.find(s => s.id === currentSessionId);
+                const hadSessionMessages = currentSession.messages.length > 0;
                 const userMsg = { sender: 'user', type: 'text', content: textFromInput };
                 currentSession.messages.push(userMsg);
-                renderMessages(currentSession.messages); renderHistoryList();
+                if (hadSessionMessages) addMessage(userMsg);
+                else renderMessages(currentSession.messages);
+                renderHistoryList();
                 userInput.value = ''; userInput.style.height = '';
                 const box = preciseEditMode.pendingBox; const itemId = preciseEditMode.pendingItemId;
                 preciseEditMode.pendingBox = null; preciseEditMode.pendingItemId = null;
+                await yieldToChatPaint();
                 await performPreciseEdit(itemId, box, promptText); return;
             }
         }
@@ -1373,115 +1563,228 @@ async function pushSelectedToChat() {
         }
         
         if (!currentSessionId) {
-            await ensureSessionExists(textFromInput.substring(0, 20) || '图片对话');
-        } else {
-            // If session exists, still trigger rename if it's generic
-            triggerAsyncSessionRename();
+            await ensureSessionExists('图片对话');
         }
 
         const currentSession = sessions.find(s => s.id === currentSessionId);
+        ensureSessionWorkingMemory(currentSession);
+        const hadSessionMessages = currentSession.messages.length > 0;
         currentSession.updatedAt = Date.now();
         currentSession.messages.push(...userMessages);
-        renderMessages(currentSession.messages); renderHistoryList();
+        if (hadSessionMessages) {
+            userMessages.forEach(message => addMessage(message));
+        } else {
+            renderMessages(currentSession.messages);
+        }
+        renderHistoryList();
         userInput.value = ''; userInput.style.height = '';
+
+        const qwenRoutingContext = {
+            model: getImageModel(),
+            text: textFromInput,
+            baseImage: effectiveBaseImage,
+            mask: maskDataUrl
+        };
+        const useQwenLocalImageRouting = shouldUseQwenLocalImageRouting(qwenRoutingContext);
+        console.log('[Qwen Local Routing] decision', getQwenLocalRoutingDiagnostics(qwenRoutingContext));
+        if (!useQwenLocalImageRouting) triggerAsyncSessionRename();
         
         const referenceImagesSent = [...referenceImageFiles];
         const maskSent = maskDataUrl;
-        const isGenTask = isImageGenerationRequest(textFromInput) && !effectiveBaseImage;
-        const isEditTask = !!effectiveBaseImage && isImageEditRequest(textFromInput, !!maskSent, referenceImagesSent.length > 0);
-        const isQueryTask = !!effectiveBaseImage && !isEditTask;
-
-        lastGenerationContext = (isGenTask || isEditTask) ? { prompt: textFromInput, baseImage: effectiveBaseImage, referenceImages: [...referenceImagesSent], mask: maskSent, isGenTask, isEditTask } : null;
-
         let placeholderDiv = document.createElement('div');
         placeholderDiv.className = 'message bot-message';
         const botAvatar = `<img src="https://www.marmoai.cn/images/avatars/WeChat84b8e05cc8464bb089de1c46bed38809.jpg" alt="小M" style="width:32px;height:32px;border-radius:50%; flex-shrink: 0;">`;
-        const isMasklessMaterialEdit = isEditTask && !maskSent && isMaterialRequest(textFromInput);
-        
-        let placeholderText = isGenTask || isEditTask ? "图片正在创建..." : "思考中...";
-        if (isMasklessMaterialEdit) placeholderText = "正在为您生成多个版本...";
-
-        let placeholderContent = (isGenTask || isEditTask)
-            ? `<div class="image-placeholder-container"><div class="image-placeholder-box"><div class="spinner"></div></div><div class="placeholder-text">${placeholderText}</div></div>`
-            : `<div>${placeholderText}</div>`;
-        placeholderDiv.innerHTML = botAvatar + placeholderContent;
+        placeholderDiv.innerHTML = botAvatar + `<div>思考中...</div>`;
         chatMessages.appendChild(placeholderDiv); chatMessages.scrollTop = chatMessages.scrollHeight;
+        await yieldToChatPaint();
         
         mainImageFile = null; referenceImageFiles = []; maskDataUrl = null;
         await updateImagePreview();
 
         try {
-            let result;
-            if (isGenTask) {
-                result = await generateImage(textFromInput, targetAspectRatio || '1:1');
-            } else if (isEditTask) {
-                if (isMasklessMaterialEdit) result = await editOrQueryImageWithGemini_Multiple(textFromInput, effectiveBaseImage, referenceImagesSent, maskSent, targetAspectRatio || '1:1');
-                else result = await editOrQueryImageWithGemini(textFromInput, effectiveBaseImage, referenceImagesSent, maskSent, targetAspectRatio || '1:1');
-            } else if (isQueryTask) {
-                result = await editOrQueryImageWithGemini(textFromInput, effectiveBaseImage, referenceImagesSent, maskSent);
-            } else {
-                const stateObj = historyManager._createSerializableState(state.workbenchItems);
-                const canvasState = stateObj.items.map(item => ({
-                    id: item.id,
-                    type: item.type,
-                    label: item.label,
-                    position: { left: item.style.left, top: item.style.top },
-                    size: { width: item.style.width, height: item.style.height },
-                    zIndex: item.style.zIndex,
-                    content: item.type === 'text-note' ? item.content : undefined
-                }));
-                result = await generateTextWithGemini(textFromInput, currentSessionId, currentSession.messages, canvasState);
-                
-                if (result.functionCalls && result.functionCalls.length > 0) {
-                    let originalText = result.text;
-                    let hasEdit = false;
-                    for (const call of result.functionCalls) {
-                        const { name, args } = call;
-                        if (name === 'edit_image') {
-                            const targetItem = state.workbenchItems.get(args.itemId);
-                            if (targetItem && targetItem.file) {
-                                effectiveBaseImage = targetItem.file;
-                                if (!hasEdit) {
-                                    placeholderDiv.innerHTML = botAvatar + `<div class="image-placeholder-container"><div class="image-placeholder-box"><div class="spinner"></div></div><div class="placeholder-text">正在编辑图片...</div></div>`;
-                                    hasEdit = true;
-                                }
-                                result = await editOrQueryImageWithGemini(args.prompt, targetItem.file, [], null);
-                                if (!result.text) result.text = originalText !== "正在执行操作..." ? originalText : "已为您修改图片。";
-                            } else {
-                                if (!result.text) result.text = originalText !== "正在执行操作..." ? originalText : "找不到指定的图片进行编辑。";
+            let workspaceContext = getAssistantWorkspaceContext(state);
+            const interpretation = await interpretConversationTurn({
+                text: textFromInput,
+                baseImage: effectiveBaseImage,
+                referenceImages: referenceImagesSent,
+                mask: maskSent,
+                history: currentSession.messages,
+                workingMemory: currentSession.workingMemory,
+                selectedModel: state.selectedModel,
+                workspaceContext,
+                skipModel: useQwenLocalImageRouting
+            });
+            const resolvedInterpretation = resolveStateConflict({
+                text: textFromInput,
+                baseImage: effectiveBaseImage,
+                referenceImages: referenceImagesSent,
+                mask: maskSent,
+                history: currentSession.messages,
+                workingMemory: currentSession.workingMemory,
+                workspaceContext
+            }, interpretation);
+            const updatedWorkingMemory = mergeInterpreterResultIntoSession(currentSession, resolvedInterpretation);
+
+            const routeDecision = await determineConversationIntent({
+                text: textFromInput,
+                baseImage: effectiveBaseImage,
+                referenceImages: referenceImagesSent,
+                mask: maskSent,
+                history: currentSession.messages,
+                selectedModel: state.selectedModel,
+                workingMemory: updatedWorkingMemory,
+                workspaceContext,
+                localImageRouting: useQwenLocalImageRouting
+            });
+
+            const workspaceCommand = detectWorkspaceCommand(textFromInput);
+            if (workspaceCommand) {
+                workspaceContext = applyWorkspaceCommand(state, workspaceCommand, textFromInput);
+            }
+            const lensSearchRequest = looksLikeLensSearchRequest(textFromInput);
+            let lensSearchResult = null;
+
+            const isGenTask = routeDecision.route === 'image_generation';
+            const isEditTask = routeDecision.route === 'image_edit';
+            const isQueryTask = routeDecision.route === 'image_query';
+            const shouldFinalizeBriefFromResponse = resolvedInterpretation.briefSource === 'assistant_result' && !isGenTask && !isEditTask;
+
+            const stateObj = historyManager._createSerializableState(state.workbenchItems);
+            const canvasState = stateObj.items.map(item => ({
+                id: item.id,
+                type: item.type,
+                label: item.label,
+                position: { left: item.style.left, top: item.style.top },
+                size: { width: item.style.width, height: item.style.height },
+                zIndex: item.style.zIndex,
+                content: item.type === 'text-note' ? item.content : undefined
+            }));
+
+            const resolvedExecutionPrompt = resolveExecutionPrompt(routeDecision, {
+                prompt: textFromInput,
+                baseImage: effectiveBaseImage,
+                referenceImages: referenceImagesSent,
+                mask: maskSent,
+                targetAspectRatio: targetAspectRatio || '1:1',
+                history: currentSession.messages,
+                sessionId: currentSessionId,
+                canvasState,
+                workingMemory: updatedWorkingMemory,
+                workspaceContext
+            });
+            const executionPrompt = composeExecutionPrompt(routeDecision, {
+                prompt: resolvedExecutionPrompt || textFromInput,
+                baseImage: effectiveBaseImage,
+                referenceImages: referenceImagesSent,
+                mask: maskSent,
+                targetAspectRatio: targetAspectRatio || '1:1',
+                history: currentSession.messages,
+                sessionId: currentSessionId,
+                canvasState,
+                workingMemory: updatedWorkingMemory,
+                workspaceContext
+            });
+
+            lastGenerationContext = (isGenTask || isEditTask) ? {
+                prompt: textFromInput,
+                corePrompt: resolvedExecutionPrompt || textFromInput,
+                resolvedPrompt: executionPrompt,
+                baseImage: effectiveBaseImage,
+                referenceImages: [...referenceImagesSent],
+                mask: maskSent,
+                isGenTask,
+                isEditTask
+            } : null;
+
+            const placeholderText = lensSearchRequest
+                ? '正在搜索同款...'
+                : getIntentPlaceholderText(routeDecision, {
+                prompt: textFromInput,
+                mask: maskSent
+            });
+            const placeholderContent = shouldUseImagePlaceholder(routeDecision)
+                ? `<div class="image-placeholder-container"><div class="image-placeholder-box"><div class="spinner"></div></div><div class="placeholder-text">${placeholderText}</div></div>`
+                : `<div>${placeholderText}</div>`;
+            placeholderDiv.innerHTML = botAvatar + placeholderContent;
+
+            if (lensSearchRequest) {
+                lensSearchResult = await executeLensSearch(state, textFromInput, workspaceContext);
+            }
+
+            let result = workspaceCommand
+                ? {
+                    success: true,
+                    text: buildWorkspaceCommandResponse(workspaceCommand, workspaceContext),
+                    functionCalls: []
+                }
+                : lensSearchResult
+                ? lensSearchResult
+                : await executeConversationIntent(routeDecision, {
+                    prompt: resolvedExecutionPrompt || textFromInput,
+                    composedPrompt: executionPrompt,
+                    baseImage: effectiveBaseImage,
+                    referenceImages: referenceImagesSent,
+                    mask: maskSent,
+                    targetAspectRatio: targetAspectRatio || '1:1',
+                    history: currentSession.messages,
+                    sessionId: currentSessionId,
+                    canvasState,
+                    workingMemory: updatedWorkingMemory,
+                    workspaceContext
+                });
+            
+            if (routeDecision.route === 'text_chat' && result.functionCalls && result.functionCalls.length > 0) {
+                let originalText = result.text;
+                let hasEdit = false;
+                for (const call of result.functionCalls) {
+                    const { name, args } = call;
+                    if (name === 'edit_image') {
+                        const targetItem = state.workbenchItems.get(args.itemId);
+                        if (targetItem && targetItem.file) {
+                            effectiveBaseImage = targetItem.file;
+                            if (!hasEdit) {
+                                placeholderDiv.innerHTML = botAvatar + `<div class="image-placeholder-container"><div class="image-placeholder-box"><div class="spinner"></div></div><div class="placeholder-text">正在编辑图片...</div></div>`;
+                                hasEdit = true;
                             }
-                        } else if (name === 'manipulate_item') {
-                            const targetItem = state.workbenchItems.get(args.itemId);
-                            if (targetItem && targetItem.el) {
-                                if (args.action === 'delete') {
-                                    targetItem.el.remove();
-                                    state.workbenchItems.delete(args.itemId);
-                                } else if (args.action === 'move') {
-                                    try {
-                                        const val = typeof args.value === 'string' ? JSON.parse(args.value) : args.value;
-                                        if (val.x !== undefined) targetItem.el.style.left = val.x + 'px';
-                                        if (val.y !== undefined) targetItem.el.style.top = val.y + 'px';
-                                    } catch(e) {}
-                                } else if (args.action === 'resize') {
-                                    try {
-                                        const val = typeof args.value === 'string' ? JSON.parse(args.value) : args.value;
-                                        if (val.width !== undefined) targetItem.el.style.width = val.width + 'px';
-                                        if (val.height !== undefined) targetItem.el.style.height = val.height + 'px';
-                                    } catch(e) {}
-                                }
-                            } else {
-                                if (!result.text || result.text === "正在执行操作...") result.text = "找不到指定的元素进行操作。";
+                            const requestedCount = getExplicitRequestedImageCount(args.prompt || '', 6);
+                            result = requestedCount > 1
+                                ? await editOrQueryImageWithGemini_Multiple(args.prompt, targetItem.file, [], null, null, requestedCount)
+                                : await editOrQueryImageWithGemini(args.prompt, targetItem.file, [], null);
+                            if (!result.text) result.text = originalText !== "正在执行操作..." ? originalText : "已为您修改图片。";
+                        } else {
+                            if (!result.text) result.text = originalText !== "正在执行操作..." ? originalText : "找不到指定的图片进行编辑。";
+                        }
+                    } else if (name === 'manipulate_item') {
+                        const targetItem = state.workbenchItems.get(args.itemId);
+                        if (targetItem && targetItem.el) {
+                            if (args.action === 'delete') {
+                                targetItem.el.remove();
+                                state.workbenchItems.delete(args.itemId);
+                            } else if (args.action === 'move') {
+                                try {
+                                    const val = typeof args.value === 'string' ? JSON.parse(args.value) : args.value;
+                                    if (val.x !== undefined) targetItem.el.style.left = val.x + 'px';
+                                    if (val.y !== undefined) targetItem.el.style.top = val.y + 'px';
+                                } catch(e) {}
+                            } else if (args.action === 'resize') {
+                                try {
+                                    const val = typeof args.value === 'string' ? JSON.parse(args.value) : args.value;
+                                    if (val.width !== undefined) targetItem.el.style.width = val.width + 'px';
+                                    if (val.height !== undefined) targetItem.el.style.height = val.height + 'px';
+                                } catch(e) {}
                             }
+                        } else {
+                            if (!result.text || result.text === "正在执行操作...") result.text = "找不到指定的元素进行操作。";
                         }
                     }
-                    if (result.functionCalls.some(c => c.name === 'manipulate_item')) {
-                        historyManager.pushState();
-                        if (result.text === "正在执行操作...") result.text = "已为您更新工作台。";
-                    }
+                }
+                if (result.functionCalls.some(c => c.name === 'manipulate_item')) {
+                    historyManager.pushState();
+                    if (result.text === "正在执行操作...") result.text = "已为您更新工作台。";
                 }
             }
 
-            if (result.success) {
+            if (result.success || result.handled) {
                 const botMessage = { sender: 'bot', type: 'bot-rich' };
                 
                 if (Array.isArray(result.imageData)) {
@@ -1493,7 +1796,7 @@ async function pushSelectedToChat() {
                             await addImageToWorkbench(file, 'AI生成', {
                                 dataUrl: watermarkedSrc,
                                 parentId: effectiveBaseImage ? fileToWorkbenchIdMap.get(effectiveBaseImage) : null,
-                                generationParams: { prompt: textFromInput },
+                                generationParams: { prompt: executionPrompt },
                                 fusionProperties: targetFusionProperties || undefined
                             });
                         } catch(e){}
@@ -1505,6 +1808,9 @@ async function pushSelectedToChat() {
                     placeholderDiv.innerHTML = botAvatar + buildMessageContentHTML(botMessage);
                     currentSession.updatedAt = Date.now();
                     currentSession.messages.push(botMessage);
+                    if (shouldFinalizeBriefFromResponse) {
+                        finalizeWorkingMemoryWithAssistantResult(currentSession, resolvedInterpretation, botMessage.content || '');
+                    }
                     await updateImagePreview();
                     // 异步建议
                     getSmartSuggestions(result.imageData[0].imageData).then(s => appendSuggestionButtons(placeholderDiv, s, handleSuggestionClick));
@@ -1512,22 +1818,27 @@ async function pushSelectedToChat() {
                 } else if (result.imageData) {
                     const watermarkedImgSrc = await addWatermark(`data:${result.mimeType};base64,${result.imageData}`);
                     botMessage.imageData = { src: watermarkedImgSrc };
-                    botMessage.content = result.text || buildBotFallbackText(textFromInput, {isEditTask, isGenTask});
+                    botMessage.content = result.text || buildBotFallbackText(executionPrompt, {isEditTask, isGenTask});
                     
                     // 【同步点1】对话框显示
                     placeholderDiv.innerHTML = botAvatar + buildMessageContentHTML(botMessage);
                     currentSession.updatedAt = Date.now();
                     currentSession.messages.push(botMessage);
+                    if (shouldFinalizeBriefFromResponse) {
+                        finalizeWorkingMemoryWithAssistantResult(currentSession, resolvedInterpretation, botMessage.content || '');
+                    }
                     await updateImagePreview();
 
                     // 【同步点2】工作台瞬间显示
                     try {
-                        lastGeneratedImageForEditing = dataURLtoFileSync(watermarkedImgSrc, `gen-${Date.now()}.png`);
-                        mainImageFile = lastGeneratedImageForEditing;
-                        await addImageToWorkbench(lastGeneratedImageForEditing, 'AI生成', {
+                        const generatedFile = dataURLtoFileSync(watermarkedImgSrc, `gen-${Date.now()}.png`);
+                        // 不再自动把 AI 结果设为下一轮对话底图，避免后续纯文本请求被误路由到图片链路
+                        lastGeneratedImageForEditing = null;
+                        mainImageFile = null;
+                        await addImageToWorkbench(generatedFile, 'AI生成', {
                             dataUrl: watermarkedImgSrc,
                             parentId: effectiveBaseImage ? fileToWorkbenchIdMap.get(effectiveBaseImage) : null,
-                            generationParams: { prompt: textFromInput },
+                            generationParams: { prompt: executionPrompt },
                             fusionProperties: targetFusionProperties || undefined
                         });
                     } catch(e){}
@@ -1539,6 +1850,9 @@ async function pushSelectedToChat() {
                     placeholderDiv.innerHTML = botAvatar + buildMessageContentHTML(botMessage);
                     currentSession.updatedAt = Date.now();
                     currentSession.messages.push(botMessage);
+                    if (shouldFinalizeBriefFromResponse) {
+                        finalizeWorkingMemoryWithAssistantResult(currentSession, resolvedInterpretation, botMessage.content || '');
+                    }
                     if (!isQueryTask) lastGeneratedImageForEditing = null;
                 }
             }
@@ -1555,9 +1869,10 @@ async function pushSelectedToChat() {
         const currentSession = sessions.find(s => s.id === currentSessionId);
         if (!currentSession || !Array.isArray(currentSession.messages) || currentSession.messages.length > 2) return;
 
-        const messageDiv = addMessage({ sender: 'bot', content: '图片已上传。您可以直接输入指令进行编辑，或尝试以下操作：' });
+        const messageDiv = addMessage({ sender: 'bot', content: '图片已上传。您可以让我先读图、提炼结构、整理成文本总纲，或者继续编辑与生成：' });
         appendSuggestionButtons(messageDiv, [
             { label: '绘制蒙版并替换', action: () => { if(mainImageFile) openMaskEditor(mainImageFile) } },
+            { label: '提炼结构总纲', prompt: '请把这张图整理成后续都要遵循的结构化文本总纲' },
             { label: '咨询这张图片', prompt: '详细描述这张图的内容' },
         ], handleSuggestionClick);
     }
@@ -1725,6 +2040,100 @@ async function pushSelectedToChat() {
             // --- INTEGRATING MVR ASSET RUNTIME ---
             window.mvrRuntime = runtime; // Set it early
             window.memoryLayer = memoryLayer; // Expose memoryLayer
+            runtime.setAgentAssetResolver(async ({ projectId, assetId }) => {
+                const persistedSession = await dbHelper.getSessionData(projectId);
+                return persistedSession?.runtimeWorkspace?.currentState?.assets?.find(asset => asset.uid === assetId) || null;
+            });
+            runtime.setAgentVerificationHooks({
+                verify: async ({ workspace: targetWorkspace, assetIds }) => {
+                    const checks = [];
+                    const closeEnough = (actual, expected) => Number.isFinite(actual) && Math.abs(actual - expected) <= 1;
+                    const waitForImage = (image) => {
+                        if (!image || image.complete) return Promise.resolve();
+                        return new Promise(resolve => {
+                            let settled = false;
+                            const finish = () => {
+                                if (settled) return;
+                                settled = true;
+                                image.removeEventListener('load', finish);
+                                image.removeEventListener('error', finish);
+                                resolve();
+                            };
+                            image.addEventListener('load', finish, { once: true });
+                            image.addEventListener('error', finish, { once: true });
+                            setTimeout(finish, 1200);
+                        });
+                    };
+                    for (const assetId of assetIds) {
+                        const asset = targetWorkspace.currentState.assetRegistry.get(assetId);
+                        const escapedAssetId = typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
+                            ? CSS.escape(assetId)
+                            : String(assetId).replace(/(["\\])/g, '\\$1');
+                        const element = document.querySelector(`[data-item-id="${escapedAssetId}"]`);
+                        const image = element?.querySelector('img');
+                        await waitForImage(image);
+                        const hasElement = Boolean(element);
+                        const hasImageReference = Boolean(image?.getAttribute('src') || image?.src);
+                        checks.push({
+                            id: `dom_asset_${assetId}`,
+                            passed: hasElement,
+                            message: hasElement ? `Workspace element ${assetId} is present.` : `Workspace element ${assetId} is missing.`
+                        });
+                        checks.push({
+                            id: `image_reference_${assetId}`,
+                            passed: hasImageReference,
+                            message: hasImageReference ? `Image reference ${assetId} is bound.` : `Image reference ${assetId} is missing.`
+                        });
+                        const imageLoaded = Boolean(image && image.complete && (
+                            image.naturalWidth > 0 || /^(data:|blob:)/i.test(image.currentSrc || image.src || '')
+                        ));
+                        checks.push({
+                            id: `image_loaded_${assetId}`,
+                            passed: imageLoaded,
+                            message: imageLoaded ? `Image ${assetId} is loadable.` : `Image ${assetId} has not finished loading.`
+                        });
+                        if (!asset?.transform || !element) continue;
+                        const style = getComputedStyle(element);
+                        const transformMatches =
+                            closeEnough(parseFloat(element.style.left || style.left), asset.transform.x) &&
+                            closeEnough(parseFloat(element.style.top || style.top), asset.transform.y) &&
+                            closeEnough(parseFloat(element.style.width || style.width), asset.transform.width) &&
+                            closeEnough(parseFloat(element.style.height || style.height), asset.transform.height) &&
+                            String(element.style.zIndex || style.zIndex || '') === String(asset.transform.zIndex);
+                        checks.push({
+                            id: `transform_${assetId}`,
+                            passed: transformMatches,
+                            message: transformMatches ? `Transform ${assetId} matches Runtime.` : `Transform ${assetId} differs from Runtime.`
+                        });
+                    }
+                    return checks;
+                },
+                repair: isAgentRuntimeFeatureEnabled('verificationAutoRepair') ? async () => {
+                    if (typeof window.hydrateWorkbench === 'function') await window.hydrateWorkbench();
+                    if (typeof window.reconcileAllAssets === 'function') window.reconcileAllAssets();
+                } : undefined
+            });
+            runtime.setAgentLayerExtractionHooks(isAgentRuntimeFeatureEnabled('magicLayersCommand') ? {
+                execute: executeAgentLayerExtraction,
+                undo: undoAgentLayerExtraction,
+                commit: commitAgentLayerExtraction,
+                release: releaseAgentLayerExtraction
+            } : {});
+            runtime.setAgentCapabilityHooks(isAgentRuntimeFeatureEnabled('capabilityCommands') || isAgentRuntimeFeatureEnabled('objectEditing') ? {
+                execute: executeAgentCapability,
+                undo: undoAgentCapability,
+                commit: commitAgentCapabilities,
+                release: releaseAgentCapabilities
+            } : {});
+            if (isAgentRuntimeFeatureEnabled('agentTelemetry')) {
+                runtime.getAgentRuntime().subscribe(event => {
+                    console.info('[AgentTelemetry]', event);
+                });
+            }
+            runtime.setAgentCommitPersistence(async () => {
+                const currentSession = state.sessions.find(session => session.id === state.currentSessionId);
+                if (currentSession && dbHelper?.saveSession) await dbHelper.saveSession(currentSession);
+            });
             const workspace = await runtime.restoreWorkspace();
             if (workspace) {
                 console.log("[MVR] Workspace re-initialized on app start");
@@ -1757,6 +2166,10 @@ async function pushSelectedToChat() {
 
             await cleanupPlaceholderSessions();
             sessions = await dbHelper.getAllSessions();
+            // Backfill the lightweight Agent catalog one session at a time so
+            // historical projects become searchable after an upgrade without
+            // retaining all image payloads in memory or in the index.
+            await dbHelper.rebuildAssetCatalog(sessions);
             state.sessions = sessions;
 
             renderHistoryList();
@@ -1768,12 +2181,22 @@ async function pushSelectedToChat() {
             } else {
                 startNewSession();
             }
+            initAgentVisualSurface({
+                runtime,
+                onUserMessage: appendAgentTaskUserMessage,
+                onFinished: persistAgentTaskResult,
+                onFallback: async (text) => {
+                    userInput.value = text;
+                    await handleSend();
+                }
+            });
         } finally {
             window.isInitializingAppRestore = false;
             window.suppressSessionAutoCreate = false;
         }
         
         initSidebar();
+        initAgentDock({ runtime });
         initCameraAngleModal(handleSend);
         setupSelectionBox(); 
 
@@ -2077,6 +2500,27 @@ async function pushSelectedToChat() {
                     } catch (e) {
                         console.error("[ImplicitMemory] Error registering satisfaction:", e);
                     }
+                    try {
+                        const source = interactionAttributionRuntime.resolveSource({
+                            fallbackSourceType: 'manual'
+                        });
+                        resultFeedbackRuntime.recordEvent({
+                            type: 'result_selected',
+                            sessionId: currentSessionId || undefined,
+                            projectId: runtime.getCurrentWorkspace()?.projectId || undefined,
+                            sourceType: source.sourceType,
+                            sourceId: source.sourceId,
+                            context: {
+                                workflowStage: 'chat_selection'
+                            },
+                            metadata: {
+                                imageSrc: imgSrc,
+                                attributionMetadata: source.metadata || null
+                            }
+                        });
+                    } catch (e) {
+                        console.error('[ResultFeedback] Failed to record result_selected:', e);
+                    }
 
                     const selectedFile = await dataURLToFile(imgSrc, `selected-${Date.now()}.png`);
                     
@@ -2097,6 +2541,21 @@ async function pushSelectedToChat() {
                     addMessage(userMessage);
                     if (currentSession) {
                         currentSession.messages.push(userMessage);
+                        try {
+                            const continuityAnchor = await buildSeriesContinuityAnchor(
+                                selectedFile,
+                                currentSession.messages,
+                                {
+                                    promptHint: '这张图已被用户明确选用，后续连续性项目应继承其中可复用的系列视觉系统，而不是机械复制当前场景。',
+                                    anchorSource: 'selected_image'
+                                }
+                            );
+                            if (continuityAnchor) {
+                                setContinuityAnchor(currentSession, continuityAnchor, { replace: true });
+                            }
+                        } catch (anchorError) {
+                            console.warn('Failed to build continuity anchor from selected image:', anchorError);
+                        }
                         await dbHelper.saveSession(currentSession);
                     }
                     

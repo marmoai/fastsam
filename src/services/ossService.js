@@ -1,6 +1,15 @@
 import { getUserId, OSS_BACKEND_URL, getProxiedUrl, compressImage, buildAuthorizedHeaders } from '../core/utils.js';
 
 const UPLOAD_CACHE_KEY = 'oss_upload_cache';
+const inFlightUploads = new Map();
+let uploadQueue = Promise.resolve();
+
+const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+function isRetryableUploadFailure(status, message = '') {
+    if ([429, 500, 502, 503, 504].includes(Number(status))) return true;
+    return Number(status) === 400 && /文件上传服务暂时不可用|上传服务暂时不可用|temporarily unavailable|service unavailable/i.test(message);
+}
 
 function guessExtensionFromMimeType(mimeType = '') {
     if (mimeType === 'image/png') return 'png';
@@ -76,7 +85,7 @@ function setCachedUrl(hash, url) {
     }
 }
 
-export const uploadImageToOSS = async (fileOrBase64, options = {}) => {
+const uploadImageToOSSUnqueued = async (fileOrBase64, options = {}, hash = null) => {
     // 如果已经是目标 OSS 的 URL，直接返回，不必重新上传
     if (typeof fileOrBase64 === 'string' && (fileOrBase64.startsWith(OSS_BACKEND_URL) || fileOrBase64.startsWith('https://www.marmoai.cn/'))) {
         return fileOrBase64;
@@ -85,16 +94,6 @@ export const uploadImageToOSS = async (fileOrBase64, options = {}) => {
     const userId = getUserId();
     const sessionId = options.sessionId || getCurrentSessionIdForUpload();
     
-    // 1. Calculate hash and check cache
-    const hash = await calculateHash(fileOrBase64);
-    if (hash) {
-        const cachedUrl = getCachedUrl(hash);
-        if (cachedUrl) {
-            console.log('OSS Upload: Cache hit, skipping upload.');
-            return cachedUrl;
-        }
-    }
-
     let file = fileOrBase64;
     
     console.log('OSS Upload: Incoming type:', typeof file, 'Value:', file?.constructor?.name || file);
@@ -120,14 +119,16 @@ export const uploadImageToOSS = async (fileOrBase64, options = {}) => {
 
     file = ensureNamedUploadFile(file, `upload_${Date.now()}`);
 
-    // Compress the image before uploading (max 2048px, 85% quality)
-    try {
-        file = await compressImage(file, 2048, 0.85);
-    } catch (compressErr) {
-        console.warn('Image compression failed, falling back to original file:', compressErr);
-        // Ensure the original file is still a Blob/File
-        if (!(file instanceof Blob || file instanceof File)) {
-            throw new Error('Original file is not a valid Blob or File');
+    if (!options.preserveOriginal) {
+        // The display copy is intentionally bounded for workbench bandwidth.
+        try {
+            file = await compressImage(file, 2048, 0.85);
+        } catch (compressErr) {
+            console.warn('Image compression failed, falling back to original file:', compressErr);
+            // Ensure the original file is still a Blob/File
+            if (!(file instanceof Blob || file instanceof File)) {
+                throw new Error('Original file is not a valid Blob or File');
+            }
         }
     }
 
@@ -151,43 +152,95 @@ export const uploadImageToOSS = async (fileOrBase64, options = {}) => {
     }
 
     try {
-        const response = await fetch(`${OSS_BACKEND_URL}/upload`, {
-            method: 'POST',
-            headers: buildAuthorizedHeaders(),
-            body: formData,
-        });
+        const max429Retries = Math.max(0, Math.min(2, Number(options.max429Retries ?? 2)));
+        for (let attempt = 0; attempt <= max429Retries; attempt += 1) {
+        try {
+            const response = await fetch(`${OSS_BACKEND_URL}/upload`, {
+                method: 'POST',
+                headers: buildAuthorizedHeaders(),
+                body: formData,
+            });
 
-        if (!response.ok) {
-            let errorMessage = `OSS 上传失败 (${response.status})`;
-            try {
-                const errorPayload = await response.json();
-                errorMessage = errorPayload?.message || errorPayload?.debug || errorMessage;
-            } catch (parseError) {
+            if (!response.ok) {
+                let errorMessage = `OSS 上传失败 (${response.status})`;
                 try {
-                    const errorText = await response.text();
-                    if (errorText) errorMessage = errorText;
-                } catch (readError) {
-                    // Ignore secondary parsing failures and keep the generic message.
+                    const errorPayload = await response.json();
+                    errorMessage = errorPayload?.message || errorPayload?.debug || errorMessage;
+                } catch (parseError) {
+                    try {
+                        const errorText = await response.text();
+                        if (errorText) errorMessage = errorText;
+                    } catch (readError) {
+                        // Ignore secondary parsing failures and keep the generic message.
+                    }
                 }
+                if (isRetryableUploadFailure(response.status, errorMessage) && attempt < max429Retries) {
+                    await wait(1000 * (2 ** attempt));
+                    continue;
+                }
+                throw new Error(errorMessage);
             }
-            throw new Error(errorMessage);
-        }
 
-        const result = await response.json();
-        if (result.status === 'success') {
-            const url = result.data.url;
-            // 2. Save to cache
-            if (hash) {
-                setCachedUrl(hash, url);
+            const result = await response.json();
+            if (result.status === 'success') {
+                const url = result.data.url;
+                if (hash) {
+                    setCachedUrl(hash, url);
+                }
+                return url;
             }
-            return url;
-        } else {
             throw new Error(result.message || 'OSS 上传失败');
+        } catch (error) {
+            if (attempt < max429Retries && isRetryableUploadFailure(0, error?.message || '')) {
+                await wait(1000 * (2 ** attempt));
+                continue;
+            }
+            throw error;
+        }
         }
     } catch (error) {
+        // Kept below the retry loop so callers receive the final failure only.
         console.error('OSS 上传出错:', error);
         throw error;
     }
+};
+
+export const uploadImageToOSS = async (fileOrBase64, options = {}) => {
+    // If it is already a remote URL, do not enqueue or upload it again.
+    if (typeof fileOrBase64 === 'string' && (fileOrBase64.startsWith(OSS_BACKEND_URL) || fileOrBase64.startsWith('https://www.marmoai.cn/'))) {
+        return fileOrBase64;
+    }
+
+    const hash = await calculateHash(fileOrBase64);
+    const cacheKey = hash
+        ? `${hash}:${options.preserveOriginal ? 'original' : 'display'}`
+        : null;
+    if (hash) {
+        const cachedUrl = getCachedUrl(cacheKey);
+        if (cachedUrl) {
+            console.log('OSS Upload: Cache hit, skipping upload.');
+            return cachedUrl;
+        }
+        const existingUpload = inFlightUploads.get(cacheKey);
+        if (existingUpload) {
+            return existingUpload;
+        }
+    }
+
+    // Serialize all uploads. The upload endpoint rate-limits bursts even when
+    // the files are different, so Promise.all at callers must not fan out POSTs.
+    const queuedUpload = uploadQueue.then(() => uploadImageToOSSUnqueued(fileOrBase64, options, cacheKey));
+    uploadQueue = queuedUpload.catch(() => undefined);
+
+    if (!hash) {
+        return queuedUpload;
+    }
+
+    const sharedUpload = queuedUpload.finally(() => {
+        inFlightUploads.delete(cacheKey);
+    });
+    inFlightUploads.set(cacheKey, sharedUpload);
+    return sharedUpload;
 };
 
 export const uploadEmbeddedMedia = async (value, visited = new WeakSet(), options = {}) => {
@@ -350,6 +403,27 @@ export const getSessionsFromOSS = async () => {
         }
     } catch (error) {
         console.error('从 OSS 获取会话列表出错:', error);
+        return null;
+    }
+};
+
+export const getSessionFromOSS = async (sessionId) => {
+    const userId = getUserId();
+    if (!sessionId) return null;
+
+    try {
+        const response = await fetch(
+            `${OSS_BACKEND_URL}/get-session?userId=${encodeURIComponent(userId)}&sessionId=${encodeURIComponent(sessionId)}`,
+            { headers: buildAuthorizedHeaders() }
+        );
+        if (response.status === 404) return null;
+        if (!response.ok) throw new Error(`从 OSS 获取会话详情失败: ${response.status}`);
+
+        const result = await response.json();
+        if (result.status === 'success') return result.session || null;
+        throw new Error(result.message || '获取会话详情失败');
+    } catch (error) {
+        console.error(`从 OSS 获取会话 ${sessionId} 详情出错:`, error);
         return null;
     }
 };

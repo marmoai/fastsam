@@ -600,7 +600,11 @@ export function addTextNoteToWorkbench(x, y, restoreState = null) {
         type: 'text-note',
         id: id,
         parentId: restoreState ? restoreState.parentId : null,
-        css: restoreState && restoreState.css ? restoreState.css : null
+        css: restoreState && restoreState.css ? restoreState.css : null,
+        originalBbox: restoreState && Array.isArray(restoreState.originalBbox) ? restoreState.originalBbox : null,
+        sourceTextLayerId: restoreState?.sourceTextLayerId || null,
+        layerName: restoreState?.layerName || null,
+        textContent: restoreState?.textContent || restoreState?.content || ''
     });
     
     wrapper.addEventListener('dblclick', (e) => {

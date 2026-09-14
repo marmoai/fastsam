@@ -28,7 +28,7 @@ export async function hydrateWorkbench() {
             if (window.addImageToWorkbench) {
                 await window.addImageToWorkbench(null, asset.layerName || '恢复的图片', {
                     id: asset.uid,
-                    dataUrl: asset.cleanPlateDataUrl || asset.sourceImage,
+                    dataUrl: asset.runtimeDisplayUrl || asset.cleanPlateDataUrl || asset.sourceImage,
                     x: asset.transform?.x,
                     y: asset.transform?.y,
                     initialWidth: asset.transform?.width,
@@ -85,9 +85,23 @@ export function reconcileAllAssets() {
                 const img = el.querySelector('img');
                 
                 // Reconcile image source changes
-                const displaySource = asset.cleanPlateDataUrl || asset.sourceImage;
-                if (img && !isInvalidImageSrc(displaySource) && img.src !== displaySource) {
-                    img.src = displaySource;
+                const displaySource = asset.runtimeDisplayUrl || asset.cleanPlateDataUrl || asset.sourceImage;
+                if (img) {
+                    img.onerror = () => {
+                        if (asset.runtimeDisplayUrl && asset.sourceImage && img.src === asset.runtimeDisplayUrl && img.src !== asset.sourceImage) {
+                            img.src = asset.sourceImage;
+                            return;
+                        }
+                        img.style.visibility = 'hidden';
+                        console.warn('[MVR] Asset preview unavailable:', id);
+                    };
+                    img.onload = () => {
+                        img.style.visibility = 'visible';
+                    };
+                    if (!isInvalidImageSrc(displaySource) && img.src !== displaySource) {
+                        img.style.visibility = 'visible';
+                        img.src = displaySource;
+                    }
                 }
                 // Show remixing state
                 if (asset.status === 'remixing') {

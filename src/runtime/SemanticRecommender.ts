@@ -1,8 +1,30 @@
 import { DESIGN_PATTERNS, DesignPattern } from './DesignPatternSystem';
 import { memoryLayer } from './CreativeMemoryLayer';
+import { resultFeedbackRuntime, SourceFeedbackInsights } from './ResultFeedbackRuntime';
+import { TaskBucket, inferTaskBucketFromAsset } from './taskBuckets';
+
+export interface RecommendationContext {
+    prompt?: string;
+    taskType?: TaskBucket;
+}
+
+export interface RecommendedPattern {
+    pattern: DesignPattern;
+    score: number;
+    insights: SourceFeedbackInsights;
+    bucket: TaskBucket;
+}
 
 export class SemanticRecommender {
-    static recommend(asset: any): { recommended: DesignPattern[], others: DesignPattern[] } {
+    static recommend(asset: any, context: RecommendationContext = {}): { recommended: DesignPattern[], others: DesignPattern[] } {
+        const enriched = this.recommendWithInsights(asset, context);
+        return {
+            recommended: enriched.recommended.map(entry => entry.pattern),
+            others: enriched.others.map(entry => entry.pattern)
+        };
+    }
+
+    static recommendWithInsights(asset: any, context: RecommendationContext = {}): { recommended: RecommendedPattern[], others: RecommendedPattern[] } {
         // Collect context texts from the asset
         const keywords = new Set<string>();
         
@@ -10,10 +32,23 @@ export class SemanticRecommender {
             if (asset.type) keywords.add(asset.type.toLowerCase());
             if (asset.name) keywords.add(asset.name.toLowerCase());
             if (asset.prompt) keywords.add(asset.prompt.toLowerCase());
+            if (asset.label) keywords.add(asset.label.toLowerCase());
+            if (asset.layerName) keywords.add(asset.layerName.toLowerCase());
+            if (asset.semanticType) keywords.add(asset.semanticType.toLowerCase());
+            if (asset.designRole) keywords.add(asset.designRole.toLowerCase());
             if (asset.metadata && Array.isArray(asset.metadata.tags)) {
                 asset.metadata.tags.forEach((t: string) => keywords.add(t.toLowerCase()));
             }
+            if (Array.isArray(asset.layers)) {
+                asset.layers.forEach((layer: any) => {
+                    [layer?.name, layer?.semanticType, layer?.designRole, layer?.reasoning]
+                        .filter(Boolean)
+                        .forEach((value: string) => keywords.add(value.toLowerCase()));
+                });
+            }
         }
+
+        if (context.prompt?.trim()) keywords.add(context.prompt.trim().toLowerCase());
         
         // Convert to a single string for easy regex matching
         const contextStr = Array.from(keywords).join(' ');
@@ -81,10 +116,23 @@ export class SemanticRecommender {
             }
         });
 
-        const scoredPatterns: { pattern: DesignPattern, score: number }[] = [];
+        // An explicit task inferred from the current instruction is more
+        // relevant than the asset's default category for this interaction.
+        const taskBucket = context.taskType && context.taskType !== 'general'
+            ? context.taskType
+            : inferTaskBucketFromAsset(asset);
+        const scopedContext = {
+            taskType: taskBucket !== 'general' ? taskBucket : undefined
+        };
+        const scoredPatterns: RecommendedPattern[] = [];
         
         // 1. Process Baseline / Static patterns (Point 2: Adaptive Data Flywheel Multiplier)
         DESIGN_PATTERNS.forEach(pattern => {
+            const bucketInsights = scopedContext.taskType
+                ? resultFeedbackRuntime.getRecommendationInsights(pattern.id, scopedContext)
+                : null;
+            const globalInsights = resultFeedbackRuntime.getRecommendationInsights(pattern.id);
+            const insights = bucketInsights && bucketInsights.totalEvents > 0 ? bucketInsights : globalInsights;
             let score = 0;
             if (pattern.id === 'make_appetizing' && contextStr.match(/food|burger|pizza|cake|meat|salad|食物|汉堡|披萨|餐饮/)) score += 20;
             if (pattern.id === 'cyberpunk_style' && contextStr.match(/city|neon|night|car|street|future|赛博朋克|夜晚|城市|未来/)) score += 20;
@@ -98,9 +146,11 @@ export class SemanticRecommender {
             
             score += (globalCount * 12);  // Substantial flywheel boost
             score += (contextualCount * 25);
+            score += (bucketInsights?.score || 0) * 16;
+            score += globalInsights.score * 6;
             if (pattern.id === 'increase_depth' && score === 0) score += 2; 
 
-            scoredPatterns.push({ pattern, score });
+            scoredPatterns.push({ pattern, score, insights, bucket: taskBucket });
         });
 
         // 2. Point 4 Co-Creation: Synthesize and learn from Custom manual Sliders / Active Adjustments
@@ -145,12 +195,23 @@ export class SemanticRecommender {
                         });
                     }
                 };
-                scoredPatterns.push({ pattern: habitPattern, score: 99 }); // Put at top for easy reuse
+                scoredPatterns.push({
+                    pattern: habitPattern,
+                    score: 99,
+                    insights: resultFeedbackRuntime.getRecommendationInsights(habitPattern.id, scopedContext),
+                    bucket: taskBucket
+                }); // Put at top for easy reuse
             }
         }
 
         // 3. Point 4 Co-Creation: Synthesize and display user the past typed successful NL Prompt Commands
         Array.from(customPromptIntents).forEach((promptText, idx) => {
+            const patternId = `dynamic_nl_intent_${idx}`;
+            const bucketInsights = scopedContext.taskType
+                ? resultFeedbackRuntime.getRecommendationInsights(patternId, scopedContext)
+                : null;
+            const globalInsights = resultFeedbackRuntime.getRecommendationInsights(patternId);
+            const insights = bucketInsights && bucketInsights.totalEvents > 0 ? bucketInsights : globalInsights;
             let score = 30; // Solid baseline score to appear in suggestions
             // Match with keywords
             keywords.forEach(kw => {
@@ -158,9 +219,11 @@ export class SemanticRecommender {
                     score += 15;
                 }
             });
+            score += (bucketInsights?.score || 0) * 16;
+            score += globalInsights.score * 6;
 
             const promptWordPattern: DesignPattern = {
-                id: `dynamic_nl_intent_${idx}`,
+                id: patternId,
                 name: `🪄 自学创意: "${promptText}"`,
                 intent: promptText,
                 description: `快捷键命令: 同步创意指令到当前图层`,
@@ -176,7 +239,7 @@ export class SemanticRecommender {
                     });
                 }
             };
-            scoredPatterns.push({ pattern: promptWordPattern, score });
+            scoredPatterns.push({ pattern: promptWordPattern, score, insights, bucket: taskBucket });
         });
 
         // 4. Synthesize experience patterns from Data Flywheel records
@@ -200,11 +263,19 @@ export class SemanticRecommender {
                 let score = 0;
                 score += (globalIntentCounts[intentName] || 0) * 2;
                 score += (contextMatchedIntentCounts[intentName] || 0) * 10; // High confidence if context matches
+                const dynamicPatternId = `dynamic_${intentName.replace(/\s+/g, '_').toLowerCase()}`;
+                const bucketInsights = scopedContext.taskType
+                    ? resultFeedbackRuntime.getRecommendationInsights(dynamicPatternId, scopedContext)
+                    : null;
+                const globalInsights = resultFeedbackRuntime.getRecommendationInsights(dynamicPatternId);
+                const insights = bucketInsights && bucketInsights.totalEvents > 0 ? bucketInsights : globalInsights;
+                score += (bucketInsights?.score || 0) * 16;
+                score += globalInsights.score * 6;
 
                 // Create a dynamic pattern if score is decent or we have enough data points
                 if (score > 0 || deltas.length > 2) {
                     const dynamicPattern: DesignPattern = {
-                        id: `dynamic_${intentName.replace(/\s+/g, '_').toLowerCase()}`,
+                        id: dynamicPatternId,
                         name: `💡 经验: ${intentName}`,
                         intent: intentName,
                         description: '基于过往决策提取的数据策略',
@@ -240,7 +311,7 @@ export class SemanticRecommender {
                         }
                     };
                     
-                    scoredPatterns.push({ pattern: dynamicPattern, score });
+                    scoredPatterns.push({ pattern: dynamicPattern, score, insights, bucket: taskBucket });
                 }
             }
         });
@@ -248,14 +319,14 @@ export class SemanticRecommender {
         // Sort descending by score
         scoredPatterns.sort((a, b) => b.score - a.score);
 
-        const recommended: DesignPattern[] = [];
-        const others: DesignPattern[] = [];
+        const recommended: RecommendedPattern[] = [];
+        const others: RecommendedPattern[] = [];
 
         scoredPatterns.forEach((item, index) => {
             if (index < 3 && item.score > 0) { // Bumped up top choices to 3
-                recommended.push(item.pattern);
+                recommended.push(item);
             } else {
-                others.push(item.pattern);
+                others.push(item);
             }
         });
 

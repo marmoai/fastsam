@@ -2,7 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { 
     isRemovalRequest, 
     isMaterialRequest, 
-    isImageGenerationRequest 
+    isImageGenerationRequest,
+    getExplicitRequestedImageCount
 } from './utils';
 
 describe('utils.js core logic tests', () => {
@@ -40,6 +41,19 @@ describe('utils.js core logic tests', () => {
         it('should return false for simple chat', () => {
             expect(isImageGenerationRequest('你好')).toBe(false);
             expect(isImageGenerationRequest('你是谁？')).toBe(false);
+        });
+    });
+
+    describe('getExplicitRequestedImageCount', () => {
+        it('returns 1 by default when no explicit count is present', () => {
+            expect(getExplicitRequestedImageCount('换成木质纹理')).toBe(1);
+            expect(getExplicitRequestedImageCount('继续做这一版')).toBe(1);
+        });
+
+        it('extracts explicit chinese image counts correctly', () => {
+            expect(getExplicitRequestedImageCount('生成两张图')).toBe(2);
+            expect(getExplicitRequestedImageCount('来三张不同版本')).toBe(3);
+            expect(getExplicitRequestedImageCount('重新生成4张')).toBe(4);
         });
     });
 });

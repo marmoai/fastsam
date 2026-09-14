@@ -403,9 +403,7 @@ export async function executeNode(node, inputs) {
         case "video-generation":
             result = await skillFn(inputs.image, inputs.prompt, inputs.aspectRatio);
             if (!result) throw new Error("视频生成失败，未返回数据。");
-            // result is a Blob, convert to Object URL or base64?
-            // The graph expects a URL or base64. Let's return an Object URL for now.
-            return { video: URL.createObjectURL(result) };
+            return { video: result.videoUrl || result.url || null, requestId: result.requestId || null };
 
         case "upscale":
             result = await skillFn(inputs.image, inputs.prompt);

@@ -2,6 +2,29 @@ import { state } from '../../core/state.js';
 import { showLayerEditPrompt } from '../modals.js';
 import { editLayerAsset } from './layer-assets.js';
 import { runtime } from '../../runtime/CoreRuntime';
+import { syncWorkspaceContext, recordWorkspaceAction } from '../../services/workspace-context.js';
+
+function applyLayerSelectionVisual(layerEl, selected, hasCutout = false) {
+    if (!layerEl) return;
+    layerEl.classList.toggle('selected', !!selected);
+    layerEl.style.borderRadius = '4px';
+    layerEl.style.filter = selected
+        ? 'drop-shadow(0 0 8px rgba(79, 70, 229, 0.75))'
+        : 'none';
+
+    if (!hasCutout) {
+        layerEl.style.backgroundColor = selected ? 'rgba(79, 70, 229, 0.08)' : 'transparent';
+        layerEl.style.border = selected ? '1.5px solid rgba(79, 70, 229, 0.85)' : 'none';
+    }
+}
+
+function hasStandaloneSplitChild(parentItemId, layer) {
+    if (!layer?.id) return false;
+    return [...state.workbenchItems.values()].some(candidate =>
+        candidate?.parentId === parentItemId &&
+        (candidate.sourceLayerId === layer.id || candidate.layerId === layer.id)
+    );
+}
 
 export function renderCanvasLayers(itemId) {
     const item = state.workbenchItems.get(itemId);
@@ -45,6 +68,10 @@ export function renderCanvasLayers(itemId) {
     layersToRender.forEach((layer, index) => {
         console.log(`[Layers] Rendering layer ${index}: ${layer.name || 'unnamed'}, visible=${layer.visible !== false}, bbox=${layer.bbox}`);
         if (!layer.bbox) return;
+        // A split child is the only interactive representation of an extracted
+        // layer. Rendering the same cutout inside its parent creates a second,
+        // parent-bound copy that cannot be dragged on the workbench.
+        if (hasStandaloneSplitChild(itemId, layer)) return;
         
         // Check visibility state
         let isVisible = true;
@@ -65,11 +92,6 @@ export function renderCanvasLayers(itemId) {
         layerEl.className = 'canvas-layer';
         if (layer.category === 'background') {
             layerEl.classList.add('is-background');
-        }
-        if (isSelected) {
-            layerEl.classList.add('selected');
-            // 移除 BBOX 边框，让图层本身成为唯一视觉主体
-            layerEl.style.filter = 'drop-shadow(0 0 8px rgba(79, 70, 229, 0.8))';
         }
         layerEl.dataset.layerIndex = index;
         layerEl.dataset.layerId = layer.id || `layer-${index}`;
@@ -111,7 +133,14 @@ export function renderCanvasLayers(itemId) {
             imgEl.src = displayCutoutUrl;
             imgEl.style.width = '100%';
             imgEl.style.height = '100%';
-            imgEl.style.objectFit = 'fill'; // Fill the bbox exactly
+            // Preserve the generated asset's aspect ratio. The bbox remains the
+            // placement box; it must not be used to non-uniformly stretch the
+            // edited pixels.
+            // Preserve the asset's aspect ratio while filling the bbox. Any
+            // excess transparent canvas is cropped instead of shrinking the
+            // visible object inside the placement box.
+            imgEl.style.objectFit = 'cover';
+            imgEl.style.objectPosition = 'center';
             imgEl.style.pointerEvents = 'none';
             imgEl.style.display = 'block';
             
@@ -122,9 +151,9 @@ export function renderCanvasLayers(itemId) {
             layerEl.appendChild(imgEl);
         } else {
             layerEl.style.backgroundImage = 'none';
-            layerEl.style.backgroundColor = isSelected ? 'rgba(79, 70, 229, 0.08)' : 'transparent';
-            layerEl.style.border = isSelected ? '1.5px solid rgba(79, 70, 229, 0.85)' : 'none';
         }
+
+        applyLayerSelectionVisual(layerEl, isSelected, !!displayCutoutUrl);
 
         // Add a loading indicator overlay (independent of background source)
         const isProcessing = layer.assetStatus === 'processing' || 
@@ -181,12 +210,10 @@ export function renderCanvasLayers(itemId) {
             
             // Deselect all other layers in this item
             layersContainer.querySelectorAll('.canvas-layer').forEach(el => {
-                el.classList.remove('selected');
-                el.style.filter = 'none';
+                applyLayerSelectionVisual(el, false, !!el.querySelector('.cutout-img'));
             });
             
-            layerEl.classList.add('selected');
-            layerEl.style.filter = 'drop-shadow(0 0 8px rgba(79, 70, 229, 0.8))';
+            applyLayerSelectionVisual(layerEl, true, !!displayCutoutUrl);
 
             // Setup drag
             let startX = e.clientX;
@@ -243,6 +270,14 @@ export function renderCanvasLayers(itemId) {
 
                 // Track currently active workbench item ID and trigger capsule alert popup
                 state.currentActiveWorkbenchItemId = itemId;
+                syncWorkspaceContext(state, { activeItemId: itemId });
+                recordWorkspaceAction(state, {
+                    actionName: 'semantic_layer_selection_changed',
+                    itemId,
+                    layerId: layer.id || `layer-${index}`,
+                    layerName: layer.name || `图层 ${index + 1}`,
+                    status: 'ready'
+                });
                 if (typeof window.triggerCapsuleAlert === 'function') {
                     window.triggerCapsuleAlert(itemId);
                 }

@@ -13,7 +13,13 @@ export type ActionType = 'UPDATE_FUSION' | 'UPDATE_TRANSFORM' | 'ADD_ASSET' | 'A
 export interface Action {
     type: ActionType;
     payload: any;
-    meta?: { silent?: boolean, intent?: string }; // If silent=true, we don't snapshot
+    meta?: {
+        silent?: boolean,
+        intent?: string,
+        skipSnapshot?: boolean,
+        persistWithoutSnapshot?: boolean
+        skipNotify?: boolean
+    }; // If silent=true, we don't snapshot
     
     // Creative Memory Fields
     intent?: string; // e.g. "make_premium"
@@ -66,7 +72,14 @@ export class Dispatcher {
     }
 
     dispatch(action: Action) {
-        console.log('[Dispatcher] Processing:', action);
+        const payload = action?.payload || {};
+        console.log('[Dispatcher] Processing:', {
+            type: action.type,
+            uid: payload.uid,
+            uidCount: Array.isArray(payload.uids) ? payload.uids.length : undefined,
+            transformCount: Array.isArray(payload.transforms) ? payload.transforms.length : undefined,
+            intent: action.intent || action.meta?.intent
+        });
         
         // --- Middleware 0: Intent & Semantic Inference ---
         // Infer intent before recording to memory
@@ -79,22 +92,34 @@ export class Dispatcher {
 
         // --- Extract Before State for Delta ---
         let beforeState: any = null;
-        if (action.type === 'ADD_ASSET_WITH_RELATIONS') {
+        const captureDelta = !action.meta?.silent && !action.meta?.skipSnapshot;
+        const captureCompactTransformDelta = !action.meta?.silent && action.meta?.persistWithoutSnapshot && (
+            action.type === 'BATCH_UPDATE_TRANSFORMS' || action.type === 'UPDATE_TRANSFORM'
+        );
+        if (captureCompactTransformDelta) {
+            const transformRows = action.type === 'BATCH_UPDATE_TRANSFORMS'
+                ? (Array.isArray(action.payload?.transforms) ? action.payload.transforms : [])
+                : [{ uid: action.payload?.uid, transform: action.payload?.transform }];
+            beforeState = transformRows.map(({ uid, transform }: any) => ({
+                uid,
+                transform: this.workspace.currentState.assetRegistry.get(uid)?.transform || transform
+            }));
+        } else if (captureDelta && action.type === 'ADD_ASSET_WITH_RELATIONS') {
             beforeState = {
                 asset: null,
                 relations: []
             };
-        } else if (action.type === 'ADD_RELATIONS') {
+        } else if (captureDelta && action.type === 'ADD_RELATIONS') {
             beforeState = {
                 relations: []
             };
-        } else if (action.type === 'REMOVE_RELATION') {
+        } else if (captureDelta && action.type === 'REMOVE_RELATION') {
             const edgeId = action.payload?.id;
             const edgeBefore = edgeId ? this.workspace.currentState.sceneGraph.getEdge(edgeId) : null;
             beforeState = {
                 relation: edgeBefore ? JSON.parse(JSON.stringify(edgeBefore)) : null
             };
-        } else if (action.type === 'REMOVE_RELATIONS') {
+        } else if (captureDelta && action.type === 'REMOVE_RELATIONS') {
             const relationIds = Array.isArray(action.payload?.ids) ? action.payload.ids : [];
             beforeState = {
                 relations: relationIds
@@ -102,33 +127,33 @@ export class Dispatcher {
                     .filter(Boolean)
                     .map((edge: any) => JSON.parse(JSON.stringify(edge)))
             };
-        } else if (action.type === 'ADD_RELATION') {
+        } else if (captureDelta && action.type === 'ADD_RELATION') {
             beforeState = {
                 relation: null
             };
-        } else if (action.payload?.uid) {
+        } else if (captureDelta && action.payload?.uid) {
             const assetBefore = this.workspace.currentState.assetRegistry.get(action.payload.uid);
             if (assetBefore) beforeState = JSON.parse(JSON.stringify(assetBefore));
-        } else if (action.payload?.uids) {
+        } else if (captureDelta && action.payload?.uids) {
             const list: any[] = [];
             action.payload.uids.forEach((id: string) => {
                 const asset = this.workspace.currentState.assetRegistry.get(id);
                 if (asset) list.push(JSON.parse(JSON.stringify(asset)));
             });
             beforeState = list;
-        } else if (action.payload?.transforms) {
+        } else if (captureDelta && action.payload?.transforms) {
             const list: any[] = [];
             action.payload.transforms.forEach((item: any) => {
                 const asset = this.workspace.currentState.assetRegistry.get(item.uid);
                 if (asset) list.push(JSON.parse(JSON.stringify(asset)));
             });
             beforeState = list;
-        } else if (action.type === 'CLEAR_WORKSPACE') {
+        } else if (captureDelta && action.type === 'CLEAR_WORKSPACE') {
             beforeState = JSON.parse(JSON.stringify(this.workspace.currentState.assetRegistry.getAll()));
         }
 
         // --- Middleware 2: Snapshot Check ---
-        if (!action.meta?.silent) {
+        if (!action.meta?.silent && !action.meta?.skipSnapshot) {
             this.workspace.snapshot();
         }
 
@@ -181,9 +206,13 @@ export class Dispatcher {
         }
 
         if (!action.meta?.silent) {
-            this.workspace.currentState.notify();
-            if (typeof (window as any).mvrRuntime?.saveCurrentWorkspace === 'function') {
-                (window as any).mvrRuntime.saveCurrentWorkspace().catch((e: any) => {
+            if (!action.meta?.skipNotify) {
+                this.workspace.currentState.notify();
+            }
+            if ((!action.meta?.skipSnapshot || action.meta?.persistWithoutSnapshot) && typeof window !== 'undefined' && typeof (window as any).mvrRuntime?.saveCurrentWorkspace === 'function') {
+                (window as any).mvrRuntime.saveCurrentWorkspace({
+                    defer: Boolean(action.meta?.skipSnapshot && action.meta?.persistWithoutSnapshot)
+                }).catch((e: any) => {
                     console.error("[MVR] Dispatcher automatic workspace save failed:", e);
                 });
             }
@@ -191,50 +220,55 @@ export class Dispatcher {
 
         // --- Extract After State for Delta ---
         let afterState: any = null;
-        if (action.type === 'ADD_ASSET_WITH_RELATIONS') {
+        if (captureCompactTransformDelta) {
+            const transformRows = action.type === 'BATCH_UPDATE_TRANSFORMS'
+                ? (Array.isArray(action.payload?.transforms) ? action.payload.transforms : [])
+                : [{ uid: action.payload?.uid, transform: action.payload?.transform }];
+            afterState = transformRows.map(({ uid, transform }: any) => ({ uid, transform }));
+        } else if (captureDelta && action.type === 'ADD_ASSET_WITH_RELATIONS') {
             const { asset, relations = [] } = action.payload;
             afterState = {
                 asset: asset ? JSON.parse(JSON.stringify(this.workspace.currentState.assetRegistry.get(asset.uid) || asset)) : null,
                 relations: Array.isArray(relations) ? relations.map((edge: any) => JSON.parse(JSON.stringify(edge))) : []
             };
-        } else if (action.type === 'ADD_RELATION') {
+        } else if (captureDelta && action.type === 'ADD_RELATION') {
             const { edge } = action.payload;
             afterState = {
                 relation: edge ? JSON.parse(JSON.stringify(this.workspace.currentState.sceneGraph.getEdge(edge.id) || edge)) : null
             };
-        } else if (action.type === 'ADD_RELATIONS') {
+        } else if (captureDelta && action.type === 'ADD_RELATIONS') {
             const { edges = [] } = action.payload;
             afterState = {
                 relations: Array.isArray(edges)
                     ? edges.map((edge: any) => JSON.parse(JSON.stringify(this.workspace.currentState.sceneGraph.getEdge(edge.id) || edge)))
                     : []
             };
-        } else if (action.type === 'REMOVE_RELATION') {
+        } else if (captureDelta && action.type === 'REMOVE_RELATION') {
             afterState = {
                 relation: null
             };
-        } else if (action.type === 'REMOVE_RELATIONS') {
+        } else if (captureDelta && action.type === 'REMOVE_RELATIONS') {
             afterState = {
                 relations: []
             };
-        } else if (action.payload?.uid) {
+        } else if (captureDelta && action.payload?.uid) {
             const assetAfter = this.workspace.currentState.assetRegistry.get(action.payload.uid);
             if (assetAfter) afterState = JSON.parse(JSON.stringify(assetAfter));
-        } else if (action.payload?.uids) {
+        } else if (captureDelta && action.payload?.uids) {
             const list: any[] = [];
             action.payload.uids.forEach((id: string) => {
                 const asset = this.workspace.currentState.assetRegistry.get(id);
                 if (asset) list.push(JSON.parse(JSON.stringify(asset)));
             });
             afterState = list;
-        } else if (action.payload?.transforms) {
+        } else if (captureDelta && action.payload?.transforms) {
             const list: any[] = [];
             action.payload.transforms.forEach((item: any) => {
                 const asset = this.workspace.currentState.assetRegistry.get(item.uid);
                 if (asset) list.push(JSON.parse(JSON.stringify(asset)));
             });
             afterState = list;
-        } else if (action.type === 'CLEAR_WORKSPACE') {
+        } else if (captureDelta && action.type === 'CLEAR_WORKSPACE') {
             afterState = [];
         }
 
@@ -381,9 +415,13 @@ export class Dispatcher {
                 break;
             }
             case 'CO_CREATE_SYNC': {
-                const { uid, prompt } = action.payload;
+                const { uid, prompt, operationMode, replaceCurrent } = action.payload;
                 if (typeof (window as any).handleQuickFusionSync === 'function') {
-                    (window as any).handleQuickFusionSync(uid, prompt).catch(console.error);
+                    console.info('[Dispatcher] CO_CREATE_SYNC', { uid, operationMode, replaceCurrent });
+                    (window as any).handleQuickFusionSync(uid, prompt, {
+                        operationMode: operationMode || 'fusion',
+                        replaceCurrent: replaceCurrent !== false
+                    }).catch(console.error);
                 }
                 break;
             }

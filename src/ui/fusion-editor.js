@@ -2,6 +2,8 @@ import { state } from '../core/state.js';
 import { addMessage } from './chat-panel.js';
 import { SemanticRecommender } from '../runtime/SemanticRecommender';
 import { evolutionEngine } from '../runtime/EvolutionEngine';
+import { interactionAttributionRuntime } from '../runtime/InteractionAttributionRuntime';
+import { describeTaskBucket } from '../runtime/taskBuckets';
 
 const { workbenchItems } = state;
 
@@ -1202,16 +1204,31 @@ function initAIInspirationCapsule() {
 // Run capsule bootstrap
 initAIInspirationCapsule();
 
+// The Agent Visual Workspace owns the primary inspiration entry. Keep the
+// legacy capsule implementation available, but remove its independent visual
+// surface so it cannot compete with the Visual Object panel.
+export function hideAIInspirationCapsule() {
+    ['aiInspirationCapsule', 'capsuleSpeechTooltip'].forEach((id) => {
+        const element = document.getElementById(id);
+        if (!element) return;
+        element.hidden = true;
+        element.setAttribute('aria-hidden', 'true');
+    });
+}
+hideAIInspirationCapsule();
+window.hideAIInspirationCapsule = hideAIInspirationCapsule;
+
 /**
  * Triggered automatically on selected layer click. Fired from showWorkbenchToolbox hook.
  */
 window.triggerCapsuleAlert = function(itemId) {
+    if (document.body.classList.contains('agent-visual-workspace-mode')) return;
     initAIInspirationCapsule();
     const item = workbenchItems.get(itemId);
     if (!item) return;
 
     // Retrieve suggestions counts from SemanticRecommender matching asset
-    const { recommended, others } = SemanticRecommender.recommend(item);
+    const { recommended, others } = SemanticRecommender.recommendWithInsights(item);
     const totalInspirations = (recommended ? recommended.length : 0) + (others ? others.length : 0) + 1; // 1 represents the active base or intent variants
 
     const capsule = document.getElementById('aiInspirationCapsule');
@@ -1337,6 +1354,14 @@ function applySuggestionPattern(pattern, itemId) {
     if (!ws?.dispatcher || !pattern) return;
 
     try {
+        interactionAttributionRuntime.registerRecommendationApplied({
+            assetUid: itemId,
+            patternId: pattern.id,
+            patternName: pattern.name,
+            semanticType: pattern.semanticType || null,
+            sessionId: state.currentSessionId || undefined,
+            projectId: ws.projectId || undefined
+        });
         pattern.apply(ws.dispatcher, itemId);
         showFeedbackToast(`🌱 已套用建议: ${pattern.name}`);
         setTimeout(() => {
@@ -1401,6 +1426,20 @@ export function showFloatingFusionEditor(itemId, x, y, width) {
     if (!item) {
         return;
     }
+
+    // Magic Layers objects now have one canonical editing entry: the Agent
+    // Visual Target Bar. Keep legacy inspiration/capsule callers from
+    // resurrecting the old drawer on top of that surface.
+    if (isExtractedLayerItem(item)) {
+        hideFloatingFusionEditor();
+        window.dispatchEvent(new CustomEvent('marmo:workspace-selection-changed', {
+            detail: { itemId, source: 'legacy-fusion-redirect' }
+        }));
+        return;
+    }
+
+    document.body.classList.add('agent-inspiration-open');
+    window.toggleChat?.(false);
 
     // Hide toolbox of active elements to prevent visual clashing with the inspiration lists
     const toolbox = document.getElementById('workbenchToolbox') || window.workbenchToolbox;
@@ -1697,6 +1736,13 @@ export function showFloatingFusionEditor(itemId, x, y, width) {
     const syncModeButtons = () => {
         modeIsolatedBtn.classList.toggle('active', currentMode === 'isolated');
         modeFusionBtn.classList.toggle('active', currentMode === 'fusion');
+        editor.dataset.executionMode = currentMode;
+    };
+
+    const getSelectedExecutionMode = () => {
+        if (modeFusionBtn.classList.contains('active')) return 'fusion';
+        if (modeIsolatedBtn.classList.contains('active')) return 'isolated';
+        return editor.dataset.executionMode === 'fusion' ? 'fusion' : currentMode;
     };
 
     modeIsolatedBtn.onclick = (e) => {
@@ -1710,6 +1756,7 @@ export function showFloatingFusionEditor(itemId, x, y, width) {
         currentMode = 'fusion';
         syncModeButtons();
     };
+    syncModeButtons();
 
     // Execute NL intent triggers
     const executeNLIntent = async () => {
@@ -1718,15 +1765,25 @@ export function showFloatingFusionEditor(itemId, x, y, width) {
             alert('请输入修改指令');
             return;
         }
+        const requestedMode = getSelectedExecutionMode();
+        const replaceCurrent = requestedMode === 'fusion';
+        console.info('[Fusion Editor] dispatch edit intent', {
+            itemId,
+            requestedMode,
+            replaceCurrent,
+            prompt: promptText
+        });
 
         // Use workspace dispatcher so it remains in timeline historical stream
         if (ws && ws.dispatcher) {
             ws.dispatcher.dispatch({
-                type: currentMode === 'isolated' ? 'CO_CREATE_ISOLATED' : 'CO_CREATE_SYNC',
+                type: replaceCurrent ? 'CO_CREATE_SYNC' : 'CO_CREATE_ISOLATED',
                 intent: promptText,
                 payload: {
                     uid: itemId,
-                    prompt: promptText
+                    prompt: promptText,
+                    operationMode: requestedMode,
+                    replaceCurrent
                 }
             });
             showFeedbackToast(`🪄 已部署创意意图: "${promptText}"`);
@@ -1736,16 +1793,19 @@ export function showFloatingFusionEditor(itemId, x, y, width) {
                 showFloatingFusionEditor(itemId);
             }, 120);
         } else {
-            const modeText = currentMode === 'isolated' ? '独立资产生成中' : '同步至原图';
+            const modeText = replaceCurrent ? '同步至当前图层' : '独立资产生成中';
             editor.innerHTML = `<div style="text-align:center; padding: 40px; font-size: 13px; color: #64748b;"><i class="fas fa-spinner fa-spin" style="margin-right: 6px;"></i> 正在${modeText}...</div>`;
             
-            if (currentMode === 'isolated') {
+            if (!replaceCurrent) {
                 if (typeof window.handleIsolatedAssetEdit === 'function') {
                     await window.handleIsolatedAssetEdit(itemId, promptText);
                 }
             } else {
                 if (typeof window.handleQuickFusionSync === 'function') {
-                    await window.handleQuickFusionSync(itemId, promptText);
+                    await window.handleQuickFusionSync(itemId, promptText, {
+                        operationMode: requestedMode,
+                        replaceCurrent: true
+                    });
                 }
             }
             hideFloatingFusionEditor();
@@ -2021,6 +2081,13 @@ export function showFloatingFusionEditor(itemId, x, y, width) {
  * Renders a clickable elegant card layout for suggestions, featuring Napkin styling
  */
 function renderSuggestionCard(pattern, isBestMatch, itemId) {
+    const patternDef = pattern.pattern || pattern;
+    const insights = pattern.insights || null;
+    const taskLabel = pattern.bucket ? describeTaskBucket(pattern.bucket) : '当前任务';
+    const feedbackLine = insights && insights.totalEvents > 0
+        ? `${taskLabel}里${insights.shortLabel} · ${insights.detail}`
+        : '先试一版，系统会继续学习';
+
     const card = document.createElement('div');
     card.className = 'ai-suggestion-card';
     card.style.cssText = `
@@ -2036,14 +2103,17 @@ function renderSuggestionCard(pattern, isBestMatch, itemId) {
 
     card.innerHTML = `
         <div style="font-size: 20px; width: 34px; height: 34px; border-radius: 10px; background: ${isBestMatch ? '#e0e7ff' : '#f1f5f9'}; display: flex; align-items: center; justify-content: center; flex-shrink: 0;">
-            ${pattern.emoji}
+            ${patternDef.emoji}
         </div>
         <div style="display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0;">
             <p style="margin: 0; font-size: 11.5px; font-weight: 600; color: #1e293b; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
-                ${pattern.name}
+                ${patternDef.name}
             </p>
-            <p style="margin: 0; font-size: 9.5px; color: #64748b; line-height: 1.3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${pattern.description}">
-                ${pattern.description}
+            <p style="margin: 0; font-size: 9.5px; color: #64748b; line-height: 1.3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${patternDef.description}">
+                ${patternDef.description}
+            </p>
+            <p style="margin: 2px 0 0; font-size: 9px; color: ${isBestMatch ? '#6366f1' : '#7c3aed'}; line-height: 1.25; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${feedbackLine}">
+                ${feedbackLine}
             </p>
         </div>
         <div style="font-size: 10px; color: ${isBestMatch ? '#6366f1' : '#94a3b8'}; padding: 4px; border-radius: 50%; opacity: 0.7;">
@@ -2053,7 +2123,7 @@ function renderSuggestionCard(pattern, isBestMatch, itemId) {
 
     card.onclick = (e) => {
         e.stopPropagation();
-        applySuggestionPattern(pattern, itemId);
+        applySuggestionPattern(patternDef, itemId);
     };
 
     return card;
@@ -2099,6 +2169,7 @@ function showFeedbackToast(msg) {
 }
 
 export function hideFloatingFusionEditor() {
+    document.body.classList.remove('agent-inspiration-open');
     const el = document.getElementById('floatingFusionEditor');
     if (el && el.classList.contains('expanded')) {
         el.classList.remove('expanded');

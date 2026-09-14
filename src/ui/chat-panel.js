@@ -4,6 +4,7 @@ import { state } from "../core/state.js";
 import { updateChatSourceRail } from "./chat-source-rail.js";
 
 function persistMessageIfNeeded(message) {
+    if (message?.persist === false || message?.visibility === 'progress' || message?.visibility === 'internal') return;
     if (window.__isRenderingChatHistory) return;
     if (!state.currentSessionId) return;
 
@@ -81,6 +82,9 @@ if (typeof window !== 'undefined') {
 }
 
 export function addMessage(message) {
+    // Internal Workbench diagnostics update state elsewhere and never belong in chat UI.
+    if (message?.visibility === 'internal') return null;
+
     const chatMessages = document.getElementById('chatMessages');
     if (!chatMessages) return null;
 
@@ -89,6 +93,8 @@ export function addMessage(message) {
     const { sender } = message;
     const messageDiv = document.createElement('div');
     messageDiv.className = `message ${sender}-message`;
+    if (message.visibility) messageDiv.dataset.visibility = message.visibility;
+    if (message.persist === false) messageDiv.dataset.persist = 'false';
     
     const botAvatar = `<img src="https://www.marmoai.cn/images/avatars/WeChat84b8e05cc8464bb089de1c46bed38809.jpg" alt="小M" style="width:32px;height:32px;border-radius:50%; flex-shrink: 0;">`;
     const htmlContent = buildMessageContentHTML(message);
@@ -110,6 +116,16 @@ export function addMessage(message) {
     updateChatSourceRail();
     
     return messageDiv;
+}
+
+export function yieldToChatPaint() {
+    return new Promise(resolve => {
+        if (typeof requestAnimationFrame === 'function') {
+            requestAnimationFrame(() => requestAnimationFrame(resolve));
+        } else {
+            setTimeout(resolve, 0);
+        }
+    });
 }
 
 export function renderMessages(messages, onActionClick) {
@@ -177,6 +193,138 @@ export function appendSuggestionButtons(messageElement, suggestions = [], onSugg
     } else {
         messageElement.appendChild(container);
     }
+}
+
+function escapeAgentJobText(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}
+
+const AGENT_JOB_STATUS_LABELS = {
+    created: '已创建',
+    planned: '已规划',
+    running: '执行中',
+    verifying: '验证中',
+    waiting_confirmation: '等待确认 / 处理验证',
+    committing: '保存中',
+    completed: '已完成',
+    failed: '失败',
+    cancelled: '已取消'
+};
+
+function getAgentStepState(job, index) {
+    if (job.status === 'failed' && index === job.currentStep) return 'failed';
+    if (job.status === 'cancelled' && index === job.currentStep) return 'cancelled';
+    if (job.status === 'completed' || index < job.currentStep) return 'completed';
+    if (index === job.currentStep && ['running', 'verifying', 'waiting_confirmation', 'committing'].includes(job.status)) return 'active';
+    return 'pending';
+}
+
+function buildAgentJobCardHTML(job) {
+    const planSteps = Array.isArray(job?.plan?.steps) ? job.plan.steps : [];
+    const steps = planSteps.map((step, index) => {
+        const state = getAgentStepState(job, index);
+        const icon = state === 'completed' ? '✓' : state === 'failed' ? '!' : state === 'active' ? '●' : '○';
+        return `<li class="agent-job-step is-${state}"><span class="agent-job-step-icon">${icon}</span><span>${escapeAgentJobText(step.label || step.commandType)}</span></li>`;
+    }).join('');
+    const error = job.error?.message
+        ? `<div class="agent-job-error">${escapeAgentJobText(job.error.message)}</div>`
+        : '';
+    const failedChecks = job.verification?.checks?.filter(check => !check.passed).slice(0, 3) || [];
+    const verification = job.verification
+        ? `<div class="agent-job-verification ${job.verification.passed ? 'is-passed' : 'is-failed'}">${job.verification.passed ? '✓ 结构与视觉入口验证通过' : '⚠ 验证未通过，结果已保留待处理'}${failedChecks.length ? `<div class="agent-job-checks">${failedChecks.map(check => escapeAgentJobText(check.message)).join('<br>')}</div>` : ''}</div>`
+        : '';
+    const confirmButton = job.status === 'waiting_confirmation' && job.verification?.passed !== false
+        ? '<button type="button" class="agent-job-action agent-job-confirm">确认保存</button>'
+        : '';
+    const cancelButton = ['created', 'planned', 'running', 'verifying', 'waiting_confirmation'].includes(job.status)
+        ? '<button type="button" class="agent-job-action agent-job-cancel">取消任务</button>'
+        : '';
+    const retryButton = job.status === 'failed' || (job.status === 'waiting_confirmation' && job.verification?.passed === false)
+        ? '<button type="button" class="agent-job-action agent-job-retry">重试验证</button>'
+        : '';
+    return `
+        <div class="agent-job-card" data-job-id="${escapeAgentJobText(job.id)}">
+            <div class="agent-job-header">
+                <div><span class="agent-job-kicker">AGENT JOB</span><div class="agent-job-goal">${escapeAgentJobText(job.goal)}</div></div>
+                <span class="agent-job-status is-${escapeAgentJobText(job.status)}">${escapeAgentJobText(AGENT_JOB_STATUS_LABELS[job.status] || job.status)}</span>
+            </div>
+            <ol class="agent-job-steps">${steps}</ol>
+            ${verification}
+            ${error}
+            <div class="agent-job-actions">${confirmButton}${retryButton}${cancelButton}</div>
+        </div>
+    `;
+}
+
+/**
+ * Render a transient Job card. Job state is deliberately not written into the
+ * conversation history; the Runtime remains the source of truth for recovery.
+ */
+export function addAgentJobCard(job, handlers = {}) {
+    const chatMessages = document.getElementById('chatMessages');
+    if (!chatMessages) return null;
+
+    const messageDiv = document.createElement('div');
+    messageDiv.className = 'message bot-message agent-job-message';
+    const botAvatar = '<img src="https://www.marmoai.cn/images/avatars/WeChat84b8e05cc8464bb089de1c46bed38809.jpg" alt="小M" style="width:32px;height:32px;border-radius:50%; flex-shrink: 0;">';
+    messageDiv.innerHTML = botAvatar + buildAgentJobCardHTML(job);
+
+    const controller = {
+        element: messageDiv,
+        update(nextJob) {
+            messageDiv.innerHTML = botAvatar + buildAgentJobCardHTML(nextJob);
+            const confirm = messageDiv.querySelector('.agent-job-confirm');
+            const cancel = messageDiv.querySelector('.agent-job-cancel');
+            const retry = messageDiv.querySelector('.agent-job-retry');
+            const bind = (button, handler) => {
+                if (!button || !handler) return;
+                button.addEventListener('click', async () => {
+                    button.disabled = true;
+                    try {
+                        await handler(nextJob);
+                    } catch (error) {
+                        if (handlers.onError) handlers.onError(error, nextJob);
+                        button.disabled = false;
+                    }
+                });
+            };
+            bind(confirm, handlers.onConfirm);
+            bind(cancel, handlers.onCancel);
+            bind(retry, handlers.onRetry);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+    };
+    chatMessages.appendChild(messageDiv);
+    controller.update(job);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+    updateChatSourceRail();
+    return controller;
+}
+
+export function focusAgentJobCard(jobId) {
+    if (!jobId) return false;
+    const escapedId = typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
+        ? CSS.escape(String(jobId))
+        : String(jobId).replace(/(["\\])/g, '\\$1');
+    const card = document.querySelector(`.agent-job-card[data-job-id="${escapedId}"]`);
+    if (!card) return false;
+    card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    card.classList.remove('is-focused');
+    void card.offsetWidth;
+    card.classList.add('is-focused');
+    window.setTimeout(() => card.classList.remove('is-focused'), 1800);
+    return true;
+}
+
+if (typeof window !== 'undefined') {
+    window.addEventListener('marmo:agent-task-focus', event => {
+        focusAgentJobCard(event.detail?.jobId);
+    });
 }
 
 export function buildBotFallbackText(userInstruction, { isEditTask, isGenTask }) {

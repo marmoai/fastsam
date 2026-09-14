@@ -73,6 +73,8 @@ export interface AssetEntity {
 
     // MVR基础数据：告别一次性图片
     sourceImage: string; // Blob URL 或远程 URL
+    /** Current-page preview only; never persist this object URL. */
+    runtimeDisplayUrl?: string;
     masks: MaskData[]; // 语义遮罩数据
     
     variants: AssetVariant[]; // 对象修改产生的版本
