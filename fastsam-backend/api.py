@@ -17,6 +17,7 @@ from mask_ops import *
 from candidate_selection import *
 from matte_ops import *
 from segmentation_core import *
+from sam_diagnostics import sam_diagnostic_request, sam_diagnostic_event
 
 app = FastAPI()
 
@@ -68,7 +69,6 @@ async def segment(request: Request):
             pixel_bboxes = []
             original_target_bboxes = []
             sam_prompt_bboxes = []
-            legacy_food_output_count = 0
             for bbox in bboxes_norm:
                 ymin_n, xmin_n, ymax_n, xmax_n = bbox
                 y1 = int((ymin_n / 1000.0) * h)
@@ -81,34 +81,36 @@ async def segment(request: Request):
                     clamp(x2, 1, w),
                     clamp(y2, 1, h)
                 ]
-                prompt_bbox = expand_bbox(*output_bbox, w, h)
                 original_target_bboxes.append(output_bbox)
                 layer_meta = layer_metas[len(pixel_bboxes)] if (
                     isinstance(layer_metas, list) and len(pixel_bboxes) < len(layer_metas)
                 ) else {}
+                # Compile explicit adjacent-instance evidence once per layer.
+                # The guard is used by candidate arbitration and probe review;
+                # it does not by itself enable ownership point prompts.
+                spatial_guard = build_spatial_ownership_guard(
+                    layer_meta or {},
+                    context_layers if isinstance(context_layers, list) else [],
+                    output_bbox,
+                    w,
+                    h
+                )
+                if spatial_guard.get("enabled"):
+                    layer_meta["_spatialOwnershipGuard"] = spatial_guard
+                else:
+                    layer_meta.pop("_spatialOwnershipGuard", None)
                 resolved_layer_strategy = get_layer_strategy(layer_meta or {})
                 layer_policy = resolve_mask_policy(layer_meta or {}, quality_profile)
-                is_food_product = layer_policy["selector"] == "compound_food"
-                # Restore the previous cloud-parity food path: food products
-                # use the expanded bbox for candidate/output parity.
-                pixel_bboxes.append(prompt_bbox if is_food_product else output_bbox)
-                if is_food_product:
-                    legacy_food_output_count += 1
-                # The expanded prompt gives SAM enough context to recover the
-                # complete hard object. The output remains constrained by the
-                # original bbox, so this must not be confused with output
-                # expansion.
+                prompt_bbox = expand_bbox(*output_bbox, w, h)
+                pixel_bboxes.append(output_bbox)
+                # Prompt context and output geometry are separate. Output
+                # expands only when the recovery audit establishes evidence.
                 sam_prompt_bboxes.append(prompt_bbox)
 
             print(
                 f"Using expanded SAM prompts by {int(BBOX_EXPAND_RATIO * 100)}% "
-                "with strict original-bbox output clipping"
+                "with semantic-bbox output clipping unless recovery verifies an extension"
             )
-            if legacy_food_output_count:
-                print(
-                    f"Food product legacy bbox parity enabled for {legacy_food_output_count} layer(s): "
-                    "expanded prompt bbox is also used for output"
-                )
             if requested_engine == "sam":
                 def sam_mask_provider(target_bbox, layer_meta, index):
                     layer_policy = resolve_mask_policy(layer_meta or {}, quality_profile)
@@ -135,64 +137,29 @@ async def segment(request: Request):
                         completion_layer and layer_policy["spatialCanonicalCompletion"]
                     )
                     # The post-processing stage may issue one local recovery
-                    # query. Record which model owns the accepted mask so that
-                    # recovery does not accidentally reload the other variant.
-                    # The completion marker identifies the second SAM pass
-                    # unambiguously. Do not allow a caller-provided model hint
-                    # to downgrade this pass back to B.
-                    force_completion_sam_l = completion_layer
-                    layer_meta["_samModelVariant"] = "l" if force_completion_sam_l else "b"
+                    # query. Start every SAM pass with B; the normal quality
+                    # gates below decide whether this request needs L. The
+                    # accepted model is recorded so refinement and matte
+                    # processing follow the selected candidate.
+                    initial_sam_variant = forced_sam_model_variant("b")
+                    layer_meta["_samModelVariant"] = initial_sam_variant
                     print(
                         f"SAM layer policy id={request_id} layer={layer_name} "
                         f"profile={layer_policy['profile']} phase={layer_policy['phase']} "
                         f"selector={layer_policy['selector']} matte={layer_policy['matteType']} "
                         f"spatialCanonical={layer_policy['spatialCanonicalCompletion']} "
+                        f"boundaryRecovery={bool(layer_policy.get('boundaryRecovery', {}).get('enabled'))} "
+                        f"boundaryMatte={bool(layer_policy.get('boundaryMatte', {}).get('enabled'))} "
+                        f"spatialOwnership={bool((layer_policy.get('spatialOwnership') or {}).get('enabled'))} "
                         f"instanceUnion={bool(layer_policy.get('completionOccluder') and strategy_type == 'furniture')} "
                         f"features={','.join(layer_policy['features'])} "
-                        f"imgsz={layer_policy['samImgSize']}"
+                        f"imgsz={layer_policy['samImgSize']} "
+                        f"forcedModel={initial_sam_variant.upper() if sam_l_forced() else 'off'}"
                     )
-                    if force_completion_sam_l:
-                        # This is exclusively the post-inpaint, second-SAM
-                        # path. It must not start with B or let B/L arbitration
-                        # retain a fragmented B mask. Initial extraction,
-                        # including all category-specific routes, is unchanged.
-                        print(
-                            f"SAM route for {layer_name}: model=L forced "
-                            "reason=completion_forced_l"
-                        )
-                        l_results, l_imgsz = run_sam_l_with_retry(
-                            img,
-                            prompt_bbox,
-                            strategy_type,
-                            layer_name,
-                            policy=layer_policy
-                        )
-                        candidate_masks = normalize_result_masks(
-                            l_results,
-                            w,
-                            h,
-                            interpolation=(
-                                cv2.INTER_LINEAR
-                                if (layer_policy["softEdge"] or layer_policy["baseStrategyType"] in HARD_EDGE_STRATEGIES)
-                                else cv2.INTER_NEAREST
-                            ),
-                            debug_label=(
-                                f"{layer_name} strategy={strategy_type} "
-                                f"model=L forced imgsz={l_imgsz}"
-                            )
-                        )
-                        del l_results
-                        if strategy_type == "soft_edge":
-                            forced_soft_edge_prompts = build_soft_edge_prompt_inputs(img, target_bbox)
-                            candidate_masks = filter_soft_edge_masks_by_points(
-                                candidate_masks,
-                                forced_soft_edge_prompts
-                            )
-                        layer_meta["_samSelectionRoute"] = "completion_forced_l"
-                        return candidate_masks
                     if (
                         layer_policy["selector"] == "compound_food" and
-                        not layer_policy["completionOccluder"]
+                        not layer_policy["completionOccluder"] and
+                        not (layer_policy.get("compoundComponentDiscovery") or {}).get("enabled")
                     ):
                         print(
                             f"SAM prompts for {layer_meta.get('name') or layer_ids[index] or index}: "
@@ -203,11 +170,12 @@ async def segment(request: Request):
                             prompt_bbox,
                             multimask_output=True,
                             imgsz=1024,
-                            model_variant="b"
+                            model_variant=initial_sam_variant
                         )
                         return normalize_result_masks(results, w, h)
 
                     soft_edge_prompts = None
+                    semantic_ownership_prompts = None
                     if strategy_type == "soft_edge":
                         soft_edge_prompts = build_soft_edge_prompt_inputs(img, target_bbox)
                         print(
@@ -216,10 +184,41 @@ async def segment(request: Request):
                             "strategy=soft_edge_color_guided"
                         )
                     else:
-                        print(
-                            f"SAM prompts for {layer_name}: "
-                            f"bbox-only strategy={strategy_type}"
-                        )
+                        ownership_config = layer_policy.get("semanticOwnershipPrompt") or {}
+                        if ownership_config.get("enabled"):
+                            semantic_ownership_prompts = build_sam_prompt_inputs(
+                                layer_meta,
+                                context_layers,
+                                target_bbox,
+                                w,
+                                h,
+                                include_boundary_negatives=bool(
+                                    ownership_config.get("includeBoundaryNegatives")
+                                ),
+                                prompt_bbox=prompt_bbox
+                            )
+                            print(
+                                f"SAM prompts for {layer_name}: "
+                                f"+{len((semantic_ownership_prompts.get('points') or [[]])[0])} "
+                                f"ownershipNegatives="
+                                f"{sum(1 for label in ((semantic_ownership_prompts.get('labels') or [[]])[0]) if label == 0)} "
+                                f"contextExcludes={semantic_ownership_prompts.get('ownershipExcludeCount', 0)} "
+                                f"intent={semantic_ownership_prompts.get('segmentationIntentAudit', {}).get('reason')} "
+                                f"intentComponents={semantic_ownership_prompts.get('segmentationIntentAudit', {}).get('componentCount', 0)} "
+                                f"spatialOwnership={bool((layer_policy.get('spatialOwnership') or {}).get('enabled'))} "
+                                "strategy=semantic_ownership"
+                            )
+                        else:
+                            ownership_state = layer_policy.get("spatialOwnership") or {}
+                            ownership_suffix = (
+                                " ownership=single_component_bbox_baseline"
+                                if ownership_state.get("enabled") else ""
+                            )
+                            print(
+                                f"SAM prompts for {layer_name}: "
+                                f"bbox-only strategy={strategy_type}{ownership_suffix}"
+                            )
+                    prompt_inputs = semantic_ownership_prompts or soft_edge_prompts
                     results = run_sam_bbox_inference(
                         img,
                         prompt_bbox,
@@ -227,9 +226,9 @@ async def segment(request: Request):
                         imgsz=(
                             layer_policy["samImgSize"]
                         ),
-                        points=soft_edge_prompts["points"] if soft_edge_prompts else None,
-                        labels=soft_edge_prompts["labels"] if soft_edge_prompts else None,
-                        model_variant="b"
+                        points=prompt_inputs["points"] if prompt_inputs else None,
+                        labels=prompt_inputs["labels"] if prompt_inputs else None,
+                        model_variant=initial_sam_variant
                     )
                     # Preserve the established raster mode for tables/chairs;
                     # profile classification must not silently change their
@@ -252,8 +251,86 @@ async def segment(request: Request):
                     # Ultralytics result before a possible B -> L switch so
                     # its GPU tensors do not keep B's inference memory alive.
                     del results
+                    sam_diagnostic_event(
+                        "b_candidates", masks=candidate_masks,
+                        targetBbox=target_bbox, promptBbox=prompt_bbox,
+                        policy=layer_policy,
+                        points=prompt_inputs["points"] if prompt_inputs else None,
+                        labels=prompt_inputs["labels"] if prompt_inputs else None
+                    )
                     if soft_edge_prompts:
                         candidate_masks = filter_soft_edge_masks_by_points(candidate_masks, soft_edge_prompts)
+                    positive_probe_enabled = bool(
+                        SAM_POSITIVE_PROBE_ENABLED and
+                        (layer_policy.get("positiveProbe") or {}).get("enabled")
+                    )
+                    if positive_probe_enabled:
+                        candidate_masks, positive_probe_audit = run_positive_probe(
+                            img,
+                            candidate_masks,
+                            target_bbox,
+                            prompt_bbox,
+                            layer_name,
+                            strategy_type=strategy_type,
+                            layer_meta=layer_meta,
+                            context_layers=context_layers,
+                            quality_profile=quality_profile
+                        )
+                        layer_meta["_positiveProbeAudit"] = positive_probe_audit
+                        sam_diagnostic_event("probe_decision", audit=positive_probe_audit)
+                        if positive_probe_audit.get("status") == "accepted":
+                            layer_meta["_samSelectionRoute"] = "b_positive_probe"
+                            if not (layer_policy.get("spatialOwnership") or {}).get("strictOutput"):
+                                layer_meta["_samEffectiveBbox"] = positive_probe_audit.get(
+                                    "effectiveBbox"
+                                )
+                        print(
+                            f"SAM positive probe for {layer_name}: "
+                            f"status={positive_probe_audit.get('status')} "
+                            f"reason={positive_probe_audit.get('reason')} "
+                            f"points={positive_probe_audit.get('positivePoints', 0)} "
+                            f"fillGain={positive_probe_audit.get('fillGain', 0)} "
+                            f"addedPixels={positive_probe_audit.get('addedPixels', 0)} "
+                            f"preserve={positive_probe_audit.get('preserve')} "
+                            f"preserveCore={positive_probe_audit.get('preserveCore')} "
+                            f"imageReview={positive_probe_audit.get('imageReview')} "
+                            f"connectedGrowth={positive_probe_audit.get('connectedGrowth')} "
+                            f"growth={positive_probe_audit.get('growth')} "
+                            f"growthGain={positive_probe_audit.get('growthGain')} "
+                            f"outsideAddedRatio={positive_probe_audit.get('outsideAddedRatio')} "
+                            f"contextConflictRatio={positive_probe_audit.get('contextConflictRatio')} "
+                            f"effectiveBbox={positive_probe_audit.get('effectiveBbox')} "
+                            f"rejections={positive_probe_audit.get('rejectionCounts', {})}"
+                        )
+                    compound_discovery_config = layer_policy.get("compoundComponentDiscovery") or {}
+                    if compound_discovery_config.get("enabled"):
+                        candidate_masks, compound_discovery_audit = run_compound_component_discovery(
+                            img,
+                            candidate_masks,
+                            target_bbox,
+                            layer_name,
+                            layer_meta=layer_meta,
+                            context_layers=context_layers,
+                            quality_profile=quality_profile,
+                            policy=layer_policy
+                        )
+                        layer_meta["_compoundComponentDiscovery"] = compound_discovery_audit
+                        sam_diagnostic_event(
+                            "compound_discovery_decision",
+                            masks=candidate_masks,
+                            audit=compound_discovery_audit,
+                            targetBbox=target_bbox
+                        )
+                        print(
+                            f"SAM compound component discovery for {layer_name}: "
+                            f"status={compound_discovery_audit.get('status')} "
+                            f"reason={compound_discovery_audit.get('reason')} "
+                            f"selected={compound_discovery_audit.get('selectedIndex')} "
+                            f"verifiedAddedPixels={compound_discovery_audit.get('verifiedAddedPixels')} "
+                            f"baselinePixels={compound_discovery_audit.get('baselinePixels')} "
+                            f"candidateCount={compound_discovery_audit.get('candidateCount')} "
+                            f"promptBbox={compound_discovery_audit.get('promptBbox')}"
+                        )
                     if layer_policy["allowLocalUpscale"]:
                         local_upscale, local_reason = should_run_local_upscale(
                             candidate_masks,
@@ -272,7 +349,7 @@ async def segment(request: Request):
                                 w,
                                 h,
                                 layer_name,
-                                model_variant="b",
+                                model_variant=initial_sam_variant,
                                 imgsz=LOCAL_UPSCALE_SAM_IMGSZ
                             )
                             if local_masks is not None and len(local_masks) > 0:
@@ -293,10 +370,81 @@ async def segment(request: Request):
                                     f"SAM local-upscale candidates for {layer_name}: "
                                     f"before={before_count} after={len(candidate_masks)}"
                                 )
-                    if layer_policy["allowModelEscalation"]:
-                        escalate, escalation_reason = should_escalate_sam_to_l(
+                    boundary_config = layer_policy.get("boundaryRecovery") or {}
+                    if boundary_config.get("enabled"):
+                        boundary_evidence = boundary_recovery_evidence(
                             candidate_masks,
                             target_bbox,
+                            strategy_type=strategy_type,
+                            layer_meta=layer_meta,
+                            context_layers=context_layers,
+                            policy=layer_policy
+                        )
+                        print(
+                            f"SAM boundary recovery evidence for {layer_name}: "
+                            f"needed={bool(boundary_evidence.get('needed'))} "
+                            f"boundaryTruncated={boundary_evidence.get('boundary_truncated')} "
+                            f"candidateDisagreement={boundary_evidence.get('candidate_disagreement')} "
+                            f"contextConflict={boundary_evidence.get('context_conflict')} "
+                            f"preserveCore={boundary_evidence.get('preserve_core')} "
+                            f"edgeType={boundary_evidence.get('edge_type')} "
+                            f"reason={boundary_evidence.get('reason')}"
+                        )
+                        if boundary_evidence.get("needed"):
+                            try:
+                                recovered_mask, recovery_audit = recover_boundary_with_sam_l(
+                                    img,
+                                    candidate_masks,
+                                    target_bbox,
+                                    prompt_bbox,
+                                    layer_name,
+                                    strategy_type=strategy_type,
+                                    layer_meta=layer_meta,
+                                    context_layers=context_layers,
+                                    policy=layer_policy
+                                )
+                                print(
+                                    f"SAM boundary recovery result for {layer_name}: "
+                                    f"{recovery_audit}"
+                                )
+                                layer_meta["_boundaryRecovery"] = {
+                                    **boundary_evidence,
+                                    **(recovery_audit or {})
+                                }
+                                if recovered_mask is not None and np.any(recovered_mask > 0.5):
+                                    candidate_masks = np.stack([recovered_mask], axis=0)
+                                    layer_meta["_samModelVariant"] = "l"
+                                    layer_meta["_samSelectionRoute"] = "boundary_recovery_l"
+                                    layer_meta["_samEffectiveBbox"] = recovery_audit.get("effectiveBbox")
+                                    return candidate_masks
+                                release_sam_model("l", reason="boundary_recovery_rejected")
+                            except Exception as error:
+                                print(
+                                    f"SAM boundary recovery failed for {layer_name}: {error}"
+                                )
+                                release_sam_model("l", reason="boundary_recovery_failed")
+                            # This capability has already performed its dedicated L
+                            # review. Preserve the established B result rather
+                            # than running a second, generic L arbitration pass.
+                            layer_meta["_samSelectionRoute"] = "boundary_recovery_b_fallback"
+                            return candidate_masks
+                    if layer_policy["allowModelEscalation"] and not sam_l_forced():
+                        arbitration_bbox, uses_effective_bbox = resolve_verified_effective_bbox(
+                            target_bbox,
+                            layer_meta.get("_samEffectiveBbox"),
+                            w,
+                            h
+                        )
+                        if (layer_policy.get("spatialOwnership") or {}).get("strictOutput"):
+                            arbitration_bbox, uses_effective_bbox = target_bbox, False
+                        if uses_effective_bbox:
+                            print(
+                                f"SAM B/L effective bbox for {layer_name}: "
+                                f"original={target_bbox} effective={arbitration_bbox}"
+                            )
+                        escalate, escalation_reason = should_escalate_sam_to_l(
+                            candidate_masks,
+                            arbitration_bbox,
                             strategy_type,
                             quality_profile=quality_profile,
                             completion_observation=completion_observation,
@@ -309,12 +457,22 @@ async def segment(request: Request):
                                 f"reason={escalation_reason}"
                             )
                             try:
+                                l_points = (
+                                    semantic_ownership_prompts["points"]
+                                    if semantic_ownership_prompts else None
+                                )
+                                l_labels = (
+                                    semantic_ownership_prompts["labels"]
+                                    if semantic_ownership_prompts else None
+                                )
                                 l_results, l_imgsz = run_sam_l_with_retry(
                                     img,
                                     prompt_bbox,
                                     strategy_type,
                                     layer_label,
-                                    policy=layer_policy
+                                    policy=layer_policy,
+                                    points=l_points,
+                                    labels=l_labels
                                 )
                                 l_masks = normalize_result_masks(
                                     l_results,
@@ -329,7 +487,7 @@ async def segment(request: Request):
                                 del l_results
                                 local_l_upscale, local_l_reason = should_run_l_local_upscale(
                                     candidate_masks,
-                                    target_bbox,
+                                    arbitration_bbox,
                                     strategy_type
                                 )
                                 if local_l_upscale:
@@ -340,7 +498,7 @@ async def segment(request: Request):
                                     local_l_masks = run_upscaled_hard_edge_bbox_inference(
                                         img,
                                         prompt_bbox,
-                                        target_bbox,
+                                        arbitration_bbox,
                                         w,
                                         h,
                                         layer_label,
@@ -367,7 +525,7 @@ async def segment(request: Request):
                                 candidate_masks, arbitration = arbitrate_sam_b_l_masks(
                                     candidate_masks,
                                     l_masks,
-                                    target_bbox,
+                                    arbitration_bbox,
                                     strategy_type=strategy_type,
                                     b_failure_reason=escalation_reason,
                                     completion_recovery=(
@@ -451,6 +609,12 @@ async def segment(request: Request):
                                                 candidate_masks = np.stack([cross_mask], axis=0)
                                     layer_meta["_samModelVariant"] = "l"
                                 elif arbitration == "b_kept_l_rejected":
+                                    # The selected silhouette is still B-led
+                                    # even when L supplied an accepted bounded
+                                    # edge measurement. Keep the B marker so a
+                                    # category-specific later post-process is
+                                    # not accidentally enabled by this generic
+                                    # boundary capability.
                                     layer_meta["_samModelVariant"] = "b"
                                     release_sam_model("l", reason="b_arbitration_kept")
                                 else:
@@ -485,18 +649,54 @@ async def segment(request: Request):
                             )
                     return candidate_masks
 
-                cutouts = process_prompted_cutouts(
-                    img,
-                    pixel_bboxes,
-                    layer_ids,
-                    layer_metas,
-                    context_layers,
-                    sam_mask_provider,
-                    "sam_bbox_prompt",
-                    refine_masks=True,
-                    original_target_bboxes=original_target_bboxes,
-                    quality_profile=quality_profile
+                shared_embedding_request = (
+                    SAM_SHARED_EMBEDDING_ENABLED and len(pixel_bboxes) > 1
                 )
+                positive_probe_request = bool(
+                    SAM_POSITIVE_PROBE_ENABLED and
+                    any(
+                        isinstance(meta, dict) and
+                        (resolve_mask_policy(meta, quality_profile).get("positiveProbe") or {}).get("enabled")
+                        for meta in layer_metas
+                    ) if isinstance(layer_metas, list) else False
+                )
+                def run_prompted_sam_cutouts():
+                    if shared_embedding_request or positive_probe_request:
+                        # Keep the shared predictor features alive for this
+                        # request. The layer prompts, multimask output and all
+                        # candidate/post-processing decisions remain independent.
+                        with sam_runtime_lock, sam_embedding_cache():
+                            return process_prompted_cutouts(
+                                img,
+                                pixel_bboxes,
+                                layer_ids,
+                                layer_metas,
+                                context_layers,
+                                sam_mask_provider,
+                                "sam_bbox_prompt",
+                                refine_masks=True,
+                                original_target_bboxes=original_target_bboxes,
+                                quality_profile=quality_profile
+                            )
+                    return process_prompted_cutouts(
+                        img,
+                        pixel_bboxes,
+                        layer_ids,
+                        layer_metas,
+                        context_layers,
+                        sam_mask_provider,
+                        "sam_bbox_prompt",
+                        refine_masks=True,
+                        original_target_bboxes=original_target_bboxes,
+                        quality_profile=quality_profile
+                    )
+
+                with sam_diagnostic_request(data, img, request_id), sam_request_metrics() as sam_metrics:
+                    cutouts = run_prompted_sam_cutouts()
+                    print(
+                        f"SAM request metrics id={request_id}: "
+                        f"{sam_metrics.summary()}"
+                    )
                 completion_request = any(
                     is_completion_segmentation_layer(meta)
                     for meta in layer_metas

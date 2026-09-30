@@ -7,7 +7,10 @@ import { getImageModel, isQwenImageFamilyModel } from '../../ai-services/gemini-
 // We'll need functions to generate mask, cutout, etc.
 // For now, we'll simulate the generation or use basic Gemini calls.
 
-const DISABLE_CLEAN_PLATE_FOR_FASTSAM_TEST = false;
+// Temporarily bypass AI clean-plate/background purification while validating
+// the SAM extraction path. Keep the implementation below intact so it can be
+// re-enabled without restoring or rewriting any code.
+const DISABLE_CLEAN_PLATE_FOR_FASTSAM_TEST = true;
 const USE_EXPERIMENTAL_CLEAN_PLATE_TEST_ROUTER = true;
 
 function cloneSerializable(value) {

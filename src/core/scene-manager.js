@@ -16,6 +16,7 @@ export function buildSceneDocument(file, imageDataUrl, imageSize, rawLayers) {
         renderMode: layer.renderMode || null,
         compositeRole: layer.compositeRole || null,
         parentLayerId: layer.parentLayerId || null,
+        segmentationIntent: layer.segmentationIntent || null,
         textContent: layer.textContent || "",
         fontStyle: layer.fontStyle || "",
         promptHint: layer.promptHint || "",
@@ -42,6 +43,7 @@ export function buildSceneDocument(file, imageDataUrl, imageSize, rawLayers) {
             promptHint: layer.promptHint,
             designRole: layer.designRole || "unknown",
             renderMode: layer.renderMode || null,
+            segmentationIntent: layer.segmentationIntent || null,
             categoryConfidence: undefined,
         },
 

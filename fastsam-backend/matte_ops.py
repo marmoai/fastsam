@@ -300,11 +300,145 @@ def build_prompt_seed_mask(target_bbox, img_w, img_h, negative_mask=None):
     return fallback
 
 
-def build_sam_prompt_inputs(layer_meta, context_layers, target_bbox, img_w, img_h):
+def _intent_pixel_bbox(bbox, img_w, img_h):
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return None
+    try:
+        ymin, xmin, ymax, xmax = [float(value) for value in bbox]
+    except (TypeError, ValueError):
+        return None
+    if ymax <= ymin or xmax <= xmin:
+        return None
+    return [
+        clamp(int(round(xmin * img_w / 1000.0)), 0, img_w - 1),
+        clamp(int(round(ymin * img_h / 1000.0)), 0, img_h - 1),
+        clamp(int(round(xmax * img_w / 1000.0)), 1, img_w),
+        clamp(int(round(ymax * img_h / 1000.0)), 1, img_h)
+    ]
+
+
+def _intersect_prompt_boxes(a, b):
+    if not a or not b:
+        return None
+    x1, y1 = max(a[0], b[0]), max(a[1], b[1])
+    x2, y2 = min(a[2], b[2]), min(a[3], b[3])
+    return [x1, y1, x2, y2] if x2 > x1 and y2 > y1 else None
+
+
+def build_spatial_intent_prompt_inputs(layer_meta, target_bbox, prompt_bbox, img_w, img_h):
+    """Compile spatial ownership into sparse SAM points, never bbox masks."""
+    config = get_spatial_ownership_config(layer_meta or {})
+    intent = (layer_meta or {}).get("segmentationIntent") or {}
+    instance_guard = (layer_meta or {}).get("_spatialOwnershipGuard") or {}
+    atomic_instance_entries = list(instance_guard.get("entries") or [])
+    composite_prompt = bool(config.get("promptEnabled"))
+    atomic_instance_prompt = bool(
+        config.get("atomicInstancePromptEligible") and
+        atomic_instance_entries
+    )
+    if not (composite_prompt or atomic_instance_prompt):
+        return {
+            "enabled": False,
+            "reason": (
+                "single_component_bbox_baseline"
+                if config.get("enabled") else config.get("reason")
+            ),
+            "positive": [],
+            "negative": []
+        }
+    included = []
+    for component in intent.get("includedComponents") or []:
+        box = _intent_pixel_bbox(component.get("bbox") if isinstance(component, dict) else None, img_w, img_h)
+        box = _intersect_prompt_boxes(box, target_bbox)
+        if box and bbox_area(box) >= 16:
+            included.append(box)
+    if not included:
+        return {"enabled": False, "reason": "no_component_anchor", "positive": [], "negative": []}
+    positive = []
+    for box in included[:3]:
+        core = shrink_bbox(box, ratio=0.28)
+        point = sample_points_in_bbox(core if bbox_area(core) >= 4 else box, [(0.5, 0.5)])[0]
+        if point not in positive:
+            positive.append(point)
+    negative = []
+    # A composite can use declared exclusions. For a single atomic target,
+    # only a sibling verified against this request may supply a negative point.
+    negative_entries = (
+        atomic_instance_entries if atomic_instance_prompt else
+        list(intent.get("excludedAdjacentObjects") or [])[:2]
+    )
+    for entry in negative_entries[:2]:
+        raw_bbox = entry.get("bbox") if isinstance(entry, dict) else None
+        box = raw_bbox if atomic_instance_prompt else _intent_pixel_bbox(raw_bbox, img_w, img_h)
+        box = _intersect_prompt_boxes(box, prompt_bbox)
+        if not box:
+            continue
+        for point in sample_points_in_bbox(box, [(0.16, 0.16), (0.84, 0.16), (0.16, 0.84), (0.84, 0.84), (0.5, 0.5)]):
+            if not point_in_any_bbox(point, included) and point not in positive:
+                negative.append(point)
+                break
+    # A single generic positive point changes SAM's candidate ranking. Keep
+    # the September 16 bbox-only behavior unless ownership provides either a
+    # safe exclusion point or multiple explicit components that must remain
+    # together. A coarse overlapping sibling BBOX is not sufficient evidence.
+    has_ownership_evidence = bool(negative) or len(included) >= 2
+    return {
+        "enabled": bool(positive and has_ownership_evidence),
+        "reason": (
+            "accepted" if positive and has_ownership_evidence else
+            "no_safe_ownership_evidence" if positive else
+            "no_safe_anchor"
+        ),
+        "positive": positive, "negative": negative, "componentCount": len(included),
+        "mode": "atomic_instance" if atomic_instance_prompt else "composite_assembly",
+        "excludedCount": len(intent.get("excludedAdjacentObjects") or []),
+        "confidence": config.get("confidence")
+    }
+
+
+def build_sam_prompt_inputs(
+    layer_meta,
+    context_layers,
+    target_bbox,
+    img_w,
+    img_h,
+    include_boundary_negatives=False,
+    prompt_bbox=None
+):
+    """Translate semantic/context metadata into conservative SAM ownership prompts.
+
+    Positive points describe the target core. Negative points are restricted to
+    explicit semantic conflicts or strong sibling exclusions. Bbox borders are
+    not negative by default because a valid subject can touch its semantic box.
+    """
     strategy = get_layer_strategy(layer_meta or {})
     strategy_type = strategy.get("type")
+    intent_prompt = build_spatial_intent_prompt_inputs(
+        layer_meta or {}, target_bbox, prompt_bbox or target_bbox, img_w, img_h
+    )
 
-    exclude_entries = build_exclude_bboxes(layer_meta or {}, context_layers or [], target_bbox, img_w, img_h)
+    # The ownership contract is valid, but its coarse component rectangles
+    # supplied no safe sparse evidence. Do not fall through to generic points
+    # here: that would silently turn a bbox-only layer into a different route.
+    if (
+        get_spatial_ownership_config(layer_meta or {}).get("promptEnabled") and
+        not intent_prompt.get("enabled")
+    ):
+        return {
+            "points": None,
+            "labels": None,
+            "labelCleanupMask": np.zeros((img_h, img_w), dtype=bool),
+            "flatCleanupMask": np.zeros((img_h, img_w), dtype=bool),
+            "strongExcludeMask": np.zeros((img_h, img_w), dtype=bool),
+            "strategyType": strategy_type,
+            "ownershipExcludeCount": 0,
+            "ownershipStrongExcludeCount": 0,
+            "segmentationIntentAudit": intent_prompt
+        }
+
+    exclude_entries = build_semantic_ownership_bboxes(
+        layer_meta or {}, context_layers or [], target_bbox, img_w, img_h
+    )
     strong_excludes = [entry for entry in exclude_entries if is_strong_exclude(entry)]
     strong_exclude_mask = build_exclude_mask(strong_excludes, img_w, img_h) if strong_excludes else np.zeros((img_h, img_w), dtype=bool)
     foreground_context_mask = decode_completion_foreground_context_mask(
@@ -320,7 +454,7 @@ def build_sam_prompt_inputs(layer_meta, context_layers, target_bbox, img_w, img_
         negative_mask |= foreground_context_mask
     label_context_entries = []
 
-    if strategy_type == "food_product":
+    if not intent_prompt["enabled"] and strategy_type == "food_product":
         # Food/menu layouts are fragile when we push negative prompts into SAM.
         # Keep extraction generous and handle cleanup in a later dedicated pass.
         label_context_entries = []
@@ -328,7 +462,10 @@ def build_sam_prompt_inputs(layer_meta, context_layers, target_bbox, img_w, img_
         flat_cleanup_mask = np.zeros((img_h, img_w), dtype=bool)
 
     seed_mask = build_prompt_seed_mask(target_bbox, img_w, img_h, negative_mask=negative_mask)
-    if strategy_type == "food_product":
+    if intent_prompt["enabled"]:
+        # Do not overwrite explicit component anchors with generic seed points.
+        positive_points = list(intent_prompt["positive"])
+    elif strategy_type == "food_product":
         positive_points = build_food_prompt_positive_points(target_bbox, [])
         positive_points.extend(build_food_positive_points_from_mask(seed_mask, target_bbox) or [])
     else:
@@ -342,25 +479,33 @@ def build_sam_prompt_inputs(layer_meta, context_layers, target_bbox, img_w, img_
         negative_points = []
     elif np.any(label_cleanup_mask):
         negative_points.extend(build_negative_points_from_mask(label_cleanup_mask, max_points=4))
-    if strong_excludes:
-        negative_points.extend(build_negative_points_from_mask(strong_exclude_mask, max_points=4))
-    if strategy_type != "food_product":
+    if exclude_entries and not intent_prompt["enabled"]:
+        negative_points.extend(
+            build_negative_points_from_context_entries(exclude_entries, max_entries=2)
+        )
+    if intent_prompt["enabled"]:
+        negative_points.extend(intent_prompt["negative"])
+    if include_boundary_negatives and strategy_type != "food_product":
         negative_points.extend(build_boundary_negative_points(seed_mask, target_bbox, max_points=4))
 
     prompt_points = []
     prompt_labels = []
     seen = set()
+    positive_coordinates = set()
     for point in positive_points:
-        key = (int(point[0]), int(point[1]), 1)
+        coordinate = (int(point[0]), int(point[1]))
+        key = (*coordinate, 1)
         if key in seen:
             continue
         seen.add(key)
+        positive_coordinates.add(coordinate)
         prompt_points.append([key[0], key[1]])
         prompt_labels.append(1)
 
     for point in negative_points:
-        key = (int(point[0]), int(point[1]), 0)
-        if key in seen:
+        coordinate = (int(point[0]), int(point[1]))
+        key = (*coordinate, 0)
+        if key in seen or coordinate in positive_coordinates:
             continue
         seen.add(key)
         prompt_points.append([key[0], key[1]])
@@ -379,7 +524,10 @@ def build_sam_prompt_inputs(layer_meta, context_layers, target_bbox, img_w, img_
         "labelCleanupMask": label_cleanup_mask,
         "flatCleanupMask": flat_cleanup_mask,
         "strongExcludeMask": strong_exclude_mask,
-        "strategyType": strategy_type
+        "strategyType": strategy_type,
+        "ownershipExcludeCount": len(exclude_entries),
+        "ownershipStrongExcludeCount": len(strong_excludes),
+        "segmentationIntentAudit": intent_prompt
     }
 
 
@@ -605,7 +753,7 @@ def despill_soft_edge_image(img, alpha, target_bbox, context_bbox=None):
     return output
 
 
-def build_hard_edge_alpha(mask, target_bbox):
+def build_hard_edge_alpha(mask, target_bbox, preserve_accepted_mask=False):
     """Anti-alias the accepted silhouette without expanding or blurring it."""
     x1, y1, x2, y2 = target_bbox
     crop_probability = np.clip(
@@ -646,6 +794,14 @@ def build_hard_edge_alpha(mask, target_bbox):
         (crop_w, crop_h),
         interpolation=cv2.INTER_AREA
     )
+    if preserve_accepted_mask:
+        # Contour vertices sit on pixel centers. Supersampling can otherwise
+        # make an accepted one-pixel edge fall below the visible-alpha cutoff.
+        refined_crop = np.where(
+            crop_binary > 0,
+            np.maximum(refined_crop, 128),
+            0
+        ).astype(np.uint8)
 
     alpha = np.zeros(mask.shape, dtype=np.uint8)
     alpha[y1:y2, x1:x2] = refined_crop
@@ -664,7 +820,7 @@ def generate_table_safe_matte(mask, target_bbox):
     constrained = constrain_mask_to_bbox(mask, target_bbox)
     if not np.any(constrained > 0.0):
         return dilate_and_feather_mask(constrained)
-    alpha = build_hard_edge_alpha(constrained, target_bbox)
+    alpha = build_hard_edge_alpha(constrained, target_bbox, preserve_accepted_mask=True)
     # Keep fractional contour coverage from crossing a concavity or a small
     # hole in the accepted silhouette.
     return np.where(constrained > 0.5, alpha, 0).astype(np.uint8)
@@ -1343,7 +1499,10 @@ def select_best_refine_mask(candidate_masks, coarse_mask_crop, local_bbox, strat
     return best_mask
 
 
-def refine_mask_with_local_sam(img, coarse_mask, target_bbox, cleanup_mask=None, strategy_type=None):
+def refine_mask_with_local_sam(
+    img, coarse_mask, target_bbox, cleanup_mask=None, strategy_type=None,
+    model_variant="b", boundary_only=False, refine_config=None
+):
     coarse_binary = coarse_mask > 0.5
     coarse_bbox = mask_bbox(coarse_binary)
     if not coarse_bbox:
@@ -1388,7 +1547,8 @@ def refine_mask_with_local_sam(img, coarse_mask, target_bbox, cleanup_mask=None,
             # passing them to SAM. Point prompts avoid the incompatible
             # crop-size mask path while retaining the coarse mask as guidance.
             masks=None,
-            multimask_output=True
+            multimask_output=True,
+            model_variant=model_variant
         )
         candidate_masks = normalize_result_masks(results, crop_w, crop_h)
     except Exception as error:
@@ -1410,6 +1570,47 @@ def refine_mask_with_local_sam(img, coarse_mask, target_bbox, cleanup_mask=None,
         min_overlap_ratio = 0.60
     if refined_area < coarse_area * min_area_ratio or preserved_overlap < coarse_area * min_overlap_ratio:
         return coarse_mask, False
+
+    if boundary_only:
+        refine_config = refine_config or {}
+        min_side = max(1, min(coarse_bbox[2] - coarse_bbox[0], coarse_bbox[3] - coarse_bbox[1]))
+        band_radius = max(2, min(14, int(round(min_side * float(refine_config.get("bandRatio", 0.024))))))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (band_radius * 2 + 1, band_radius * 2 + 1))
+        stable_core = cv2.erode(coarse_binary.astype(np.uint8), kernel, iterations=1) > 0
+        boundary_band = (cv2.dilate(coarse_binary.astype(np.uint8), kernel, iterations=1) > 0) & (~stable_core)
+        proposed_full = coarse_binary.copy()
+        proposed_full[crop_y1:crop_y1 + crop_h, crop_x1:crop_x1 + crop_w] = refined_crop_mask > 0.5
+        refined_binary = (coarse_binary & (~boundary_band)) | (proposed_full & boundary_band)
+        coarse_area = max(1, int(np.count_nonzero(coarse_binary)))
+        changed = refined_binary ^ coarse_binary
+        added = refined_binary & (~coarse_binary)
+        removed = coarse_binary & (~refined_binary)
+        core_area = max(1, int(np.count_nonzero(stable_core)))
+        core_preserve = int(np.count_nonzero(refined_binary & stable_core)) / core_area
+        baseline_preserve = int(np.count_nonzero(refined_binary & coarse_binary)) / coarse_area
+        changed_area = int(np.count_nonzero(changed))
+        max_changed = max(64, int(coarse_area * float(refine_config.get("maxChangedRatio", 0.10))))
+        max_removed = max(32, int(coarse_area * float(refine_config.get("maxRemovedRatio", 0.015))))
+        max_added = max(32, int(coarse_area * float(refine_config.get("maxAddedRatio", 0.10))))
+        candidate_overlap = int(np.count_nonzero((refined_crop_mask > 0.5) & coarse_crop)) / max(1, int(np.count_nonzero(coarse_crop)))
+        safe = (
+            core_preserve >= float(refine_config.get("minCorePreserve", 0.985)) and
+            baseline_preserve >= float(refine_config.get("minBaselinePreserve", 0.985)) and
+            candidate_overlap >= float(refine_config.get("minCandidateOverlap", 0.94)) and
+            changed_area <= max_changed and
+            int(np.count_nonzero(removed)) <= max_removed and
+            int(np.count_nonzero(added)) <= max_added
+        )
+        print(
+            f"Local SAM boundary refine {'accepted' if safe else 'rejected'} "
+            f"model={str(model_variant).upper()} bandRadius={band_radius} "
+            f"changed={changed_area} added={int(np.count_nonzero(added))} "
+            f"removed={int(np.count_nonzero(removed))} "
+            f"corePreserve={core_preserve:.4f} overlap={candidate_overlap:.4f}"
+        )
+        if not safe:
+            return coarse_mask, False
+        return refined_binary.astype(np.float32), True
 
     refined_full = coarse_binary.astype(np.float32)
     refined_full[crop_y1:crop_y1 + crop_h, crop_x1:crop_x1 + crop_w] = refined_crop_mask

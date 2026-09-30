@@ -4,6 +4,9 @@ This layer translates metadata into capabilities. It does not run models or
 touch HTTP state, which keeps category behavior testable and centralized.
 """
 
+import os
+import re
+
 from sam_runtime import *
 
 
@@ -12,6 +15,14 @@ def normalize_sam_quality_profile(profile):
     if value in {"completion", "completion_candidate", "completion_review", "canonical_completion"}:
         return "completion"
     return "publish"
+
+
+def is_price_like_text(text):
+    value = str(text or "").lower()
+    return any(token in value for token in [
+        "price_badge", "price", "badge", "circle", "round", "coin", "sticker", "$",
+        "价格", "价签", "徽章"
+    ])
 
 
 def is_completion_segmentation_layer(layer_meta):
@@ -34,6 +45,66 @@ def _get_legacy_layer_strategy(layer_meta):
         str(layer_meta.get("category", "")),
         str(layer_meta.get("runtimeType", ""))
     ]).lower()
+
+    intent = layer_meta.get("segmentationIntent")
+    intent_confidence = 0.0
+    if isinstance(intent, dict):
+        try:
+            intent_confidence = float(intent.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            intent_confidence = 0.0
+
+    # A high-confidence tight atomic-object contract is stronger than the
+    # broad upstream food/product label. Keep these hard silhouettes on the
+    # shared hard-product candidate and matte route; the generic semantic
+    # identity checks still prevent adjacent layers from being absorbed.
+    if (
+        extraction_profile == "layout_embedded_product" and
+        isinstance(intent, dict) and
+        str(intent.get("targetKind") or "").lower() == "atomic_object" and
+        str(intent.get("bboxRole") or "").lower() == "tight_subject" and
+        intent_confidence >= 0.90 and
+        semantic_type not in {"person", "person_character"}
+    ):
+        return {
+            "type": "hard_product",
+            "max_fill": 0.88,
+            "max_merged_fill": 0.86,
+            "max_attachment_distance": 18,
+            "allow_attachments": True,
+            "prefer_rectangular": False,
+            "max_masks": 6,
+            "require_overlap_for_attachments": False
+        }
+
+    # Plant layers commonly contain narrow leaves/fronds rather than one
+    # filled silhouette. Keep their low-fill SAM parts eligible for the
+    # established hard-product attachment selector.
+    if semantic_type == "decor_plant" and design_role == "scene_object":
+        return {
+            "type": "hard_product",
+            "max_fill": 0.88,
+            "max_merged_fill": 0.86,
+            "max_attachment_distance": 18,
+            "allow_attachments": True,
+            "prefer_rectangular": False,
+            "max_masks": 6,
+            "require_overlap_for_attachments": False
+        }
+
+    if any(token in str(layer_meta.get("name", "")).lower() for token in [
+        "羽毛", "羽绒", "羽饰", "窗纱", "薄纱", "纱帘", "透明织物"
+    ]):
+        return {
+            "type": "soft_edge",
+            "max_fill": 0.96,
+            "max_merged_fill": 0.96,
+            "max_attachment_distance": 24,
+            "allow_attachments": True,
+            "prefer_rectangular": False,
+            "max_masks": 8,
+            "require_overlap_for_attachments": False
+        }
 
     # layout_embedded_product is a broad upstream profile used for poster
     # subjects, but it can also be attached to a physical surface by the
@@ -80,7 +151,8 @@ def _get_legacy_layer_strategy(layer_meta):
     # An explicit person/character name is stronger evidence than that broad
     # label. Route it as one hard entity before layout_embedded_product would
     # otherwise send it through compound-food expansion and cleanup.
-    if any(token in profile_text for token in [
+    person_profile_text = re.sub(r"\bsemantic_object\b", "", profile_text)
+    if any(token in person_profile_text for token in [
         "person", "people", "woman", "man", "girl", "boy", "portrait",
         "character", "figure", "人物", "女子", "女人", "女孩", "男孩",
         "男性", "女性", "肖像", "角色"
@@ -512,7 +584,10 @@ def get_layer_strategy(layer_meta):
     else:
         features.add("hard_edge")
 
-    if base_type in {"food_product", "decor_arrangement"} or any(token in text for token in [
+    if base_type in {"food_product", "decor_arrangement"} or (
+        str(meta.get("semanticType", "")).lower() == "decor_plant" and
+        str(meta.get("designRole", "")).lower() == "scene_object"
+    ) or any(token in text for token in [
         "compound", "arrangement", "plate", "dish", "meal", "food", "食物", "菜品",
         "餐盘", "组合", "花艺", "插花"
     ]):
@@ -565,6 +640,221 @@ def get_layer_strategy(layer_meta):
     return result
 
 
+def get_boundary_recovery_config(layer_meta=None, strategy=None):
+    """Resolve boundary recovery as a capability, not an object category."""
+    meta = layer_meta or {}
+    strategy = strategy or get_layer_strategy(meta)
+    features = set(strategy.get("features", []))
+    phase = strategy.get("phase", "initial")
+    edge_type = (
+        "soft_edge" if "soft_edge" in features else
+        "text" if "text_overlap" in features else
+        "hard_edge"
+    )
+    # Text and soft silhouettes keep their established specialized alpha paths.
+    # They still have an explicit edge_type here, so future recovery changes
+    # can tune parameters without creating another routing branch.
+    enabled = bool(
+        phase == "initial" and
+        edge_type == "hard_edge" and
+        not bool(meta.get("completionOccluder")) and
+        strategy.get("baseStrategyType") != "flat_shape"
+    )
+    return {
+        "enabled": enabled,
+        "edgeType": edge_type,
+        "minTouchCount": 4,
+        "lowFillThreshold": 0.42,
+        "recoveryTriggerFill": 0.52,
+        "disagreementTriggerFill": 0.52,
+        "minAddedPixels": 32,
+        "minAddedRatio": 0.025,
+        "minPreserveCore": 0.90,
+        "maxGrowth": 2.20,
+        "maxPromptAreaRatio": 0.92,
+        "minAttachedGrowth": 0.78,
+        "maxContextConflictRatio": 0.16
+    }
+
+
+def get_semantic_ownership_prompt_config(layer_meta=None, strategy=None):
+    """Resolve semantic ownership prompting as a shared capability."""
+    meta = layer_meta or {}
+    strategy = strategy or get_layer_strategy(meta)
+    features = set(strategy.get("features", []))
+    phase = strategy.get("phase", "initial")
+    edge_type = (
+        "soft_edge" if "soft_edge" in features else
+        "text" if "text_overlap" in features else
+        "hard_edge"
+    )
+    spatial_ownership = get_spatial_ownership_config(meta, strategy)
+    instance_guard = meta.get("_spatialOwnershipGuard") or {}
+    has_verified_atomic_sibling = bool(instance_guard.get("entries"))
+    return {
+        "enabled": bool(
+            # Ownership is evidence-driven, not domain-driven. A flat poster
+            # can contain overlapping raster objects just as an interior can.
+            # The prompt compiler still refuses to emit points without safe
+            # component/exclusion evidence, preserving the bbox-only baseline.
+            (
+                spatial_ownership["promptEnabled"] or
+                (
+                    spatial_ownership.get("atomicInstancePromptEligible") and
+                    has_verified_atomic_sibling
+                )
+            ) and
+            phase == "initial" and
+            edge_type == "hard_edge" and
+            strategy.get("baseStrategyType") != "flat_shape" and
+            not bool(meta.get("completionOccluder"))
+        ),
+        "edgeType": edge_type,
+        "includeBoundaryNegatives": False,
+        "spatialOwnership": spatial_ownership
+    }
+
+
+def get_spatial_ownership_config(layer_meta=None, strategy=None):
+    """Enable ownership guidance only for evidenced raster atomic assets.
+
+    A sibling bbox is not a pixel mask.  This capability authorizes sparse SAM
+    point prompts and locks output geometry only when Gemini supplied a
+    high-confidence ownership contract. Legacy metadata without an explicit
+    contract remains on the established September 16 bbox-only path.
+    """
+    meta = layer_meta or {}
+    strategy = strategy or get_layer_strategy(meta)
+    intent = meta.get("segmentationIntent")
+    if not isinstance(intent, dict):
+        return {
+            "enabled": False,
+            "promptEnabled": False,
+            "strictOutput": False,
+            "reason": "missing_intent"
+        }
+    try:
+        confidence = float(intent.get("confidence"))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    included = intent.get("includedComponents")
+    excluded = intent.get("excludedAdjacentObjects")
+
+    def box_area(box):
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            return 0.0
+        try:
+            ymin, xmin, ymax, xmax = [float(value) for value in box]
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, ymax - ymin) * max(0.0, xmax - xmin)
+
+    def intersection_area(first, second):
+        if not isinstance(first, (list, tuple)) or not isinstance(second, (list, tuple)):
+            return 0.0
+        try:
+            ymin = max(float(first[0]), float(second[0]))
+            xmin = max(float(first[1]), float(second[1]))
+            ymax = min(float(first[2]), float(second[2]))
+            xmax = min(float(first[3]), float(second[3]))
+        except (TypeError, ValueError, IndexError):
+            return 0.0
+        return max(0.0, ymax - ymin) * max(0.0, xmax - xmin)
+
+    # A component rectangle that is wholly covered by the target rectangle
+    # cannot provide a safe negative ownership point.  Treating that metadata
+    # as strict evidence is what incorrectly routed flat raster layers into
+    # tight-subject path.  Require either multiple included components or an
+    # exclusion with a verifiable region outside the included components.
+    safe_exclusion = False
+    for entry in excluded if isinstance(excluded, list) else []:
+        entry_box = entry.get("bbox") if isinstance(entry, dict) else None
+        entry_area = box_area(entry_box)
+        if entry_area <= 0:
+            continue
+        covered_area = sum(
+            intersection_area(entry_box, component.get("bbox"))
+            for component in (included if isinstance(included, list) else [])
+            if isinstance(component, dict)
+        )
+        if entry_area - min(entry_area, covered_area) >= 16:
+            safe_exclusion = True
+            break
+    ownership_evidence = bool(
+        isinstance(included, list) and len(included) >= 2
+    ) or safe_exclusion
+    enabled = bool(
+        strategy.get("phase") == "initial" and
+        "hard_edge" in set(strategy.get("features", [])) and
+        intent.get("targetKind") in {"atomic_object", "composite_assembly"} and
+        isinstance(included, list) and len(included) > 0 and
+        confidence >= 0.85 and
+        ownership_evidence
+    )
+    # An atomic asset can describe its own physical parts (for example a
+    # tabletop and its legs). That alone is not evidence to change SAM's
+    # bbox-only proposal. It additionally needs a runtime-verified sibling.
+    atomic_instance_prompt_eligible = bool(
+        enabled and
+        intent.get("targetKind") == "atomic_object" and
+        intent.get("bboxRole") == "tight_subject" and
+        safe_exclusion
+    )
+    # Composite assemblies can use their declared component anchors directly.
+    # Atomic prompts remain disabled until the API proves the exclusion matches
+    # an actual nearby context sibling.
+    prompt_enabled = bool(
+        enabled and
+        intent.get("targetKind") == "composite_assembly" and
+        isinstance(included, list) and
+        len(included) >= 2
+    )
+    return {
+        "enabled": enabled,
+        "promptEnabled": prompt_enabled,
+        "atomicInstancePromptEligible": atomic_instance_prompt_eligible,
+        # A tight subject is a valid output boundary only when the semantic
+        # contract itself is present.  The core checks candidate containment
+        # before enforcing it, so an incomplete box cannot cut a chair/sofa.
+        "strictOutput": bool(enabled and intent.get("bboxRole") == "tight_subject"),
+        "reason": "accepted" if enabled else (
+            "no_safe_ownership_evidence" if confidence >= 0.85 else
+            "not_confident_atomic_intent"
+        ),
+        "confidence": round(confidence, 3),
+        "bboxRole": intent.get("bboxRole")
+    }
+
+
+def get_positive_probe_config(layer_meta=None, strategy=None):
+    """Resolve positive-point recovery from capabilities, never categories."""
+    meta = layer_meta or {}
+    strategy = strategy or get_layer_strategy(meta)
+    features = set(strategy.get("features", []))
+    phase = strategy.get("phase", "initial")
+    edge_type = (
+        "soft_edge" if "soft_edge" in features else
+        "text" if "text_overlap" in features else
+        "hard_edge"
+    )
+    return {
+        "enabled": bool(
+            phase == "initial" and
+            edge_type == "hard_edge" and
+            strategy.get("baseStrategyType") != "flat_shape" and
+            not bool(meta.get("completionOccluder"))
+        ),
+        "edgeType": edge_type,
+        "minPreserveCore": 0.98,
+        "minFillGain": 0.025,
+        "minGrowthGain": 0.025,
+        "maxGrowth": 1.45,
+        "minConnectedGrowth": 0.35,
+        "maxOutsideAddedRatio": 0.55,
+        "maxContextConflictRatio": 0.12
+    }
+
+
 # The legacy type names below are implementation details kept for compatibility
 # with the existing matte helpers. Routing and quality decisions must use this
 # policy instead of growing another object-name branch.
@@ -588,6 +878,137 @@ def resolve_mask_policy(layer_meta=None, quality_profile="publish"):
     compound = "compound" in features
     spatial = profile == "spatial_design"
     spatial_canonical_completion = bool(strategy.get("spatialCanonicalCompletion"))
+    boundary_recovery = get_boundary_recovery_config(
+        layer_meta or {},
+        strategy=strategy
+    )
+    semantic_ownership_prompt = get_semantic_ownership_prompt_config(
+        layer_meta or {},
+        strategy=strategy
+    )
+    # A tight atomic spatial asset with an explicit sibling exclusion must not
+    # trigger the optional bbox-expanding L recovery route.  Its normal B mask
+    # and positive probe remain available inside the original semantic bbox.
+    spatial_ownership = get_spatial_ownership_config(layer_meta or {}, strategy)
+    if spatial_ownership.get("enabled"):
+        boundary_recovery = {**boundary_recovery, "enabled": False}
+    positive_probe = get_positive_probe_config(
+        layer_meta or {},
+        strategy=strategy
+    )
+    compound_component_discovery = {
+        # Composition is a capability signal. It does not change the
+        # established person/object recovery thresholds or routes.
+        "enabled": bool(
+            compound and
+            phase == "initial" and
+            boundary_recovery.get("edgeType") == "hard_edge" and
+            not completion_occluder
+        ),
+        "promptExpandRatio": 0.36,
+        "minCorePreserve": 0.97,
+        "minComponentAreaRatio": 0.0025,
+        "maxGrowthRatio": 0.75,
+        "maxContextConflictRatio": 0.22,
+        "maxContextComponentAreaRatio": 0.02,
+        "maxStrictOwnershipConflictRatio": 0.18,
+        "maxDetachedDistance": 18,
+        "minComponentFill": 0.42,
+        "maxEnvelopeFill": 0.40,
+        "maxPromptEdgeFill": 0.55,
+        "minContainedEdgeEnvelopeTargetRatio": 0.95,
+        "targetEdgeMarginRatio": 0.05,
+        "minEdgeEnvelopeHeightRatio": 0.35,
+        "minEdgeEnvelopeWidthRatio": 0.35
+    }
+    interior_hole_recovery = {
+        # This is an evidence-gated capability, not a category route. It is
+        # evaluated for hard-edge SAM masks and remains a no-op for ordinary
+        # masks without substantial enclosed holes.
+        "enabled": bool(
+            phase == "initial" and
+            boundary_recovery.get("edgeType") == "hard_edge" and
+            not completion_occluder
+        ),
+        "minHolePixels": 64,
+        "minHoleRatio": 0.008,
+        # Individual holes can be fragmented by image texture or a coarse
+        # SAM contour. Filter only tiny speckles per component, then apply the
+        # substantial-hole threshold to their aggregate area.
+        "minHoleComponentPixels": 8,
+        "minRingSupport": 0.72,
+        "maxHoleCount": 24,
+        "maxProbePoints": 4,
+        "minHoleFillRatio": 0.25,
+        # SAM's positive-point mask may include a broad surrounding object
+        # envelope while still proving that the audited hole belongs to the
+        # subject. The final merge clips that verified growth to the audited
+        # hole union, so a high-confidence hole fill can be accepted without
+        # importing the envelope.
+        "minClippedHoleFillRatio": 0.90,
+        "minClippedCandidateCoreOverlap": 0.90,
+        "minPreserveCore": 0.98,
+        "maxAddedRatio": 0.16,
+        "maxOutsideHoleRatio": 0.18,
+        "maxStrictOwnershipRatio": 0.18
+    }
+    # SAM-B is the primary instance/coverage proposal.  SAM-L can provide a
+    # more precise hard boundary, but must not replace that proposal wholesale:
+    # its edits are later limited to a narrow B-derived boundary band and are
+    # accepted only when they preserve B's stable core and topology.  This is
+    # deliberately based on visual capability and execution phase, rather
+    # than labels such as chair, person, food, or product.
+    cross_model_boundary_refine = {
+        # Retained as a compatibility capability for old diagnostics, but the
+        # former full-image B-accepted -> L arbitration is intentionally off.
+        # Accepted furniture uses the bounded local-L capability below.
+        "enabled": False,
+        "bandRatio": 0.018,
+        "minStableCorePreserve": 0.985,
+        "minBaselinePreserve": 0.985,
+        "minLCoverageOfBaseline": 0.94,
+        "maxChangedRatio": 0.075,
+        "maxRemovedRatio": 0.015,
+        "maxAddedRatio": 0.06
+    }
+    local_l_refine = {
+        # Keep the ROI implementation for later experiments, but disable it
+        # in the production route. L is reserved for B-failure recovery.
+        "enabled": False,
+        "roiExpandRatio": 0.18,
+        "bandRatio": 0.024,
+        "minCorePreserve": 0.985,
+        "minBaselinePreserve": 0.985,
+        "minCandidateOverlap": 0.94,
+        "maxChangedRatio": 0.10,
+        "maxRemovedRatio": 0.015,
+        "maxAddedRatio": 0.10
+    }
+    instance_guard = (layer_meta or {}).get("_spatialOwnershipGuard") or {}
+    ownership_boundary_repair = {
+        # This is image-only alpha geometry repair, not a second instance
+        # decision. It is available only after a verified atomic sibling guard
+        # has separated the subject from an adjacent instance.
+        "enabled": bool(
+            phase == "initial" and
+            boundary_recovery.get("edgeType") == "hard_edge" and
+            spatial_ownership.get("atomicInstancePromptEligible") and
+            isinstance(instance_guard.get("entries"), list) and
+            len(instance_guard.get("entries")) > 0 and
+            not completion_occluder
+        ),
+        "bandRatio": .024,
+        "maxBandPixels": 8,
+        "minAgreement": .98,
+        "minCoreRatio": .40,
+        "backgroundOdds": 4,
+        # The image review may be broader internally, but this ownership
+        # adapter outputs additions only and caps them to 2.5% of the mask.
+        "maxAddedRatio": .025,
+        "maxRemovedRatio": .10,
+        "minComponentPreserve": .90,
+        "maxReviewPixels": 1500000
+    }
     # A semantic composite is intentionally one workbench layer.  Its SAM
     # output must therefore be allowed to contain multiple disconnected
     # instances; do not confuse this with splitting the layer into children.
@@ -644,6 +1065,36 @@ def resolve_mask_policy(layer_meta=None, quality_profile="publish"):
         "spatial": spatial,
         "completion": completion,
         "spatialCanonicalCompletion": spatial_canonical_completion,
+        "boundaryRecovery": boundary_recovery,
+        "semanticOwnershipPrompt": semantic_ownership_prompt,
+        "spatialOwnership": spatial_ownership,
+        "positiveProbe": positive_probe,
+        "compoundComponentDiscovery": compound_component_discovery,
+        "interiorHoleRecovery": interior_hole_recovery,
+        "crossModelBoundaryRefine": cross_model_boundary_refine,
+        "localLRefine": local_l_refine,
+        "ownershipBoundaryRepair": ownership_boundary_repair,
+        "boundaryMatte": {
+            # Existing authoritative spatial mattes, soft alpha, composite
+            # masks and completion keep their own pixel ownership contracts.
+            "enabled": bool(
+                positive_probe["enabled"] and not spatial and
+                not composite_instance_union and
+                str(os.environ.get("SAM_BOUNDARY_MATTE", "1")).lower() not in {"0", "false", "no"}
+            ),
+            "bandRatio": .03,
+            "minAgreement": .98,
+            # Compound masks may contain plates and attached components with
+            # low-contrast rims. A matte that keeps only 68% of the accepted
+            # SAM core is destructive even when its two radius outputs agree.
+            # Keep the broader threshold for all existing non-compound paths.
+            "minCoreRatio": .90 if compound else .40,
+            "backgroundOdds": 4,
+            "maxAddedRatio": .10,
+            "maxRemovedRatio": .10,
+            "minComponentPreserve": .90,
+            "maxReviewPixels": 1500000
+        },
         "completionOccluder": completion_occluder,
         "compositeInstanceUnion": composite_instance_union,
         "samImgSize": sam_imgsz,
@@ -658,7 +1109,13 @@ def resolve_mask_policy(layer_meta=None, quality_profile="publish"):
         # of semantic name or product category.
         "allowModelEscalation": (
             True if completion or completion_occluder
-            else (not soft_edge and not compound)
+            else (
+                not soft_edge and
+                (
+                    not compound or
+                    cross_model_boundary_refine.get("enabled", False)
+                )
+            )
         ),
         "qualityProfile": normalize_sam_quality_profile(quality_profile)
     }

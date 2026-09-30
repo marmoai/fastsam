@@ -243,6 +243,7 @@ function getContextLayers(item, requestLayers) {
             parentLayerId: layer.parentLayerId || null,
             childLayerIds: Array.isArray(layer.childLayerIds) ? [...layer.childLayerIds] : [],
             compositeRole: layer.compositeRole || '',
+            segmentationIntent: layer.segmentationIntent || null,
             completionOccluder: layer.completionOccluder === true,
             // This is intentionally scoped to the post-inpaint spatial
             // completion request.  It tells SAM that an already-extracted
@@ -284,6 +285,7 @@ function buildRequestPayload(imageDataUrl, layers, item, engine, qualityProfile 
             parentLayerId: layer.parentLayerId || null,
             childLayerIds: Array.isArray(layer.childLayerIds) ? [...layer.childLayerIds] : [],
             compositeRole: layer.compositeRole || '',
+            segmentationIntent: layer.segmentationIntent || null,
             completionOccluder: layer.completionOccluder === true,
             completionForegroundContext: layer.completionForegroundContext === true,
             completionSegmentation: layer.completionSegmentation === true,

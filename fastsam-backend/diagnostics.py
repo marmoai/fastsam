@@ -72,6 +72,35 @@ def run_deterministic_self_tests():
     check("soft_edge_policy_uses_soft_matte", curtain_policy["matteType"] == "soft_edge")
     check("soft_edge_policy_keeps_high_res", curtain_policy["samImgSize"] == SOFT_EDGE_SAM_IMGSZ)
 
+    plant_meta = {
+        "name": "细叶植物",
+        "semanticType": "decor_plant",
+        "designRole": "scene_object",
+        "extractionProfile": "standard_object",
+        "runtimeType": "semantic_object"
+    }
+    plant = get_layer_strategy(plant_meta)
+    plant_policy = resolve_mask_policy(plant_meta, "completion")
+    check("plant_leaf_uses_component_candidate_strategy", plant["type"] == "hard_product")
+    check("plant_leaf_keeps_hard_edge_policy", "hard_edge" in plant["features"])
+    check("plant_leaf_component_attachments_enabled", plant["allow_attachments"] and plant["max_masks"] > 1)
+    check("plant_leaf_uses_hard_product_matte", plant_policy["matteType"] == "hard_product")
+    plant_candidates = np.zeros((320, 320, 2), dtype=np.float32)
+    plant_candidates[75:245, 80:240, 0] = 1.0
+    plant_candidates[110:215, 94:148, 1] = 1.0
+    _, plant_mask_count, plant_quality = select_and_merge_masks(
+        plant_candidates,
+        [50, 50, 270, 270],
+        320,
+        320,
+        layer_meta=plant_meta,
+        context_layers=[]
+    )
+    check(
+        "plant_leaf_merges_thin_hard_product_part",
+        plant_mask_count == 2 and plant_quality["selectedIndexes"] == [0, 1]
+    )
+
     food_meta = {
         "name": "一盘复合食物",
         "semanticType": "product_food",

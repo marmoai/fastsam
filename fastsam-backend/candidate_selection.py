@@ -89,6 +89,67 @@ def shape_strategy_gate(shape_features, strategy):
 def has_close_bottom_band(a, b, tolerance=BOTTOM_BAND_TOLERANCE):
     return abs(a["bottomBand"] - b["bottomBand"]) <= tolerance
 
+
+def review_primary_candidate(candidates, target_bbox, target_area):
+    """Recheck a score winner against the semantic bbox identity.
+
+    SAM's highest scoring mask can be a broad scene envelope.  Keep the
+    normal score as the primary signal, but recover a close-scoring candidate
+    whose mask bbox actually matches the requested object bbox.  This is a
+    geometry-only second pass and deliberately does not use labels or manual
+    masks.
+    """
+    if not candidates:
+        return None, None
+    primary = candidates[0]
+    primary_metrics = primary.get("metrics") or {}
+    primary_bbox_overlap = float(primary_metrics.get("bbox_overlap_ratio", 0.0))
+    primary_score = float(primary.get("score", 0.0))
+    reviewed = []
+    for item in candidates[1:]:
+        metrics = item.get("metrics") or {}
+        score = float(item.get("score", 0.0))
+        bbox_overlap = float(metrics.get("bbox_overlap_ratio", 0.0))
+        inside = float(metrics.get("mask_inside_target_ratio", 0.0))
+        touch = int(metrics.get("bbox_touch_count", 99))
+        area_ratio = float(metrics.get("mask_area_ratio", 99.0))
+        score_gap = primary_score - score
+        identity_gain = bbox_overlap - primary_bbox_overlap
+        # The candidate must be close in model score, well contained, and
+        # materially closer to the semantic bbox.  The area guard prevents a
+        # huge full-scene mask from winning on bbox overlap alone.
+        eligible = bool(
+            score_gap <= 0.10 and
+            identity_gain >= 0.12 and
+            inside >= 0.94 and
+            touch <= 4 and
+            area_ratio <= 1.25
+        )
+        if eligible:
+            review_score = (
+                bbox_overlap * 2.0 +
+                inside * 0.6 -
+                min(0.35, max(0.0, area_ratio - 1.0) * 0.5) -
+                score_gap * 0.35
+            )
+            reviewed.append((review_score, item))
+    if not reviewed:
+        return primary, None
+    reviewed.sort(key=lambda row: row[0], reverse=True)
+    replacement = reviewed[0][1]
+    return replacement, {
+        "status": "accepted",
+        "reason": "close_score_bbox_identity",
+        "fromIndex": int(primary_metrics.get("index", -1)),
+        "toIndex": int((replacement.get("metrics") or {}).get("index", -1)),
+        "scoreGap": round(primary_score - float(replacement.get("score", 0.0)), 4),
+        "bboxOverlapGain": round(
+            float((replacement.get("metrics") or {}).get("bbox_overlap_ratio", 0.0)) -
+            primary_bbox_overlap,
+            4
+        )
+    }
+
 def horizontal_overlap_ratio(a, b):
     ax1, _, ax2, _ = a
     bx1, _, bx2, _ = b
@@ -224,6 +285,183 @@ def normalize_context_bbox_to_pixel(bbox, img_w, img_h):
         int((ymax_n / 1000.0) * img_h)
     ]
 
+
+def _bbox_gap(a, b):
+    """Shortest axis-aligned gap between two pixel bboxes."""
+    horizontal = max(0, max(a[0], b[0]) - min(a[2], b[2]))
+    vertical = max(0, max(a[1], b[1]) - min(a[3], b[3]))
+    return float((horizontal ** 2 + vertical ** 2) ** 0.5)
+
+
+def _intent_is_atomic_tight(layer_meta):
+    intent = (layer_meta or {}).get("segmentationIntent") or {}
+    try:
+        confidence = float(intent.get("confidence", 0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return bool(
+        intent.get("targetKind") == "atomic_object" and
+        intent.get("bboxRole") == "tight_subject" and
+        confidence >= 0.85
+    )
+
+
+def _is_atomic_spatial_asset(layer_meta):
+    """Recognize the legacy semantic contract used before ownership fields."""
+    meta = layer_meta or {}
+    composite_role = str(meta.get("compositeRole") or "").strip().lower()
+    semantic_type = str(meta.get("semanticType") or "").strip().lower()
+    extraction_profile = str(meta.get("extractionProfile") or "").strip().lower()
+    return bool(
+        composite_role == "atomic_object" and
+        semantic_type not in {"background", "surface_wall", "surface_floor"} and
+        extraction_profile not in {"background_plate", "vector_layout_element"}
+    )
+
+
+def _ownership_entry_matches_layer(entry, layer, layer_bbox, img_w, img_h):
+    """Match Gemini's named/bounded exclusion to a real context sibling."""
+    if not isinstance(entry, dict) or not isinstance(layer, dict):
+        return False
+    entry_id = str(entry.get("id") or "").strip()
+    layer_id = str(layer.get("id") or layer.get("layerId") or "").strip()
+    if entry_id and layer_id and entry_id == layer_id:
+        return True
+    entry_name = str(entry.get("name") or "").strip()
+    layer_name = str(layer.get("name") or "").strip()
+    if entry_name and layer_name and entry_name == layer_name:
+        return True
+    entry_bbox = entry.get("bbox")
+    if not isinstance(entry_bbox, list) or len(entry_bbox) != 4:
+        return False
+    try:
+        entry_pixel_bbox = normalize_context_bbox_to_pixel(entry_bbox, img_w, img_h)
+    except (TypeError, ValueError):
+        return False
+    overlap = intersection_area(entry_pixel_bbox, layer_bbox)
+    return overlap / max(1, min(bbox_area(entry_pixel_bbox), bbox_area(layer_bbox))) >= 0.82
+
+
+def build_spatial_ownership_guard(layer_meta, context_layers, target_bbox, img_w, img_h):
+    """Return a deliberately narrow guard for adjacent spatial atomic assets.
+
+    This is intentionally *not* a general ownership route.  It activates only
+    when Gemini names a real, nearby sibling that must stay out of a tight
+    spatial asset.  All other layers retain the September 16 bbox-only path.
+    """
+    meta = layer_meta or {}
+    strategy = get_layer_strategy(meta)
+    intent = meta.get("segmentationIntent") or {}
+    excluded = intent.get("excludedAdjacentObjects")
+    explicit_contract = _intent_is_atomic_tight(meta)
+    legacy_atomic_contract = _is_atomic_spatial_asset(meta)
+    # An explicit atomic contract is valid for a flat composition too:
+    # overlapping instances can share material and color in either domain.
+    # Legacy inference stays spatial-only because it has no explicit sibling
+    # relationship to validate.
+    eligible_legacy_contract = (
+        strategy.get("profile") == "spatial_design" and
+        legacy_atomic_contract
+    )
+    if not (
+        strategy.get("phase") == "initial" and
+        "hard_edge" in set(strategy.get("features", [])) and
+        (explicit_contract or eligible_legacy_contract) and
+        isinstance(context_layers, list)
+    ):
+        return {"enabled": False, "entries": [], "reason": "not_eligible"}
+
+    parent_id = meta.get("parentLayerId")
+    target_scale = max(16.0, bbox_area(target_bbox) ** 0.5)
+    max_gap = max(10.0, target_scale * 0.10)
+    entries = []
+    for other in context_layers:
+        if not isinstance(other, dict) or same_layer(meta, other):
+            continue
+        if parent_id and other.get("parentLayerId") != parent_id:
+            continue
+        if not (_intent_is_atomic_tight(other) or _is_atomic_spatial_asset(other)):
+            continue
+        other_bbox_norm = other.get("bbox")
+        if not isinstance(other_bbox_norm, list) or len(other_bbox_norm) != 4:
+            continue
+        other_bbox = normalize_context_bbox_to_pixel(other_bbox_norm, img_w, img_h)
+        matching_exclusion = None
+        if isinstance(excluded, list):
+            matching_exclusion = next(
+                (
+                    item for item in excluded
+                    if _ownership_entry_matches_layer(item, other, other_bbox, img_w, img_h)
+                ),
+                None
+            )
+        if matching_exclusion is not None:
+            exclusion_id = str(matching_exclusion.get("id") or "").strip()
+            sibling_id = str(other.get("id") or other.get("layerId") or "").strip()
+            matched_by_id = bool(exclusion_id and sibling_id and exclusion_id == sibling_id)
+            target_type = str(meta.get("semanticType") or "").strip().lower()
+            sibling_type = str(other.get("semanticType") or "").strip().lower()
+            # A name/BBOX match alone is too weak for a negative SAM point:
+            # text badges and nearby decoration often satisfy it. Without an
+            # explicit id, require a non-empty shared semantic type so this
+            # remains an adjacent-instance contract rather than a generic
+            # layout exclusion.
+            if not matched_by_id and (
+                not target_type or target_type != sibling_type
+            ):
+                continue
+        # Legacy semantic payloads have no explicit exclusion list. For a
+        # shared composite parent, the other atomic child is itself the
+        # conservative sibling boundary. Do not infer unrelated top-level
+        # objects as exclusions.
+        if matching_exclusion is None and not (legacy_atomic_contract and parent_id):
+            continue
+        overlap = intersection_area(target_bbox, other_bbox)
+        gap = _bbox_gap(target_bbox, other_bbox)
+        if overlap <= 0 and gap > max_gap:
+            continue
+        entries.append({
+            "bbox": other_bbox,
+            "strong": True,
+            "semantic_ownership": True,
+            "spatial_ownership_guard": True,
+            "reason": "explicit_spatial_sibling",
+            "name": other.get("name") or matching_exclusion.get("name"),
+            "overlap": overlap,
+            "gap": round(gap, 2)
+        })
+
+    entries.sort(key=lambda item: (item["overlap"], -item["gap"]), reverse=True)
+    if not entries:
+        # Explicit contracts without a verified sibling remain ordinary
+        # bbox-only layers. Only the legacy spatial contract keeps its empty
+        # guard marker for backward-compatible output diagnostics.
+        if not legacy_atomic_contract:
+            return {
+                "enabled": False,
+                "entries": [],
+                "reason": "no_verified_atomic_sibling",
+                "targetKind": intent.get("targetKind"),
+                "bboxRole": intent.get("bboxRole"),
+                "confidence": float(intent.get("confidence", 0) or 0)
+            }
+        return {
+            "enabled": True,
+            "entries": [],
+            "reason": "legacy_spatial_atomic_bbox_contract" if legacy_atomic_contract else "explicit_bbox_contract_no_sibling",
+            "targetKind": intent.get("targetKind"),
+            "bboxRole": intent.get("bboxRole"),
+            "confidence": float(intent.get("confidence", 0) or 0)
+        }
+    return {
+        "enabled": True,
+        "entries": entries[:2],
+        "reason": "explicit_nearby_atomic_sibling",
+        "targetKind": intent.get("targetKind"),
+        "bboxRole": intent.get("bboxRole"),
+        "confidence": float(intent.get("confidence", 0))
+    }
+
 def expand_target_bbox_for_cleanup(target_bbox, img_w, img_h, ratio=0.14, min_pixels=8):
     x1, y1, x2, y2 = target_bbox
     box_w = max(1, x2 - x1)
@@ -274,6 +512,80 @@ def build_exclude_bboxes(layer_meta, context_layers, target_bbox, img_w, img_h):
             )
         })
 
+    guard = (layer_meta or {}).get("_spatialOwnershipGuard") or {}
+    if guard.get("enabled"):
+        # Unlike ordinary context rectangles, these entries were matched to a
+        # named, nearby atomic sibling before this selection pass.
+        excludes.extend(guard.get("entries") or [])
+    return excludes
+
+
+def is_semantic_ownership_exclude(layer):
+    """Identify explicit non-subject regions for ownership prompts."""
+    if not isinstance(layer, dict):
+        return False
+    semantic_type = str(layer.get("semanticType", "")).strip().lower()
+    design_role = str(layer.get("designRole", "")).strip().lower()
+    runtime_type = str(layer.get("runtimeType", "")).strip().lower()
+    return (
+        semantic_type in {
+            "element_text", "shape_panel", "price_badge", "cta_button",
+            "logo_mark"
+        } or
+        design_role in {
+            "local_panel", "price_badge", "headline_text", "body_text",
+            "label_text", "price_text", "logo_text", "url_text"
+        } or
+        runtime_type in {"text_node", "text", "vector_text"}
+    )
+
+
+def build_semantic_ownership_bboxes(layer_meta, context_layers, target_bbox, img_w, img_h):
+    """Build conservative explicit ownership conflicts for SAM prompts."""
+    excludes = []
+    if not isinstance(context_layers, list):
+        return excludes
+    for other in context_layers:
+        if (
+            not isinstance(other, dict) or
+            same_layer(layer_meta, other) or
+            not is_semantic_ownership_exclude(other)
+        ):
+            continue
+        bbox = other.get("bbox")
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            continue
+        other_bbox = normalize_context_bbox_to_pixel(bbox, img_w, img_h)
+        if intersection_area(other_bbox, target_bbox) <= 0:
+            continue
+        semantic_type = str(other.get("semanticType", "")).strip().lower()
+        design_role = str(other.get("designRole", "")).strip().lower()
+        runtime_type = str(other.get("runtimeType", "")).strip().lower()
+        excludes.append({
+            "bbox": other_bbox,
+            "strong": False,
+            "semantic_ownership": True,
+            # Text, price and logo ownership is a stronger negative signal
+            # than a decorative/layout panel. Compound discovery may cross
+            # a panel, but it must not absorb an explicitly owned label.
+            "strict_ownership": bool(
+                semantic_type in {
+                    "element_text", "price_badge", "cta_button", "logo_mark"
+                } or
+                design_role in {
+                    "price_badge", "headline_text", "body_text",
+                    "label_text", "price_text", "logo_text", "url_text"
+                } or
+                runtime_type in {"text_node", "text", "vector_text"}
+            ),
+            "reason": "semantic_context"
+        })
+    # The broad layout/text exclusions above are deliberately unchanged.  This
+    # append-only path is for a proven spatial sibling, and is enabled only by
+    # build_spatial_ownership_guard's high-confidence ownership contract.
+    guard = (layer_meta or {}).get("_spatialOwnershipGuard") or {}
+    if guard.get("enabled"):
+        excludes.extend(guard.get("entries") or [])
     return excludes
 
 def get_exclude_bbox(entry):
@@ -1674,6 +1986,21 @@ def score_candidate(metrics, strategy):
         # semantic bbox, so a high fill must not be treated as scene spill.
         plausible_fill = 1.0 - min(1.0, abs(fill - 0.78) / 0.78)
         background_penalty = max(0, area - 1.15) * 0.45
+    elif strategy.get("type") == "hard_product":
+        # A tight product bbox commonly produces a sparse SAM detail mask and
+        # one or more fuller silhouette masks. The old generic target of .38
+        # rewarded the sparse variant, which made cups and similar products
+        # render as disconnected outlines. Once the geometry gate has proved
+        # this is a tight entity, prefer the complete silhouette while keeping
+        # a separate penalty for genuinely oversized envelopes.
+        complete_fill_target = 0.62 if metrics.get("high_coverage_entity") else 0.42
+        plausible_fill = 1.0 - min(
+            1.0, abs(fill - complete_fill_target) / complete_fill_target
+        )
+        background_penalty = (
+            max(0, fill - 0.82) * 1.5 +
+            max(0, area - 0.95) * 0.65
+        )
     else:
         plausible_fill = 1.0 - min(1.0, abs(fill - 0.38) / 0.38)
         background_penalty = max(0, fill - 0.58) * 1.8 + max(0, area - 0.75) * 0.9
@@ -1743,6 +2070,31 @@ def score_candidate(metrics, strategy):
             center_bonus + rectangular_bonus + shape_bonus - background_penalty
         )
     return (inside * 0.42) + (plausible_fill * 0.28) + (overlap * 0.22) + center_bonus + rectangular_bonus + shape_bonus - background_penalty
+
+
+def verified_positive_probe_priority(layer_meta, candidate_index):
+    """Return a small priority only for a fully audited probe candidate."""
+    audit = (layer_meta or {}).get("_positiveProbeAudit") or {}
+    if audit.get("status") != "accepted":
+        return 0.0
+    try:
+        verified_indexes = {int(value) for value in (audit.get("verifiedCandidateIndexes") or [])}
+        candidate_index = int(candidate_index)
+        preserve_core = float(audit.get("preserveCore", 0.0))
+        connected_growth = float(audit.get("connectedGrowth", 0.0))
+        context_conflict = float(audit.get("contextConflictRatio", 1.0))
+    except (TypeError, ValueError):
+        return 0.0
+    review = audit.get("imageReview") or {}
+    if not (
+        candidate_index in verified_indexes and
+        review.get("status") == "reviewed" and
+        preserve_core >= 0.98 and
+        connected_growth >= 0.35 and
+        context_conflict <= 0.12
+    ):
+        return 0.0
+    return 0.12
 
 
 def select_wall_art_fallback_candidate(fallback_candidates, target_bbox):
@@ -2211,6 +2563,9 @@ def select_and_merge_masks(
         # candidate selector for flat entities. Spatial structural entities
         # keep their canonical table/furniture strategy instead.
         strategy["type"] = "completion_object"
+    # Strict semantic BBOXs apply only to the selected output. Candidate
+    # arbitration and probe construction must see SAM's full proposals so
+    # their geometry remains comparable to the September 16 baseline.
     if policy["selector"] == "compound_food":
         food_result = select_food_masks_from_candidates(
             candidate_masks,
@@ -2319,6 +2674,14 @@ def select_and_merge_masks(
         exclude_mask_ratio = exclude_mask_area / mask_area
         strong_exclude_mask_area = count_mask_in_strong_excludes(mask_binary, exclude_bboxes) if exclude_bboxes else 0
         strong_exclude_mask_ratio = strong_exclude_mask_area / mask_area
+        spatial_guard_entries = [
+            entry for entry in exclude_bboxes
+            if isinstance(entry, dict) and entry.get("spatial_ownership_guard")
+        ]
+        spatial_guard_mask_area = count_mask_in_bboxes(
+            mask_binary, spatial_guard_entries
+        ) if spatial_guard_entries else 0
+        spatial_guard_mask_ratio = spatial_guard_mask_area / mask_area
         if completion_foreground_context_mask is not None:
             completion_foreground_mask_area = int(np.count_nonzero(
                 mask_binary & completion_foreground_context_mask
@@ -2430,6 +2793,12 @@ def select_and_merge_masks(
             bbox_touch_count >= 3 and
             mask_inside_target_ratio < 0.96
         )
+        spatial_guard_bounded_candidate = bool(
+            spatial_guard_entries and
+            mask_inside_target_ratio >= 0.94 and
+            mask_area_ratio <= 0.90 and
+            target_fill_ratio <= 0.82
+        )
         completion_anchor_candidate = bool(
         completion_recovery and
             completion_observation_recall is not None and
@@ -2524,6 +2893,8 @@ def select_and_merge_masks(
             "mask_area": mask_area,
             "exclude_mask_ratio": exclude_mask_ratio,
             "strong_exclude_mask_ratio": strong_exclude_mask_ratio,
+            "spatial_guard_mask_ratio": spatial_guard_mask_ratio,
+            "spatial_guard_bounded_candidate": spatial_guard_bounded_candidate,
             "completion_foreground_mask_ratio": completion_foreground_mask_ratio,
             "shape_features": shape_features,
             "multi_entity_coverage": multi_entity_coverage,
@@ -2541,13 +2912,17 @@ def select_and_merge_masks(
         )
         metrics["high_coverage_entity"] = high_coverage_entity
         metrics["high_coverage_reason"] = high_coverage_reason
+        metrics["positive_probe_priority"] = verified_positive_probe_priority(
+            layer_meta, index
+        )
 
         is_probable_foreground = (
             target_fill_ratio > 0
             and (
                 target_fill_ratio <= strategy["max_fill"] or
                 high_coverage_entity or
-                multi_entity_coverage
+                multi_entity_coverage or
+                spatial_guard_bounded_candidate
             )
             and mask_inside_target_ratio >= (
                 0.80 if spatial_completion_anchor_candidate else MIN_MASK_INSIDE_TARGET_RATIO
@@ -2555,11 +2930,24 @@ def select_and_merge_masks(
             and MIN_MASK_AREA_RATIO_IN_BBOX <= mask_area_ratio <= MAX_MASK_AREA_RATIO_IN_BBOX
             and (bbox_overlap_ratio >= MIN_BBOX_OVERLAP_RATIO or center_inside)
             and shape_allowed
+            # Sibling semantic rectangles can overlap heavily for stacked
+            # tables.  Their rectangle intersection is not proof that SAM
+            # selected the sibling.  Only reject a guard candidate when the
+            # mask is also broad/leaky; a bounded mask mostly inside the
+            # target remains usable and is clipped by the output contract.
+            and not (
+                spatial_guard_mask_ratio >= 0.16 and
+                (
+                    mask_inside_target_ratio < 0.94 or
+                    mask_area_ratio > 0.95
+                )
+            )
             and not lighting_background_like
             and (
                 not table_background_like or
                 completion_observation_candidate or
-                spatial_completion_anchor_candidate
+                spatial_completion_anchor_candidate or
+                spatial_guard_bounded_candidate
             )
             # A bounded high-coverage entity may touch the semantic bbox. The
             # previous gate rejected it as background even when the geometry
@@ -2567,6 +2955,12 @@ def select_and_merge_masks(
             and (
                 not furniture_background_like or
                 multi_entity_coverage or
+                # An explicit adjacent-instance guard can identify the
+                # narrow subject candidate even when it touches the same
+                # semantic BBOX as a rear/overlapping sibling. In that case
+                # containment and bounded coverage are stronger evidence than
+                # the generic furniture envelope heuristic.
+                spatial_guard_bounded_candidate or
                 (
                     high_coverage_entity and
                     strong_exclude_mask_ratio < 0.22 and
@@ -2586,7 +2980,7 @@ def select_and_merge_masks(
                 completion_foreground_mask_ratio >= 0.025
             )
         )
-        score = score_candidate(metrics, strategy)
+        score = score_candidate(metrics, strategy) + metrics["positive_probe_priority"]
         # When the prompt contains a verified occluder, prefer an otherwise
         # valid anchored candidate that actually covers some generated target
         # area. This prevents a visible-only mask from winning solely because
@@ -2608,6 +3002,7 @@ def select_and_merge_masks(
             "identityOverlap": round(float(completion_identity_overlap_ratio), 3),
             "exclude": round(float(exclude_mask_ratio), 3),
             "strongExclude": round(float(strong_exclude_mask_ratio), 3),
+            "spatialOwnershipExclude": round(float(spatial_guard_mask_ratio), 3),
             "foregroundContext": round(float(completion_foreground_mask_ratio), 3),
             "foregroundContextMaskAvailable": bool(completion_foreground_context_mask is not None),
             "touch": int(bbox_touch_count),
@@ -2621,6 +3016,7 @@ def select_and_merge_masks(
             "completionRecoveryPixels": completion_recovery_pixels,
             "completionRecoveryRatio": round(completion_recovery_ratio, 3) if completion_recovery_ratio is not None else None,
             "spatialRecoveryBonus": round(float(spatial_recovery_bonus), 3),
+            "positiveProbePriority": round(float(metrics["positive_probe_priority"]), 3),
             "completionObservationReason": completion_observation_reason,
             "completionAnchor": completion_anchor_candidate,
             "spatialCompletionAnchor": spatial_completion_anchor_candidate,
@@ -2640,8 +3036,10 @@ def select_and_merge_masks(
                                 completion_foreground_mask_ratio >= 0.025
                             ) else (
                             "missing_completion_observation_anchor" if completion_recovery and not completion_observation_candidate else (
+                                "spatial_ownership_sibling_overlap" if spatial_guard_mask_ratio >= 0.16 else (
                                 "sibling_overlap" if strong_exclude_mask_ratio >= 0.22 and not completion_recovery_candidate else (
                                 high_coverage_reason if high_coverage_entity else (shape_reject_reason or "gate")
+                                )
                                 )
                             )
                             )
@@ -2718,13 +3116,71 @@ def select_and_merge_masks(
     if not exclude_reliable:
         for item in candidates:
             item["metrics"]["exclude_mask_ratio"] = 0
-            item["score"] = score_candidate(item["metrics"], strategy)
+            item["score"] = (
+                score_candidate(item["metrics"], strategy) +
+                float(item["metrics"].get("positive_probe_priority", 0.0))
+            )
             item["debug"]["score"] = round(float(item["score"]), 3)
             item["debug"]["exclude"] = 0
         candidates.sort(key=lambda item: item["score"], reverse=True)
 
     candidates.sort(key=lambda item: item["score"], reverse=True)
-    primary = candidates[0]
+    primary, candidate_review = review_primary_candidate(
+        candidates,
+        target_bbox,
+        target_area
+    )
+    reviewed_out_candidate = None
+    if candidate_review:
+        original_primary = candidates[0]
+        reviewed_out_candidate = original_primary
+        original_primary["debug"]["selected"] = False
+        original_primary["debug"]["rejectReason"] = "candidate_review_bbox_identity"
+        primary["debug"]["candidateReview"] = candidate_review
+        print(
+            "SAM candidate review accepted: "
+            f"from=#{candidate_review['fromIndex']} "
+            f"to=#{candidate_review['toIndex']} "
+            f"scoreGap={candidate_review['scoreGap']:.4f} "
+            f"bboxGain={candidate_review['bboxOverlapGain']:.4f}"
+        )
+    if strategy["type"] == "hard_product":
+        # A bbox-only hard product can yield both a sparse detail mask and a
+        # fuller silhouette for the same object. Prefer the fuller peer only
+        # when its geometry is independently bounded; this prevents a broad
+        # scene envelope from winning while fixing cup/plate masks that were
+        # previously rendered as outlines.
+        primary_metrics = primary["metrics"]
+        primary_fill = float(primary_metrics.get("target_fill_ratio", 0.0))
+        if primary_fill < 0.42:
+            complete_peers = [
+                item for item in candidates[1:]
+                if (
+                    float(item["metrics"].get("target_fill_ratio", 0.0)) >= primary_fill + 0.14 and
+                    float(item["metrics"].get("target_fill_ratio", 0.0)) >= 0.48 and
+                    float(item["metrics"].get("mask_inside_target_ratio", 0.0)) >= 0.95 and
+                    float(item["metrics"].get("bbox_overlap_ratio", 0.0)) >= 0.88 and
+                    float(item["metrics"].get("mask_area_ratio", 1.0)) <= 0.85 and
+                    int(item["metrics"].get("bbox_touch_count", 99)) <= 4 and
+                    float(item["metrics"].get("strong_exclude_mask_ratio", 0.0)) < 0.22 and
+                    (
+                        item["metrics"].get("shape_features", {}).get("isBlockLike") or
+                        item["metrics"].get("shape_features", {}).get("isRectangularPlane")
+                    )
+                )
+            ]
+            if complete_peers:
+                complete_peers.sort(
+                    key=lambda item: (
+                        float(item["metrics"].get("target_fill_ratio", 0.0)),
+                        float(item.get("score", 0.0))
+                    ),
+                    reverse=True
+                )
+                primary["debug"]["rejectReason"] = "sparse_detail_peer"
+                primary = complete_peers[0]
+                primary["debug"]["selected"] = True
+                primary["debug"]["rejectReason"] = "complete_silhouette_primary"
     selected = [primary]
     primary["debug"]["selected"] = True
     primary["debug"]["rejectReason"] = "primary"
@@ -2734,7 +3190,26 @@ def select_and_merge_masks(
     primary_bbox = primary["metrics"]["bbox"]
     primary_shape = primary["metrics"]["shape_features"]
 
-    for candidate in candidates[1:]:
+    # A successful identity review changes the merge contract.  The old
+    # attachment rules were allowed to add any overlapping SAM proposal,
+    # which could reintroduce a scene envelope after the review had already
+    # rejected it as the primary mask.  Keep only attachments whose own bbox
+    # identity remains close to the reviewed subject.
+    reviewed_attachment_floor = None
+    if candidate_review:
+        reviewed_primary_overlap = float(
+            primary["metrics"].get("bbox_overlap_ratio", 0.0)
+        )
+        reviewed_attachment_floor = max(
+            0.88,
+            reviewed_primary_overlap - 0.08
+        )
+
+    merge_candidates = [
+        candidate for candidate in candidates
+        if candidate is not primary and candidate is not reviewed_out_candidate
+    ]
+    for candidate in merge_candidates:
         if not strategy["allow_attachments"]:
             candidate["debug"]["rejectReason"] = "attachments_disabled"
             continue
@@ -2743,6 +3218,15 @@ def select_and_merge_masks(
             break
         metrics = candidate["metrics"]
         shape_features = metrics["shape_features"]
+        if (
+            reviewed_attachment_floor is not None and
+            float(metrics.get("bbox_overlap_ratio", 0.0)) < reviewed_attachment_floor
+        ):
+            candidate["debug"]["rejectReason"] = "candidate_review_attachment_identity"
+            candidate["debug"]["attachmentIdentityFloor"] = round(
+                reviewed_attachment_floor, 3
+            )
+            continue
         distance = bbox_distance(primary_bbox, metrics["bbox"])
         overlaps_primary = intersection_area(primary_bbox, metrics["bbox"]) > 0
         horizontal_overlap = horizontal_overlap_ratio(primary_bbox, metrics["bbox"])
@@ -2789,6 +3273,14 @@ def select_and_merge_masks(
             metrics["bbox_touch_count"] <= 2 and
             (is_attachment or horizontal_overlap >= 0.30)
         )
+        # Reject furniture peers that shift into a neighboring object before
+        # either the furniture or generic hard-edge merge path can admit them.
+        furniture_peer_geometry_safe = (
+            metrics["bbox_overlap_ratio"] >= 0.93 and
+            metrics["mask_inside_target_ratio"] >= 0.96 and
+            abs(float(shape_features.get("centerX", 0.5)) -
+                float(primary_shape.get("centerX", 0.5))) <= 0.13
+        )
         is_furniture_block_peer = (
             strategy["type"] == "furniture" and
             shape_features["isBlockLike"] and
@@ -2797,6 +3289,7 @@ def select_and_merge_masks(
             mask_overlap_ratio >= 0.18 and
             metrics["target_fill_ratio"] <= 0.30 and
             metrics["mask_area_ratio"] <= 0.44 and
+            furniture_peer_geometry_safe and
             (is_attachment or distance <= strategy["max_attachment_distance"] * 1.4)
         )
         is_multi_entity_peer = (
@@ -2976,6 +3469,15 @@ def select_and_merge_masks(
             is_background_like = False
         if is_decor_compound_part or is_soft_edge_part or is_hard_edge_complete_part:
             is_background_like = False
+        if (
+            strategy["type"] == "furniture" and
+            shape_features["isBlockLike"] and
+            primary_shape["isBlockLike"] and
+            has_close_bottom_band(shape_features, primary_shape) and
+            not furniture_peer_geometry_safe
+        ):
+            candidate["debug"]["rejectReason"] = "furniture_peer_outside_target"
+            continue
         shape_merge_allowed = (
             (strategy["type"] not in {"food_product", "furniture", "table", "lighting"} and is_attachment and is_small_part) or
             is_table_leg_part or
@@ -3208,6 +3710,7 @@ def select_and_merge_masks(
         "issues": ["wall_art_quality_fallback"] if forced_wall_art_fallback else (quality_gate["issues"] if selected else ["no_selected_mask"]),
         "recommendedEngine": quality_gate["recommendedEngine"]
     }
+    quality["candidateReview"] = candidate_review
     selected_debug = next(
         (row for row in debug_candidates if isinstance(row, dict) and row.get("selected")),
         None

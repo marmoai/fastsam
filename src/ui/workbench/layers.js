@@ -3,27 +3,46 @@ import { showLayerEditPrompt } from '../modals.js';
 import { editLayerAsset } from './layer-assets.js';
 import { runtime } from '../../runtime/CoreRuntime';
 import { syncWorkspaceContext, recordWorkspaceAction } from '../../services/workspace-context.js';
+import { applyLayerSelectionVisual, updateCanvasLayerSelection } from './layer-selection.js';
 
-function applyLayerSelectionVisual(layerEl, selected, hasCutout = false) {
-    if (!layerEl) return;
-    layerEl.classList.toggle('selected', !!selected);
-    layerEl.style.borderRadius = '4px';
-    layerEl.style.filter = selected
-        ? 'drop-shadow(0 0 8px rgba(79, 70, 229, 0.75))'
-        : 'none';
+function normalizeLayerKey(value) {
+    return String(value || '')
+        .trim()
+        .toLowerCase()
+        .replace(/^(拆解|提取|补全|完成|同步更新|独立编辑)[:：\s-]*/u, '')
+        .replace(/[\s_\-:：]/g, '');
+}
 
-    if (!hasCutout) {
-        layerEl.style.backgroundColor = selected ? 'rgba(79, 70, 229, 0.08)' : 'transparent';
-        layerEl.style.border = selected ? '1.5px solid rgba(79, 70, 229, 0.85)' : 'none';
-    }
+function bboxOverlapRatio(first, second) {
+    if (!Array.isArray(first) || !Array.isArray(second) || first.length !== 4 || second.length !== 4) return 0;
+    const top = Math.max(Number(first[0]), Number(second[0]));
+    const left = Math.max(Number(first[1]), Number(second[1]));
+    const bottom = Math.min(Number(first[2]), Number(second[2]));
+    const right = Math.min(Number(first[3]), Number(second[3]));
+    const overlap = Math.max(0, bottom - top) * Math.max(0, right - left);
+    const firstArea = Math.max(0, Number(first[2]) - Number(first[0])) * Math.max(0, Number(first[3]) - Number(first[1]));
+    const secondArea = Math.max(0, Number(second[2]) - Number(second[0])) * Math.max(0, Number(second[3]) - Number(second[1]));
+    return overlap / Math.max(1, Math.min(firstArea, secondArea));
 }
 
 function hasStandaloneSplitChild(parentItemId, layer) {
-    if (!layer?.id) return false;
-    return [...state.workbenchItems.values()].some(candidate =>
-        candidate?.parentId === parentItemId &&
-        (candidate.sourceLayerId === layer.id || candidate.layerId === layer.id)
-    );
+    if (!layer) return false;
+    const layerId = String(layer.id || layer.layerId || '').trim();
+    const layerName = normalizeLayerKey(layer.name || layer.layerName);
+    return [...state.workbenchItems.values()].some(candidate => {
+        if (!candidate || candidate.parentId !== parentItemId) return false;
+        // Only extracted raster children replace the in-parent cutout. Text and
+        // shape children are separate overlays and must not suppress the image.
+        if (candidate.type && candidate.type !== 'layer-explode') return false;
+
+        const candidateId = String(candidate.sourceLayerId || candidate.layerId || '').trim();
+        if (layerId && candidateId && layerId === candidateId) return true;
+
+        const candidateName = normalizeLayerKey(candidate.layerName || candidate.name);
+        if (layerName && candidateName && layerName === candidateName) return true;
+
+        return bboxOverlapRatio(candidate.originalBbox || candidate.extractionBbox, layer.bbox) >= 0.82;
+    });
 }
 
 export function renderCanvasLayers(itemId) {
@@ -309,6 +328,11 @@ export function renderCanvasLayers(itemId) {
         });
 
         layersContainer.appendChild(layerEl);
+    });
+    layersToRender.forEach((_, index) => {
+        if (item.layerStates?.get(index)?.selected) {
+            updateCanvasLayerSelection(item, index, true);
+        }
     });
 }
 

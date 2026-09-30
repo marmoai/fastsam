@@ -1236,6 +1236,41 @@ function findSplitChildrenForSemanticLayer(itemId, layer) {
     });
 }
 
+function removeDuplicateExtractionChildren(itemId, sourceLayerId, keepChildId = null) {
+    if (!itemId || !sourceLayerId) return 0;
+    const workspace = window.mvrRuntime?.getCurrentWorkspace?.();
+    const candidates = [...workbenchItems.values()].filter(candidate => (
+        candidate?.parentId === itemId &&
+        candidate?.type === 'layer-explode' &&
+        !candidate?.completionAssetId &&
+        String(candidate?.sourceLayerId || '') === String(sourceLayerId)
+    ));
+    const resolvedKeepChildId = keepChildId || getWorkbenchItemId(candidates[candidates.length - 1]);
+    const duplicates = candidates.filter(candidate =>
+        String(getWorkbenchItemId(candidate) || '') !== String(resolvedKeepChildId || '')
+    );
+    for (const duplicate of duplicates) {
+        const duplicateId = getWorkbenchItemId(duplicate);
+        if (!duplicateId) continue;
+        duplicate.el?.remove();
+        workbenchItems.delete(duplicateId);
+        state.selectedWorkbenchItems.delete(duplicateId);
+        if (workspace?.currentState?.assetRegistry?.get(duplicateId)) {
+            workspace.dispatcher.dispatch({
+                type: 'REMOVE_ASSET',
+                payload: { uid: duplicateId }
+            });
+        }
+        console.warn('[Explosion] Removed duplicate extraction child', {
+            itemId,
+            sourceLayerId,
+            duplicateId,
+            keepChildId: resolvedKeepChildId
+        });
+    }
+    return duplicates.length;
+}
+
 function getCompletionPlacementBbox(asset, targetLayer, child) {
     // The split child's original bbox is the stable scene projection. Never
     // resize it from a generative model's silhouette, which is not geometry.
@@ -2656,6 +2691,7 @@ ${bgColorRule}`;
                                 autoOpenDecisionPanelBatchToken: batchAutoOpenToken,
                                 autoOpenDecisionPanelBatchFinal: i === currentLayers.length - 1
                             });
+                            removeDuplicateExtractionChildren(itemId, layerObj.id);
                             successCount++;
                             console.log(`[Explosion] Forced runtime child created for held raster layer: ${res.layerName}`);
                         }
@@ -2684,6 +2720,7 @@ ${bgColorRule}`;
                         autoOpenDecisionPanelBatchToken: batchAutoOpenToken,
                         autoOpenDecisionPanelBatchFinal: i === currentLayers.length - 1
                     });
+                    removeDuplicateExtractionChildren(itemId, layerObj.id);
 
                     updateLayerExtractionMetadata(item, {
                         id: layerObj.id,

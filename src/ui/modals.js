@@ -11,6 +11,7 @@ import { dataURLToFile, isRemovalRequest, isMaterialRequest, getProxiedUrl } fro
 import { addImageToWorkbench } from './workbench-core.js';
 import { analyzeImageLayers } from '../ai-services/skills-engine.js';
 import { renderCanvasLayers } from './workbench/layers.js';
+import { updateCanvasLayerSelection } from './workbench/layer-selection.js';
 import { renderSceneToCanvas } from './workbench/renderer.js';
 import { openMaskEditor } from '../graphics/mask-drawer.js';
 import { performDeepFusion } from './fusion.js';
@@ -557,18 +558,7 @@ export function updateLayerState(itemId, layerIndex, updates) {
     
     // Update canvas selection directly in DOM to avoid breaking dblclick events
     if (updates.selected !== undefined && item.el) {
-        const layerEls = item.el.querySelectorAll('.canvas-layer');
-        if (layerEls && layerEls[layerIndex]) {
-            if (updates.selected) {
-                layerEls[layerIndex].classList.add('selected');
-                layerEls[layerIndex].style.boxShadow = '0 0 0 2px #4f46e5 inset, 0 0 15px rgba(79, 70, 229, 0.6)';
-                layerEls[layerIndex].style.backgroundColor = 'rgba(79, 70, 229, 0.1)';
-            } else {
-                layerEls[layerIndex].classList.remove('selected');
-                layerEls[layerIndex].style.boxShadow = 'none';
-                layerEls[layerIndex].style.backgroundColor = 'transparent';
-            }
-        }
+        updateCanvasLayerSelection(item, layerIndex, localState.selected);
     }
     
     // Only re-render canvas if visibility or lock state changed.

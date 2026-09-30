@@ -1213,6 +1213,11 @@ export function hideAIInspirationCapsule() {
         if (!element) return;
         element.hidden = true;
         element.setAttribute('aria-hidden', 'true');
+        // The legacy component styles set display:flex explicitly, which
+        // overrides the browser's default [hidden] rule during app startup.
+        // Keep the retired capsule hidden before the workspace mode class is
+        // initialized so it cannot flash during the first paint.
+        element.style.setProperty('display', 'none', 'important');
     });
 }
 hideAIInspirationCapsule();

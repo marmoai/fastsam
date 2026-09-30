@@ -482,7 +482,11 @@ function handleWorkbenchDragStart(event) {
         selectedWorkbenchItems.add(itemId);
     }
 
-    if (state.isAltPressed) {
+    // Duplicate-on-drag is an explicit Alt-drag gesture.  Do not rely on the
+    // global `state.isAltPressed` flag here: that flag can remain stale when
+    // the window loses focus (or when an extracted layer handles the mouse
+    // event), which makes an ordinary drag unexpectedly create a copy.
+    if (event.altKey === true) {
         selectedWorkbenchItems.forEach(id => {
             const original = workbenchItems.get(id);
             if (!original) return;

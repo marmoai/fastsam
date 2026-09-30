@@ -8,6 +8,8 @@ semantic candidate-selection policy.
 import gc
 import os
 import threading
+import time
+from contextlib import contextmanager
 from urllib.request import urlopen
 
 # Keep direct `uvicorn api:app` launches equivalent to `python main.py`.
@@ -37,6 +39,222 @@ SAM_L_MODEL_URL = os.getenv("SAM_L_MODEL_URL", f"{MODEL_BASE_URL}/sam_l.pt")
 fastsam_model = None
 sam_models = {}
 sam_runtime_lock = threading.RLock()
+_active_sam_embedding_cache = None
+_active_sam_request_metrics = None
+
+
+SAM_SHARED_EMBEDDING_ENABLED = str(
+    os.getenv("SAM_SHARED_EMBEDDING", "0")
+).lower() not in {"0", "false", "no", "off"}
+
+# Temporary experiment switch.  The normal B -> L routing remains in place;
+# when this is set to ``l`` every SAM inference entry point resolves to L and
+# the caller can skip the escalation/arbitration pass.  Set it to ``off`` to
+# restore the normal routing without deleting any code.
+SAM_FORCE_MODEL_VARIANT = str(
+    os.getenv("SAM_FORCE_MODEL_VARIANT", "off")
+).strip().lower()
+
+# Optional same-model positive-point probe. It is guarded by a strict
+# candidate comparison in segmentation_core and never changes the baseline
+# unless the probe demonstrably adds a bounded subject region.
+SAM_POSITIVE_PROBE_ENABLED = str(
+    os.getenv("SAM_POSITIVE_PROBE", "1")
+).lower() not in {"0", "false", "no", "off"}
+
+
+def forced_sam_model_variant(model_variant="b"):
+    """Resolve the temporary experiment model while preserving normal calls."""
+    requested = "l" if str(model_variant).lower() == "l" else "b"
+    if SAM_FORCE_MODEL_VARIANT in {"b", "l"}:
+        return SAM_FORCE_MODEL_VARIANT
+    return requested
+
+
+def sam_l_forced():
+    return SAM_FORCE_MODEL_VARIANT == "l"
+
+
+class _SamRequestMetrics:
+    """Low-overhead timing counters for one SAM HTTP request."""
+
+    def __init__(self):
+        self.started_at = time.perf_counter()
+        self.encoder_count = 0
+        self.encoder_ms = 0.0
+        self.decoder_count = 0
+        self.decoder_ms = 0.0
+
+    def record_encoder(self, duration_ms):
+        self.encoder_count += 1
+        self.encoder_ms += float(duration_ms)
+
+    def record_decoder(self, duration_ms):
+        self.decoder_count += 1
+        self.decoder_ms += float(duration_ms)
+
+    def summary(self):
+        return {
+            "totalMs": round((time.perf_counter() - self.started_at) * 1000, 1),
+            "imageEncoderCount": self.encoder_count,
+            "imageEncoderMs": round(self.encoder_ms, 1),
+            "promptDecoderCount": self.decoder_count,
+            "promptDecoderMs": round(self.decoder_ms, 1),
+        }
+
+
+@contextmanager
+def sam_request_metrics():
+    """Collect actual image-encoder and mask-decoder forward timings."""
+    global _active_sam_request_metrics
+    previous = _active_sam_request_metrics
+    metrics = _SamRequestMetrics()
+    _active_sam_request_metrics = metrics
+    try:
+        yield metrics
+    finally:
+        _active_sam_request_metrics = previous
+
+
+@contextmanager
+def _measure_sam_modules(predictor):
+    """Count real encoder/decoder forwards without changing model outputs."""
+    metrics = _active_sam_request_metrics
+    model = getattr(predictor, "model", None)
+    encoder = getattr(model, "image_encoder", None)
+    decoder = getattr(model, "mask_decoder", None)
+    if metrics is None or (encoder is None and decoder is None):
+        yield
+        return
+
+    starts = {}
+    handles = []
+
+    def before_encoder(*_args):
+        starts["encoder"] = time.perf_counter()
+
+    def after_encoder(*_args):
+        started = starts.pop("encoder", None)
+        if started is not None:
+            metrics.record_encoder((time.perf_counter() - started) * 1000)
+
+    def before_decoder(*_args):
+        starts["decoder"] = time.perf_counter()
+
+    def after_decoder(*_args):
+        started = starts.pop("decoder", None)
+        if started is not None:
+            metrics.record_decoder((time.perf_counter() - started) * 1000)
+
+    try:
+        if encoder is not None:
+            handles.append(encoder.register_forward_pre_hook(before_encoder))
+            handles.append(encoder.register_forward_hook(after_encoder))
+        if decoder is not None:
+            handles.append(decoder.register_forward_pre_hook(before_decoder))
+            handles.append(decoder.register_forward_hook(after_decoder))
+        yield
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+class _SamEmbeddingCache:
+    """Request-scoped cache for exact SAM image features.
+
+    SAM's image encoder depends only on the source image, model variant and
+    encoder input size. Prompted layers still run independently through the
+    prompt encoder and mask decoder, so candidate selection and multimask
+    behavior remain unchanged.
+    """
+
+    def __init__(self):
+        self.entries = {}
+
+    @staticmethod
+    def _key(img, imgsz, model_variant):
+        shape = tuple(getattr(img, "shape", ())[:2])
+        dtype = str(getattr(img, "dtype", ""))
+        return (str(model_variant).lower(), int(imgsz), id(img), shape, dtype)
+
+    def prepare(self, predictor, img, imgsz, model_variant):
+        key = self._key(img, imgsz, model_variant)
+        entry = self.entries.get(key)
+        if entry is not None and entry[0] is predictor and entry[2] is not None:
+            # A local crop may have replaced the predictor's current features.
+            # Restore the features associated with this exact source image.
+            predictor.features = entry[2]
+            print(
+                f"SAM embedding cache hit model={str(model_variant).upper()} "
+                f"imgsz={int(imgsz)}"
+            )
+            return
+
+        # Never reuse a feature tensor from an earlier request or a different
+        # encoder size. set_image() follows Ultralytics' own preprocessing
+        # path, preserving the current model input and output behavior.
+        try:
+            predictor.reset_image()
+        except Exception:
+            predictor.features = None
+            predictor.im = None
+        print(
+            f"SAM embedding cache miss model={str(model_variant).upper()} "
+            f"imgsz={int(imgsz)} inferenceMode=True; encoding source image"
+        )
+        # `predictor.set_image()` is normally reached from Ultralytics'
+        # `stream_inference()` wrapper, which enables inference mode. The
+        # request embedding cache calls it directly, so explicitly disable
+        # autograd here. Otherwise the encoder retains a computation graph in
+        # `predictor.features` for every request and CPU/RAM usage can grow
+        # until the host appears frozen.
+        try:
+            with torch.inference_mode():
+                with _measure_sam_modules(predictor):
+                    predictor.set_image(img)
+        except Exception:
+            try:
+                predictor.reset_image()
+            except Exception:
+                predictor.features = None
+                predictor.im = None
+            raise
+        self.entries[key] = (predictor, img, predictor.features)
+
+    def invalidate(self, model_variant=None):
+        variant = str(model_variant).lower() if model_variant is not None else None
+        for key, entry in list(self.entries.items()):
+            if variant is not None and key[0] != variant:
+                continue
+            try:
+                entry[0].reset_image()
+            except Exception:
+                pass
+            self.entries.pop(key, None)
+
+    def close(self):
+        self.invalidate()
+
+
+@contextmanager
+def sam_embedding_cache():
+    """Enable request-scoped embedding reuse while the runtime lock is held."""
+    global _active_sam_embedding_cache
+    previous = _active_sam_embedding_cache
+    cache = _SamEmbeddingCache()
+    _active_sam_embedding_cache = cache
+    try:
+        yield cache
+    finally:
+        cache.close()
+        _active_sam_embedding_cache = previous
+
+
+def _prepare_request_embedding(predictor, img, imgsz, model_variant):
+    cache = _active_sam_embedding_cache
+    if cache is None:
+        return
+    cache.prepare(predictor, img, imgsz, model_variant)
 
 
 def resolve_model_url(model_url):
@@ -133,6 +351,8 @@ def get_sam_model(model_variant="b"):
 def release_sam_model(model_variant, reason="manual_release"):
     """Release one SAM variant and return its CUDA allocator memory to the pool."""
     variant = "l" if str(model_variant).lower() == "l" else "b"
+    if _active_sam_embedding_cache is not None:
+        _active_sam_embedding_cache.invalidate(variant)
     sam = sam_models.pop(variant, None)
     if sam is None:
         return False
@@ -218,6 +438,14 @@ def run_sam_bbox_inference(
     model_variant="b"
 ):
     with sam_runtime_lock:
+        model_variant = forced_sam_model_variant(model_variant)
+        requested_imgsz = int(imgsz or 1024)
+        imgsz, cap_reason = resolve_runtime_sam_imgsz(requested_imgsz, model_variant)
+        if cap_reason:
+            print(
+                f"SAM runtime imgsz cap model={str(model_variant).upper()} "
+                f"requested={requested_imgsz} actual={imgsz} reason={cap_reason}"
+            )
         predictor = get_sam_predictor(model_variant)
         previous_imgsz = getattr(predictor.args, "imgsz", 1024)
         predictor.args.imgsz = imgsz
@@ -227,14 +455,16 @@ def run_sam_bbox_inference(
             torch.cuda.reset_peak_memory_stats()
         log_cuda_memory("inference_before", model_variant)
         try:
-            return predictor(
-                source=img,
-                bboxes=[target_bbox],
-                points=points,
-                labels=labels,
-                masks=masks,
-                multimask_output=multimask_output
-            )
+            _prepare_request_embedding(predictor, img, imgsz, model_variant)
+            with _measure_sam_modules(predictor):
+                return predictor(
+                    source=img,
+                    bboxes=[target_bbox],
+                    points=points,
+                    labels=labels,
+                    masks=masks,
+                    multimask_output=multimask_output
+                )
         finally:
             log_cuda_memory("inference_after", model_variant)
             if hasattr(predictor.model, "set_imgsz"):
@@ -252,6 +482,14 @@ def run_sam_mask_refine_inference(
     model_variant="b"
 ):
     with sam_runtime_lock:
+        model_variant = forced_sam_model_variant(model_variant)
+        requested_imgsz = int(imgsz or 1024)
+        imgsz, cap_reason = resolve_runtime_sam_imgsz(requested_imgsz, model_variant)
+        if cap_reason:
+            print(
+                f"SAM runtime imgsz cap model={str(model_variant).upper()} "
+                f"requested={requested_imgsz} actual={imgsz} reason={cap_reason}"
+            )
         predictor = get_sam_predictor(model_variant)
         previous_imgsz = getattr(predictor.args, "imgsz", 1024)
         previous_direct_mask_mode = getattr(predictor.model, "use_mask_input_as_output_without_sam", False)
@@ -263,13 +501,15 @@ def run_sam_mask_refine_inference(
             torch.cuda.reset_peak_memory_stats()
         log_cuda_memory("mask_refine_before", model_variant)
         try:
-            return predictor(
-                source=img,
-                points=points,
-                labels=labels,
-                masks=masks,
-                multimask_output=multimask_output
-            )
+            _prepare_request_embedding(predictor, img, imgsz, model_variant)
+            with _measure_sam_modules(predictor):
+                return predictor(
+                    source=img,
+                    points=points,
+                    labels=labels,
+                    masks=masks,
+                    multimask_output=multimask_output
+                )
         finally:
             log_cuda_memory("mask_refine_after", model_variant)
             predictor.model.use_mask_input_as_output_without_sam = previous_direct_mask_mode
@@ -280,6 +520,14 @@ def run_sam_mask_refine_inference(
 
 def run_sam_auto_inference(img, imgsz=1024, model_variant="b"):
     with sam_runtime_lock:
+        model_variant = forced_sam_model_variant(model_variant)
+        requested_imgsz = int(imgsz or 1024)
+        imgsz, cap_reason = resolve_runtime_sam_imgsz(requested_imgsz, model_variant)
+        if cap_reason:
+            print(
+                f"SAM runtime imgsz cap model={str(model_variant).upper()} "
+                f"requested={requested_imgsz} actual={imgsz} reason={cap_reason}"
+            )
         predictor = get_sam_predictor(model_variant)
         previous_imgsz = getattr(predictor.args, "imgsz", 1024)
         predictor.args.imgsz = imgsz
@@ -289,7 +537,9 @@ def run_sam_auto_inference(img, imgsz=1024, model_variant="b"):
             torch.cuda.reset_peak_memory_stats()
         log_cuda_memory("auto_before", model_variant)
         try:
-            return predictor(source=img)
+            _prepare_request_embedding(predictor, img, imgsz, model_variant)
+            with _measure_sam_modules(predictor):
+                return predictor(source=img)
         finally:
             log_cuda_memory("auto_after", model_variant)
             if hasattr(predictor.model, "set_imgsz"):
@@ -306,6 +556,7 @@ SAM_MEMORY_LOGGING = str(os.getenv("SAM_MEMORY_LOGGING", "1")).lower() not in {"
 SAM_L_LARGE_IMAGE_MAX_SIDE = int(os.getenv("SAM_L_LARGE_IMAGE_MAX_SIDE", "2400"))
 SAM_L_LARGE_IMAGE_IMGSZ = int(os.getenv("SAM_L_LARGE_IMAGE_IMGSZ", "1280"))
 SAM_L_OOM_RETRY_IMGSZ = int(os.getenv("SAM_L_OOM_RETRY_IMGSZ", "1024"))
+SAM_CPU_ONLY_MAX_IMGSZ = int(os.getenv("SAM_CPU_ONLY_MAX_IMGSZ", "1024"))
 LOCAL_UPSCALE_ENABLED = str(os.getenv("SAM_LOCAL_UPSCALE_ENABLED", "1")).lower() not in {"0", "false", "no"}
 LOCAL_UPSCALE_SAM_IMGSZ = int(os.getenv("SAM_LOCAL_UPSCALE_SAM_IMGSZ", "1280"))
 LOCAL_UPSCALE_MAX_BBOX_SIDE = int(os.getenv("SAM_LOCAL_UPSCALE_MAX_BBOX_SIDE", "960"))
@@ -384,6 +635,15 @@ def log_cuda_memory(stage, model_variant=None):
 def is_cuda_oom(error):
     message = str(error).lower()
     return "cuda out of memory" in message or "out of memory" in message
+
+
+def resolve_runtime_sam_imgsz(requested_imgsz, model_variant="b"):
+    """Apply host safety caps while preserving policy-level requested sizes."""
+    requested = int(requested_imgsz or 1024)
+    cpu_cap = int(SAM_CPU_ONLY_MAX_IMGSZ or 0)
+    if not torch.cuda.is_available() and cpu_cap > 0 and requested > cpu_cap:
+        return cpu_cap, "cpu_only_max_imgsz"
+    return requested, None
 
 
 def choose_sam_imgsz(img, strategy_type=None, model_variant="b", policy=None):

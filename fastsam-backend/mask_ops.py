@@ -10,6 +10,72 @@ from segmentation_primitives import (
     normalize_result_masks,
 )
 
+
+def remove_flat_background_gaps(img, mask, target_bbox):
+    """Remove background-colored pixels trapped inside a high-contrast silhouette.
+
+    This is deliberately limited to a nearly uniform local background. It
+    never adds foreground, and leaves low-contrast subjects to SAM.
+    """
+    binary = np.asarray(mask > 0.5, dtype=bool)
+    area = int(binary.sum())
+    audit = {"status": "skipped", "reason": "insufficient_evidence", "removedPixels": 0}
+    if area < 256:
+        return mask, audit
+
+    height, width = binary.shape
+    x1, y1, x2, y2 = [int(v) for v in target_bbox]
+    pad = max(8, min(24, int(round(min(x2 - x1, y2 - y1) * 0.06))))
+    x1, y1 = max(0, x1 - pad), max(0, y1 - pad)
+    x2, y2 = min(width, x2 + pad), min(height, y2 + pad)
+    crop_mask = binary[y1:y2, x1:x2]
+    if crop_mask.size == 0:
+        return mask, audit
+    lab = cv2.cvtColor(img[y1:y2, x1:x2], cv2.COLOR_BGR2LAB).astype(np.float32)
+    background = lab[~crop_mask]
+    if len(background) < max(256, int(crop_mask.size * 0.12)):
+        return mask, audit
+    bg_color = np.median(background, axis=0)
+    bg_distance = np.linalg.norm(background - bg_color, axis=1)
+    stable_fraction = float(np.mean(bg_distance < 12.0))
+    fg_distance = np.linalg.norm(lab[crop_mask] - bg_color, axis=1)
+    foreground_separation = float(np.median(fg_distance))
+    audit.update({
+        "backgroundStableFraction": round(stable_fraction, 4),
+        "foregroundSeparation": round(foreground_separation, 2),
+    })
+    if stable_fraction < 0.65 or foreground_separation < 35.0:
+        audit["reason"] = "unstable_background_or_low_contrast"
+        return mask, audit
+
+    distance = np.linalg.norm(lab - bg_color, axis=2)
+    removed = crop_mask & (distance < 12.0)
+    # Small bright fragments are commonly leaf highlights rather than open
+    # gaps.  Require larger connected negative-space islands when the sampled
+    # background is less uniform; broad white gaps remain eligible.
+    min_gap_area = int(round(np.interp(
+        stable_fraction,
+        [0.65, 0.80, 0.90, 0.96, 1.0],
+        [144.0, 132.0, 112.0, 32.0, 24.0],
+    )))
+    component_count, component_labels, component_stats, _ = cv2.connectedComponentsWithStats(
+        removed.astype(np.uint8), connectivity=8
+    )
+    keep_labels = [
+        label for label in range(1, component_count)
+        if int(component_stats[label, cv2.CC_STAT_AREA]) >= min_gap_area
+    ]
+    removed = np.isin(component_labels, keep_labels)
+    removed_count = int(removed.sum())
+    audit["minGapArea"] = min_gap_area
+    if removed_count < 16 or removed_count > int(area * 0.40):
+        audit["reason"] = "pixel_budget"
+        return mask, audit
+    result = binary.copy()
+    result[y1:y2, x1:x2][removed] = False
+    audit.update({"status": "accepted", "reason": "stable_background_negative_space", "removedPixels": removed_count})
+    return result.astype(np.float32), audit
+
 def mask_integrity_audit(mask, target_bbox):
     """Produce model-independent diagnostics for a selected binary mask."""
     binary = np.asarray(mask > 0.5, dtype=np.uint8)
@@ -1542,7 +1608,7 @@ def select_clean_components(mask_binary, target_bbox, strategy_type=None):
     return np.isin(labels, list(keep_labels))
 
 
-def cleanup_mask(mask, target_bbox, strategy_type=None):
+def cleanup_mask(mask, target_bbox, strategy_type=None, skip_step=None):
     mask_binary = mask > 0.5
     if not np.any(mask_binary):
         return mask.astype(np.float32)
@@ -1553,11 +1619,17 @@ def cleanup_mask(mask, target_bbox, strategy_type=None):
 
     kernel_size = compute_cleanup_kernel(target_bbox)
     kernel = np.ones((kernel_size, kernel_size), np.uint8)
-    cleaned = select_clean_components(mask_binary, target_bbox, strategy_type=strategy_type).astype(np.uint8)
-    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel, iterations=1)
-    if kernel_size >= 2 and strategy_type not in {"furniture", "table", "lighting"}:
+    cleaned = (
+        mask_binary.astype(np.uint8)
+        if skip_step == "components" else
+        select_clean_components(mask_binary, target_bbox, strategy_type=strategy_type).astype(np.uint8)
+    )
+    if skip_step != "close":
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel, iterations=1)
+    if kernel_size >= 2 and strategy_type not in {"furniture", "table", "lighting"} and skip_step != "open":
         cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel, iterations=1)
-    cleaned = fill_small_holes(cleaned > 0).astype(np.uint8)
+    if skip_step != "holes":
+        cleaned = fill_small_holes(cleaned > 0).astype(np.uint8)
     return cleaned.astype(np.float32)
 
 
@@ -1581,7 +1653,12 @@ def constrain_candidate_masks_to_bbox(candidate_masks, target_bbox):
     ], axis=0)
 
 
-def derive_safe_entity_bbox(mask, target_bbox, strategy_type=None):
+def derive_safe_entity_bbox(
+    mask,
+    target_bbox,
+    strategy_type=None,
+    capability_config=None
+):
     """Extend an under-tight semantic bbox only on evidenced object sides.
 
     Semantic boxes are usually an output constraint, but they can occasionally
@@ -1591,7 +1668,17 @@ def derive_safe_entity_bbox(mask, target_bbox, strategy_type=None):
     boundary. This prevents a broad prompt expansion from becoming an output
     expansion.
     """
-    if strategy_type not in HARD_EDGE_STRATEGIES.union({"table", "furniture"}):
+    if capability_config is not None:
+        bbox_extension_enabled = bool(
+            capability_config.get("enabled") and
+            capability_config.get("edgeType") == "hard_edge"
+        )
+    else:
+        # Preserve legacy callers that have not moved to capability policy.
+        bbox_extension_enabled = (
+            strategy_type in HARD_EDGE_STRATEGIES.union({"table", "furniture"})
+        )
+    if not bbox_extension_enabled:
         return target_bbox, None
     if mask is None or not np.any(mask > 0.5):
         return target_bbox, None
