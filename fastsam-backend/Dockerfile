@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:2.2.2-cuda12.1-cudnn8-runtime
+FROM pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -7,6 +7,8 @@ ENV PIP_NO_CACHE_DIR=1
 ENV YOLO_CONFIG_DIR=/tmp/Ultralytics
 ENV MODEL_CACHE_DIR=/tmp/models
 ENV MODEL_BASE_URL=https://www.marmoai.cn/models/fastsam
+ENV SAM_HQ_L_MODEL_PATH=/tmp/models/sam_hq_vit_l.pth
+ENV SAM_HQ_L_MODEL_URL=https://www.marmoai.cn/models/fastsam/sam_hq_vit_l.pth
 
 WORKDIR /app
 
@@ -20,18 +22,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt /app/requirements.txt
+COPY requirements-v5.txt /app/requirements-v5.txt
 
 RUN pip install --upgrade pip && \
-    pip install -r /app/requirements.txt
+    pip install -r /app/requirements-v5.txt
 
-# Keep model weights out of the image. The runtime downloads them into
-# MODEL_CACHE_DIR when first needed; only the deployable backend modules are
-# copied into the image.
-COPY main.py api.py candidate_selection.py diagnostics.py mask_ops.py matte_ops.py sam_runtime.py segmentation_core.py segmentation_policy.py segmentation_primitives.py /app/
+# V5 runtime dependency closure only. Model weights remain outside the image.
+COPY main_v5.py api_v5.py segmentation_core_v5.py segmentation_policy_v5.py sam_runtime_v5.py sam_diagnostics.py /app/
+COPY alpha_guard_v5.py boundary_audit_v5.py boundary_control_v5.py boundary_refine_v5.py candidate_pool_v5.py component_recovery_v5.py fragment_ownership_v5.py hq_candidate_review_v5.py independent_neighbour_v5.py joint_ownership_v5.py local_completeness_v5.py matting_v5.py ownership_v5.py query_candidates_v5.py soft_backdrop_alpha.py transparency_contract_v5.py /app/
+COPY vendor_hq_sam/LICENSE /app/vendor_hq_sam/LICENSE
+COPY vendor_hq_sam/segment_anything /app/vendor_hq_sam/segment_anything
 
 ENV PORT=8000
+ENV SAMV5_PORT=8000
 
 EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "main_v5.py"]

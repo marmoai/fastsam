@@ -68,6 +68,22 @@ def sam_diagnostic_layer(index, layer_id):
         state["layer"] = {"index": index, "id": layer_id}
 
 
+def sam_diagnostic_output(evidence):
+    """Save native float evidence separately; never serialize logits as JSON."""
+    state = _trace.get()
+    if state is None or not evidence:
+        return
+    try:
+        prefix = f"{len(state['events']):03d}"
+        arrays = {key: value for key, value in evidence.items() if isinstance(value, np.ndarray)}
+        filename = f'{prefix}-decoder.npz'
+        np.savez_compressed(state['directory']/filename, **arrays)
+        metadata = {key:value for key,value in evidence.items() if not isinstance(value,np.ndarray)}
+        sam_diagnostic_event('decoder_output', artifact=filename, **metadata)
+    except Exception as error:
+        print(f'SAM decoder diagnostics unavailable: {error}')
+
+
 def sam_diagnostic_event(stage, masks=None, alpha=None, **metadata):
     state = _trace.get()
     if state is None:
