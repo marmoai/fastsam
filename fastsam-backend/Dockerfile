@@ -4,6 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PIP_NO_CACHE_DIR=1
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
 ENV YOLO_CONFIG_DIR=/tmp/Ultralytics
 ENV MODEL_CACHE_DIR=/tmp/models
 ENV MODEL_BASE_URL=https://www.marmoai.cn/models/fastsam
@@ -24,8 +25,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY requirements-v5.txt /app/requirements-v5.txt
 
-RUN pip install --upgrade pip && \
-    pip install -r /app/requirements-v5.txt
+# This container is isolated; the base image marks its Python as externally managed.
+RUN python -m pip install --upgrade pip && \
+    python -m pip install -r /app/requirements-v5.txt
 
 # V5 runtime dependency closure only. Model weights remain outside the image.
 COPY main_v5.py api_v5.py segmentation_core_v5.py segmentation_policy_v5.py sam_runtime_v5.py sam_diagnostics.py /app/
